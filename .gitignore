@@ -1,0 +1,33 @@
+# Build outputs and downloaded runtimes
+/engine/target/
+**/bin/
+**/obj/
+/app/runtime/
+/artifacts/
+.vs/
+*.user
+*.suo
+*.pdb
+
+# Local credentials, browser profiles, containers, and test output
+.env
+.env.*
+!.env.example
+*.dpapi
+*.odv
+*.odv[0-9]*
+*.vhd
+*.vhdx
+*.log
+**/WebProfiles/
+**/WebView2/
+**/TestResults/
+node_modules/
+__pycache__/
+
+# Historical local-only reports and release evidence
+/docs/README-v*.md
+/docs/VALIDATION-v*.md
+/docs/README.github.zh-CN.md
+/BUILD-VERIFICATION.json
+/SOURCE-SHA256.json

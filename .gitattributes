@@ -1,0 +1,16 @@
+* text=auto
+*.rs text eol=lf
+*.cs text eol=lf
+*.md text eol=lf
+*.js text eol=lf
+*.cjs text eol=lf
+*.html text eol=lf
+*.css text eol=lf
+*.json text eol=lf
+*.ps1 text eol=crlf
+*.png binary
+*.ico binary
+
+# Preserve upstream license text and vendored whitespace.
+app/ThirdParty/WinSpd/** -whitespace
+docs/*LICENSE*.txt -text -whitespace
