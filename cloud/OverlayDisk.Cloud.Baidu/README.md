@@ -15,7 +15,7 @@
 
 ## 全局请求限流与 PCS 认证
 
-所有客户端默认共用 `BaiduRequestScheduler.Shared`，默认每秒 2 个请求、同时 2 个请求。应用启动和设置保存时调用 `Shared.Configure(new BaiduRequestLimits(requestsPerSecond, maximumConcurrentRequests))`，现有客户端及已排队请求立即采用新设置；合法范围是每秒 0.1–20 次、并发 1–8。降低并发时让已开始的响应结束，直到活动数低于新上限才继续排队请求，不中断传输。`Snapshot()` 提供 `Limits`、`QueuedRequests`、`ActiveRequests`、`StartedRequests`，不包含路径或账户信息。`BaiduClientOptions.RequestScheduler` 可注入独立调度器供离线测试；生产应用使用默认共享实例，不能为每块磁盘创建独立额度。
+所有客户端默认共用 `BaiduRequestScheduler.Shared`，默认每秒 3 个请求、同时 4 个请求。应用启动和设置保存时调用 `Shared.Configure(new BaiduRequestLimits(requestsPerSecond, maximumConcurrentRequests))`，现有客户端及已排队请求立即采用新设置；合法范围是每秒 0.1–20 次、并发 1–8。降低并发时让已开始的响应结束，直到活动数低于新上限才继续排队请求，不中断传输。`Snapshot()` 提供 `Limits`、`QueuedRequests`、`ActiveRequests`、`StartedRequests`，不包含路径或账户信息；界面在“后台任务”展示进行中和排队计数。`BaiduClientOptions.RequestScheduler` 可注入独立调度器供离线测试；生产应用使用默认共享实例，不能为每块磁盘创建独立额度。
 
 调度器按先进先出、单调时钟的相邻请求最小间隔放行，空闲后不积累突发额度。会话初始化、目录查询、上传定位、每次分片、下载定位、实际下载、删除、轮询、重试和手动跟随的重定向全部经过同一发送入口。并发名额覆盖完整响应正文，不在收到响应头时释放；下载校验 EOF、关闭流、请求取消或客户端释放都会关闭正文并归还名额。排队时间不计入请求网络超时。这是进程内共享预算；应用的下载/上传由同一普通权限进程访问百度，没有提权 worker 绕过入口的第二套 HTTP 通道。界面 WebView2 本身的官方登录网页请求不经过此 HTTP 客户端。
 

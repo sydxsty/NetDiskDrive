@@ -1,5 +1,5 @@
 ﻿param(
-    [string]$ApplicationDirectory = (Join-Path (Split-Path $PSScriptRoot -Parent) 'artifacts\OverlayDisk-v0.7.0'),
+    [string]$ApplicationDirectory = (Join-Path (Split-Path $PSScriptRoot -Parent) 'artifacts\OverlayDisk-v0.8.0'),
     [string]$ReportPath,
     [ValidateRange(15,180)][int]$TimeoutSeconds = 90
 )

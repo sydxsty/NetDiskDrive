@@ -1,5 +1,5 @@
 ﻿param(
-    [string]$ApplicationDirectory = (Join-Path (Split-Path $PSScriptRoot -Parent) 'artifacts\OverlayDisk-v0.7.0'),
+    [string]$ApplicationDirectory = (Join-Path (Split-Path $PSScriptRoot -Parent) 'artifacts\OverlayDisk-v0.8.0'),
     [string]$OutputDirectory = (Join-Path $env:TEMP ('OverlayDisk-test-' + [Guid]::NewGuid().ToString('N'))),
     [string]$DotNetPath,
     [switch]$IncludeMount
@@ -24,7 +24,9 @@ foreach ($test in @(
     @('--core-smoke', 'core'),
     @('--activity-smoke', 'activity'),
     @('--sync-size-smoke', 'sync-size'),
-    @('--cache-smoke', 'cache')
+    @('--cache-smoke', 'cache'),
+    @('--replica-smoke', 'replica'),
+    @('--replica-gpt-smoke', 'replica-gpt')
 )) {
     & $DotNetPath $app $test[0] (Join-Path $OutputDirectory $test[1])
     if ($LASTEXITCODE -ne 0) { throw ('Functional test failed: ' + $test[0]) }
@@ -34,5 +36,7 @@ if ($IncludeMount) {
     # plus a new empty-MBR interrupted-create fixture. No existing path/disk number.
     & $DotNetPath $app --object-size-mount-smoke (Join-Path $OutputDirectory 'object-size-mount')
     if ($LASTEXITCODE -ne 0) { throw 'Object-size NTFS creation/remount and initialization-retry tests failed.' }
+    & $DotNetPath $app --replica-mount-smoke (Join-Path $OutputDirectory 'replica-mount')
+    if ($LASTEXITCODE -ne 0) { throw 'Lazy replica NTFS replacement and remount tests failed.' }
 }
 Write-Output ('Test artifacts: ' + $OutputDirectory)

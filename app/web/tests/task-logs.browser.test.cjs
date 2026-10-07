@@ -19,7 +19,7 @@ const fixture=Array.from({length:700},(_,i)=>{
     message:sequence===700?'<img src=x onerror="window.__injected=true">':'已校验远端对象，记录本次传输结果。',
     objectId:'block-'+String(sequence).padStart(8,'0')+'-01234567-89ab-cdef-0123-456789abcdef',objectKind:'data',bytes:4194304,wireBytes:1024,generation:9};
 });
-const initialState={connected:true,driverAvailable:true,account:null,disks:[diskA,diskB],settings:{syncIntervalSeconds:60,maxParallelTransfers:2},
+const initialState={connected:true,driverAvailable:true,account:null,disks:[diskA,diskB],settings:{syncIntervalSeconds:60,maxParallelTransfers:2},network:{activeRequests:2,queuedRequests:5,limits:{requestsPerSecond:3,maximumConcurrentRequests:4}},
   tasks:[{id:'run-b',diskId:'disk-b',kind:'sync',title:'同步 · 已解锁测试盘',state:'uploading',message:'正在上传增量对象',completedBytes:4194304,totalBytes:16777216,canPause:true}]};
 
 (async()=>{
@@ -38,6 +38,8 @@ const initialState={connected:true,driverAvailable:true,account:null,disks:[disk
   const executablePath=process.argv[4]||path.join(process.env['ProgramFiles(x86)']||'C:/Program Files (x86)','Microsoft/Edge/Application/msedge.exe');
   const browser=await chromium.launch({executablePath,headless:true});
   const context=await browser.newContext({viewport:{width:1360,height:940},locale:'zh-CN',timezoneId:'Asia/Shanghai'});
+  const origin='http://127.0.0.1:'+server.address().port;
+  await context.route('**/*',route=>new URL(route.request().url()).origin===origin?route.continue():route.abort());
   const page=await context.newPage();
   const errors=[];
   page.on('pageerror',error=>errors.push(error.message));
@@ -45,7 +47,8 @@ const initialState={connected:true,driverAvailable:true,account:null,disks:[disk
     const listeners=[];
     let state=structuredClone(initialState),logs=structuredClone(fixture);
     const send=message=>queueMicrotask(()=>listeners.forEach(listener=>listener({data:message})));
-    window.__bridgeRequests=[];window.__deferredLogs=[];
+    window.__bridgeRequests=[];window.__deferredLogs=[];window.__deferredDiagnostics=[];window.__state=state;
+    localStorage.setItem('blockAutoRefresh','false');
     window.__emitState=()=>send({type:'state',data:structuredClone(state)});
     window.__restoreDiskA=()=>{if(!state.disks.some(d=>d.id===diskA.id))state.disks.unshift(structuredClone(diskA));window.__emitState();};
     window.__addLog=sequence=>logs.unshift({...logs[0],sequence,timestampUtc:new Date(Date.UTC(2026,9,4,12,0,sequence)).toISOString(),level:'info',action:'upload.confirmed',message:'新增的确认记录',objectId:'new-object-'+sequence});
@@ -56,6 +59,11 @@ const initialState={connected:true,driverAvailable:true,account:null,disks:[disk
       window.__bridgeRequests.push({method,args:structuredClone(args)});
       let data=null;
       if(method==='app.state')data=structuredClone(state);
+      if(method==='sync.diagnostics'){
+        data={phase:'uploading',message:'诊断 '+args.id,physical_read_bytes:4194304,api_requests:window.__bridgeRequests.filter(r=>r.method==='sync.diagnostics').length};
+        if(window.__failNextDiagnostic){window.__failNextDiagnostic=false;send({requestId,ok:false,error:'模拟诊断读取失败'});return;}
+        if(window.__deferNextDiagnostic){window.__deferNextDiagnostic=false;window.__deferredDiagnostics.push(()=>send({requestId,ok:true,data}));return;}
+      }
       if(method==='tasks.logs'){
         if(window.__failNextLogs){window.__failNextLogs=false;send({requestId,ok:false,error:'日志读取暂时失败（模拟）'});return;}
         let matched=logs.filter(entry=>(!args.diskId||entry.diskId===args.diskId)&&(!args.level||entry.level===args.level)&&(args.before===undefined||entry.sequence<args.before));
@@ -119,6 +127,53 @@ const initialState={connected:true,driverAvailable:true,account:null,disks:[disk
     assert.equal(await page.evaluate(()=>window.__bridgeRequests.filter(r=>r.method==='tasks.logs'&&r.args.before!==undefined).at(-1).args.before),oldest);
     checks.push('older pages use an exclusive cursor and are never overwritten by polling or appended without a bound');
 
+    const diagnosticCalls=()=>page.evaluate(()=>window.__bridgeRequests.filter(r=>r.method==='sync.diagnostics').length);
+    assert.match(await page.locator('.task-network-current').innerText(),/当前 2 个请求进行中，5 个排队/);
+    assert.equal(await diagnosticCalls(),0);assert.equal(await page.locator('.task-diagnostics').getAttribute('open'),null);
+    await page.locator('.task-diagnostics summary').click();
+    assert.match(await page.locator('.task-diagnostics-feedback').innerText(),/解锁这块磁盘/);assert.equal(await diagnosticCalls(),0);
+    await page.locator('.task-diagnostics-disk').selectOption('disk-b');
+    await page.waitForFunction(()=>document.querySelector('.task-diagnostics-values').textContent.includes('诊断 disk-b'));
+    assert.equal(await page.evaluate(()=>localStorage.getItem('blockAutoRefresh')), 'false');
+    const diagnosticRows=await page.locator('.journal-table tbody tr').evaluateAll(rows=>rows.map(row=>row.dataset.logSequence));
+    await page.locator('.journal-scroll').evaluate(node=>node.scrollTop=140);
+    const diagnosticScroll=await page.locator('.journal-scroll').evaluate(node=>node.scrollTop);
+    await page.locator('.task-diagnostics-disk').focus();
+    await page.evaluate(()=>{window.__state.network.activeRequests=3;window.__state.network.queuedRequests=7;window.__emitState();});
+    await page.waitForFunction(()=>document.querySelector('.task-network-current').textContent.includes('3 个请求进行中，7 个排队'));
+    assert.equal(await page.evaluate(()=>document.activeElement.className),'task-diagnostics-disk');
+    assert.deepEqual(await page.locator('.journal-table tbody tr').evaluateAll(rows=>rows.map(row=>row.dataset.logSequence)),diagnosticRows);
+    assert.equal(await page.locator('.journal-scroll').evaluate(node=>node.scrollTop),diagnosticScroll);
+    await page.locator('.journal-disk-filter').focus();
+    await page.evaluate(()=>{window.__state.network.queuedRequests=8;window.__emitState();});
+    await page.waitForFunction(()=>document.querySelector('.task-network-current').textContent.includes('8 个排队'));
+    assert.equal(await page.locator('.journal-table tbody tr').first().getAttribute('data-log-sequence'),olderTop);
+    checks.push('Task requests update while diagnostic/log selectors retain focus; closed/locked diagnostics issue no requests, and expanded disk diagnostics work with block auto-refresh disabled without replacing log pages or scroll.');
+
+    await page.evaluate(()=>{window.__state.disks.push({...window.__state.disks[1],id:'disk-c',name:'另一诊断盘'});window.__emitState();});
+    const beforeDeferred=await diagnosticCalls();
+    await page.evaluate(()=>{window.__deferNextDiagnostic=true;taskMonitor.refresh();taskMonitor.refresh();});
+    await page.waitForFunction(()=>window.__deferredDiagnostics.length===1);assert.equal(await diagnosticCalls(),beforeDeferred+1);
+    await page.locator('.task-diagnostics-disk').selectOption('disk-c');
+    await page.waitForFunction(()=>document.querySelector('.task-diagnostics-values').textContent.includes('诊断 disk-c'));
+    await page.evaluate(()=>window.__deferredDiagnostics.shift()());
+    assert.match(await page.locator('.task-diagnostics-values').innerText(),/诊断 disk-c/);
+    await page.evaluate(()=>{window.__state.disks=window.__state.disks.filter(d=>d.id!=='disk-c');window.__emitState();});
+    await page.locator('.task-diagnostics-disk').selectOption('disk-b');
+    await page.waitForFunction(()=>document.querySelector('.task-diagnostics-values').textContent.includes('诊断 disk-b'));
+    const oldDiagnostic=await page.locator('.task-diagnostics-values').innerText();
+    await page.evaluate(()=>window.__failNextDiagnostic=true);await page.locator('[data-monitor-op="refresh"]').click();
+    await page.locator('.task-diagnostics-feedback.error-text').waitFor();assert.equal(await page.locator('.task-diagnostics-values').innerText(),oldDiagnostic);
+    const beforePoll=await diagnosticCalls();await page.waitForFunction(n=>window.__bridgeRequests.filter(r=>r.method==='sync.diagnostics').length>n,beforePoll);
+    await page.waitForFunction(()=>document.querySelector('.task-diagnostics-feedback').textContent.startsWith('已刷新'));
+    assert.equal(await page.locator('.journal-table tbody tr').first().getAttribute('data-log-sequence'),olderTop);
+    await page.screenshot({path:path.join(output,'task-monitor-diagnostics.png')});
+    assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth>innerWidth),false);
+    assert.ok(await page.locator('.journal-scroll').evaluate(node=>node.clientHeight)>150);
+    await page.locator('.task-diagnostics summary').click();
+    const closedAt=await diagnosticCalls();await page.waitForTimeout(2300);assert.equal(await diagnosticCalls(),closedAt);
+    checks.push('Diagnostic reads coalesce, ignore stale disk replies, retain data on error, poll only while expanded, and leave room for the paginated log without horizontal overflow.');
+
     await page.locator('.journal-disk-filter').selectOption('disk-a');
     await page.locator('.journal-level-filter').selectOption('error');
     await page.waitForFunction(()=>document.querySelectorAll('.journal-table tbody tr').length>0&&document.querySelectorAll('.journal-table tbody tr').length<200);
@@ -146,11 +201,19 @@ const initialState={connected:true,driverAvailable:true,account:null,disks:[disk
     assert.match(await page.locator('.journal-page-info').innerText(),/第 1 页/);
     checks.push('a failed page request preserves the previous page and its navigation state');
 
+    await page.locator('.task-diagnostics summary').click();
+    await page.waitForFunction(()=>!taskMonitor.inFlight);
+    await page.evaluate(()=>{window.__deferNextDiagnostic=true;taskMonitor.refresh();});
+    await page.waitForFunction(()=>window.__deferredDiagnostics.length===1);
     await page.locator('nav [data-page="settings"]').click();
+    await page.evaluate(()=>window.__deferredDiagnostics.shift()());
+    const diagnosticsAfterLeave=await diagnosticCalls();
+    assert.equal(await page.locator('.task-diagnostics').count(),0);assert.doesNotMatch(await page.locator('#content').innerText(),/请求进行中|个排队/);
     const requests=await page.evaluate(()=>window.__bridgeRequests.filter(r=>r.method==='tasks.logs').length);
     await page.waitForTimeout(3300);
     assert.equal(await page.evaluate(()=>window.__bridgeRequests.filter(r=>r.method==='tasks.logs').length),requests);
-    checks.push('log polling stops outside the background-task page');
+    assert.equal(await diagnosticCalls(),diagnosticsAfterLeave);
+    checks.push('Log and diagnostic polling stop outside the task page; delayed diagnostic replies do not recreate controls in settings.');
 
     await page.locator('nav [data-page="disks"]').click();
     await page.locator('[data-disk="disk-a"] [data-action="diskSettings"]').click();

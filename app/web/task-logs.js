@@ -7,6 +7,8 @@
     'upload.started':'开始上传','upload.confirmed':'上传确认','upload.failed':'上传失败','object.reused':'复用已有对象',
     'commit.confirmed':'版本确认','cleanup.started':'开始清理','cleanup.completed':'清理完成','cleanup.confirmed':'清理确认','cleanup.failed':'清理失败',
     'restore.started':'开始恢复','restore.completed':'恢复完成','restore.failed':'恢复失败','restore.paused':'恢复暂停',
+    'version.check':'检查云端快照','root.download':'读取必要根对象','prepared':'等待加载确认','applied':'快照加载完成','unchanged':'没有新版本','prepare.failed':'快照准备未完成','prepare.cancelled':'取消快照加载','checkpoint.warning':'快照记录需要保存',
+    'restore.root':'验证云端根信息','restore.ready':'副本可使用','index.started':'按需加载索引','index.verified':'索引校验通过',
     'download.started':'开始下载','download.confirmed':'下载确认','download.failed':'下载失败',
     'demand.started':'按需下载','demand.verified':'下载校验通过','prefetch.started':'提前加载','prefetch.verified':'预取校验通过',
     'disk.removed':'移出列表','disk.deleted':'删除本地容器','disks.delete':'移除或删除磁盘',
@@ -14,7 +16,7 @@
     'preparing.started':'准备同步版本','upload.reused':'复用已有对象','sync.unchanged':'没有新变更',
     'cleanup.deferred':'等待恢复结束','cleanup.deleted':'清理确认','cleanup.pending':'等待继续清理'
   };
-  const kindLabels = {sync:'同步',restore:'云端恢复',snapshotRestore:'快照恢复',compact:'整理',download:'按需读取',network:'网盘请求',disk:'磁盘',system:'应用'};
+  const kindLabels = {sync:'同步',restore:'云端恢复',replica:'加载云端快照',snapshotRestore:'快照恢复',compact:'整理',download:'按需读取',network:'网盘请求',disk:'磁盘',system:'应用'};
   const objectKinds = {data:'数据块',map:'索引对象',root:'根对象',metadata:'元数据',index:'索引对象',commit:'版本根对象',obsolete:'旧对象'};
   function timestamp(value) {
     const date = new Date(value);
@@ -29,6 +31,9 @@
     if (String(entry.level).toLowerCase() === 'error' || /\.failed$/.test(entry.action)) return ['失败','red'];
     if (String(entry.level).toLowerCase() === 'warning') return ['提醒','amber'];
     if (/\.paused$/.test(entry.action)) return ['已暂停','amber'];
+    if (/\.cancelled$/.test(entry.action)) return ['已取消',''];
+    if (entry.kind==='replica'&&entry.action==='prepared') return ['待确认','amber'];
+    if (entry.kind==='replica'&&['applied','unchanged'].includes(entry.action)) return ['成功','green'];
     if (entry.action === 'object.reused' || entry.action === 'upload.reused') return ['已复用','blue'];
     if (/\.(confirmed|completed|deleted|removed|unchanged|verified)$/.test(entry.action)) return ['成功','green'];
     if (/\.started$/.test(entry.action)) return ['开始','blue'];

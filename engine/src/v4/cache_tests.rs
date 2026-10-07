@@ -372,7 +372,7 @@ fn read_only_queue_barrier_rejects_guest_mutations_but_cache_and_hydration_still
         .submit_write(1, PAGE as u64, &[79; PAGE], false)
         .unwrap();
     queue
-        .call(Operation::V3Control(
+        .call(Operation::Control(
             json!({"cmd":"volume.read_only","enabled":true}),
         ))
         .unwrap();
@@ -455,7 +455,7 @@ fn read_only_queue_barrier_rejects_guest_mutations_but_cache_and_hydration_still
     );
     v.control(&json!({"cmd":"compact.cancel"})).unwrap();
     queue
-        .call(Operation::V3Control(
+        .call(Operation::Control(
             json!({"cmd":"volume.read_only","enabled":false}),
         ))
         .unwrap();

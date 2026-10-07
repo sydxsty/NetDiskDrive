@@ -4,8 +4,8 @@
 class BlockStatusView {
  constructor({request,notify,formatBytes}) {
   this.request=request;this.notify=notify;this.bytes=formatBytes;
-  this.labels={failed:'失败',pending:'有更新待上传',uploading:'上传中',uploaded:'已上传待提交',synced:'已同步',local:'未纳入当前云版本',snapshot:'快照引用',metadata:'索引 / 控制',free:'空闲'};
-  const defaults=['failed','pending','uploading','uploaded','synced','snapshot','local','metadata','free'];
+  this.labels={failed:'失败',pending:'有更新待上传',uploading:'上传中',uploaded:'已上传待提交',synced:'已同步',local:'未纳入当前云版本',snapshot:'快照引用',metadata:'索引 / 控制',unresolved:'未展开',free:'空闲'};
+  const defaults=['failed','pending','uploading','uploaded','synced','snapshot','local','metadata','unresolved','free'];
   try{const saved=JSON.parse(localStorage.getItem('blockLegendOrder')||'null');this.order=Array.isArray(saved)?[...new Set([...saved.filter(x=>defaults.includes(x)),...defaults])]:defaults;}catch{this.order=defaults;}
   this.autoRefresh=localStorage.getItem('blockAutoRefresh')!=='false';
   this.epoch=0;this.cache=new Map();this.loads=new Map();this.failedPages=new Set();this.limit=256;this.maxPages=16;this.filter={};this.summary={};this.total=0;this.revision=0;
@@ -14,7 +14,7 @@ class BlockStatusView {
  esc(value){return String(value??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
  mount(host){
   this.unmount();this.host=host;this.scroll=host.closest('main')||host;this.epoch++;
-  host.innerHTML=`<div class="blocks-toolbar"><div class="blocks-heading"><strong>块状态</strong><span class="muted">本地物理块 · 按位置排列</span></div><div class="toolbar"><input class="blocks-jump" type="number" min="0" placeholder="块号" aria-label="跳转块号"><button class="small" data-block-op="jump">跳转</button><button class="small" data-block-op="refresh">刷新</button></div></div><div class="blocks-feedback" role="status"></div><div class="blocks-summary"></div><div class="blocks-types"></div><div class="blocks-legend" aria-label="拖动图例调整主色优先级"></div><div class="blocks-filter"></div><div class="blocks-grid-space"><div class="blocks-spacer-top"></div><div class="blocks-dense-grid"></div><div class="blocks-spacer-bottom"></div></div><div class="blocks-detail hidden"></div><details class="blocks-diagnostics"><summary>同步诊断</summary><p class="muted">本次解锁以来的累计计数，页大小为 4 KiB。</p><div></div></details>`;
+  host.innerHTML=`<div class="blocks-toolbar"><div class="blocks-heading"><strong>块状态</strong><span class="muted">本地物理块 · 按位置排列</span></div><div class="toolbar"><input class="blocks-jump" type="number" min="0" placeholder="块号" aria-label="跳转块号"><button class="small" data-block-op="jump">跳转</button><button class="small" data-block-op="refresh">刷新</button></div></div><div class="blocks-feedback" role="status"></div><div class="blocks-summary"></div><div class="blocks-types"></div><div class="blocks-legend" aria-label="拖动图例调整主色优先级"></div><div class="blocks-filter"></div><div class="blocks-grid-space"><div class="blocks-spacer-top"></div><div class="blocks-dense-grid"></div><div class="blocks-spacer-bottom"></div></div><div class="blocks-detail hidden"></div>`;
   host.addEventListener('click',this.clickHandler=e=>this.click(e));
   host.addEventListener('dragstart',this.dragStart=e=>{const legend=e.target.closest('[data-legend]');if(legend){this.dragging=legend.dataset.legend;e.dataTransfer.setData('text/plain',this.dragging);e.dataTransfer.effectAllowed='move';}});
   host.addEventListener('dragover',this.dragOver=e=>{if(e.target.closest('[data-legend]')){e.preventDefault();e.dataTransfer.dropEffect='move';}});
@@ -49,7 +49,6 @@ class BlockStatusView {
     this.summary=summary;this.revision=summary.revision??0;this.cache.clear();this.loads.clear();this.total=Number(summary.total_blocks??summary.total_count??0);this.drawStats();
     const position=this.position();await this.loadPage(Math.floor(position.first/this.limit),ticket);if(!this.valid(ticket,id))return;
     this.schedule();this.feedback('已刷新 · '+new Date().toLocaleTimeString('zh-CN',{hour12:false}));
-    if(this.host.querySelector('.blocks-diagnostics')?.open){const stats=await this.request('sync.diagnostics',{id});if(this.valid(ticket,id))this.drawDiagnostics(stats);}
    }catch(error){if(this.valid(ticket,id)){this.summary=old.summary;this.revision=old.revision;this.cache=old.cache;this.total=old.total;this.drawStats();this.schedule();this.feedback('刷新失败，保留已有显示：'+error.message,true);}}
    finally{if(this.valid(ticket,id)){button.disabled=false;button.textContent='刷新';this.refreshing=null;}}
   })();this.refreshing=work;return work;
@@ -78,8 +77,9 @@ class BlockStatusView {
    finally{if(this.valid(ticket,id)){this.loads.delete(key);this.schedule();}}
   })();this.loads.set(key,work);return work;
  }
- state(block){return block.sync_state||'local';}
+ state(block){return block.unresolved===true||block.resolved===false?'unresolved':block.sync_state||'local';}
  color(block){
+  if(this.state(block)==='unresolved')return 'unresolved';
   const tags=new Set([this.state(block)]);if(block.snapshot_pinned)tags.add('snapshot');if(block.kind==='metadata'||block.kind==='control'||block.content_type==='container_index')tags.add('metadata');
   return this.order.find(x=>tags.has(x))||'local';
  }
@@ -111,6 +111,7 @@ class BlockStatusView {
   this.host.querySelector('.blocks-types').innerHTML=(s.types||[]).map(type=>`<button class="type-chip${this.filter.content_type===type.id?' active':''}" data-type-filter="${this.esc(type.id)}"><span>${this.esc(type.label||names[type.id]||type.id)}</span><b>${type.objects??0}</b><small>待传 ${type.pending_objects??0} · 压缩前 ${this.bytes(type.pending_bytes??0)}</small></button>`).join('');
   this.host.querySelector('.blocks-types').insertAdjacentHTML('beforeend','<span class="type-chip"><span>本地控制数据</span><small>不计入上传量</small></span>');
   this.host.querySelector('.blocks-filter').innerHTML=`<span>${Number(s.total_blocks??0)} 个物理块${Object.keys(this.filter).length?' · 当前筛选 '+this.total+' 个':''}</span>${Object.keys(this.filter).length?'<button class="quiet small" data-block-op="clear">清除筛选</button>':''}<span class="muted">上传按对象身份计数；筛选显示本地物理块，快照引用不代表正在上传</span>`;
+  if(s.index_complete===false||this.disk?.replica?.indexComplete===false)this.host.querySelector('.blocks-filter').insertAdjacentHTML('beforeend','<span class="blocks-unresolved-note">云端索引尚未全部展开；统计仅包含已知对象，未展开区域不计为空闲。查看本页不会下载未访问内容。</span>');
  }
  async applyFilter(key,value){
   if(key){if(this.filter[key]===value)delete this.filter[key];else this.filter[key]=value;}else this.filter={};
@@ -122,13 +123,7 @@ class BlockStatusView {
   try{
    const changes=await this.request('blocks.changes',{id,since_revision:this.revision});if(!this.autoRefresh||!this.valid(ticket,id))return;
    if(changes.revision!==this.revision||changes.reset_required){await this.refresh();return;}
-   const details=this.host?.querySelector('.blocks-diagnostics');if(this.autoRefresh&&details?.open){const stats=await this.request('sync.diagnostics',{id});if(this.autoRefresh&&this.valid(ticket,id))this.drawDiagnostics(stats);}
   }catch(error){if(this.autoRefresh&&this.valid(ticket,id))this.feedback('自动更新暂不可用：'+error.message,true);}finally{this.ticking=false;}
- }
- drawDiagnostics(stats){
-  const labels={phase:'当前阶段',message:'正在处理',queue_wait_ms:'请求排队（ms）',filesystem_flush_ms:'文件系统刷新（ms）',physical_read_bytes:'本地读取',physical_write_bytes:'本地写入',upload_read_bytes:'上传读取',foreground_read_bytes:'前台读取',foreground_write_bytes:'前台写入',changed_pages:'实际变化页',deduplicated_pages:'相同内容写入',api_requests:'网盘请求',api_queued:'网盘排队请求',api_active:'网盘进行中请求',api_requests_per_second:'全局请求上限（次/秒）',sent_bytes:'实际传输',reused_bytes:'复用内容',seal_fresh_pages:'封口复用新页',seal_disk_pages:'封口读取旧页',seal_validated_pages:'旧页认证校验',seal_padding_write_bytes:'封口补零写入',crypto_pages:'批量页编码',crypto_parallel_pages:'并行编码页',crypto_worker_limit:'编码工作线程上限',metadata_write_pages:'索引写入页',metadata_write_batches:'合并索引写入次数',cloud_index_lookup_batches:'增量索引查询批次'};
-  const fields=Object.entries(stats||{}).filter(([k,v])=>labels[k]&&typeof v!=='object');
-  const host=this.host?.querySelector('.blocks-diagnostics>div');if(host)host.innerHTML=fields.map(([k,v])=>`<div><span>${labels[k]}</span><b>${this.esc(k.endsWith('_bytes')?this.bytes(v):v)}</b></div>`).join('')||'<span class="muted">暂无诊断数据</span>';
  }
  async click(event){
   const status=event.target.closest('[data-status-filter]'),type=event.target.closest('[data-type-filter]'),button=event.target.closest('[data-physical-block]'),op=event.target.closest('[data-block-op]')?.dataset.blockOp;

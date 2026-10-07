@@ -189,7 +189,7 @@ impl Volume {
         let s = rt.state.lock().map_err(|_| Error::Poisoned)?;
         let ready = c.cache.backing.is_some() && c.published_root != 0 && reader.root.cache_capable;
         Ok(
-            json!({"object_size":g.object_size,"max_bytes":c.cache.max_bytes,"policy":c.cache.policy,"online":rt.online.load(Ordering::Acquire),"source_ready":ready,"origin_ready":c.lazy_backing.is_some(),"eviction_ready":ready||c.lazy_backing.is_some(),"origin_backing":source_from_origin(&c,reader.root.id),"backing":c.cache.backing,"allocated_bytes":allocated,"cached_bytes":reader.root.lazy_cached_objects*g.object_size,"over_limit_bytes":if c.cache.max_bytes==0{0}else{allocated.saturating_sub(c.cache.max_bytes)},"missing_objects":reader.root.lazy_missing_objects,"evicted_objects":c.cache.evicted_objects,"evicted_bytes":c.cache.evicted_bytes,"pending_reclaims":c.cache.pending.len(),"blocked_reason":s.blocked,"more_work":s.more}),
+            json!({"object_size":g.object_size,"max_bytes":c.cache.max_bytes,"policy":c.cache.policy,"online":rt.online.load(Ordering::Acquire),"source_ready":ready,"origin_ready":c.lazy_backing.is_some(),"origin_pin_required":c.replica.is_some(),"eviction_ready":ready||c.lazy_backing.is_some(),"origin_backing":source_from_origin(&c,reader.root.id),"backing":c.cache.backing,"allocated_bytes":allocated,"cached_bytes":reader.root.lazy_cached_objects*g.object_size,"over_limit_bytes":if c.cache.max_bytes==0{0}else{allocated.saturating_sub(c.cache.max_bytes)},"missing_objects":reader.root.lazy_missing_objects,"evicted_objects":c.cache.evicted_objects,"evicted_bytes":c.cache.evicted_bytes,"pending_reclaims":c.cache.pending.len(),"blocked_reason":s.blocked,"more_work":s.more}),
         )
     }
     pub(super) fn cache_control(&self, r: &Value) -> Result<Value> {
@@ -219,6 +219,13 @@ impl Volume {
                     .filter(|v| v.len() <= 64)
                     .ok_or_else(|| invalid("GC candidates require at most 64 IDs"))?;
                 let (_lease, mut reader, c) = self.cache_view()?;
+                // An unexpanded subtree can name an object that is not yet in
+                // the local catalogue. Absence is not proof that GC is safe.
+                let source_limit = if reader.root.deferred_index {
+                    let s = self.shared.store.lock().map_err(|_| Error::Poisoned)?;
+                    let range = store::allocation_range(&s.config)?;
+                    if c.replica.as_ref().is_some_and(|r| r.mode == "copy") { range.start } else { range.end }
+                } else { 0 };
                 let old_readers = self
                     .shared
                     .readers
@@ -243,7 +250,7 @@ impl Volume {
                     let oid = u64::from_le_bytes(uuid.as_bytes()[8..].try_into().unwrap());
                     let root = reader.root.objects;
                     let row = tree::get(&mut reader, &OBJECTS, root, oid)?;
-                    let mut protect = old_readers || pins.contains_key(&oid);
+                    let mut protect = old_readers || pins.contains_key(&oid) || oid < source_limit;
                     if let Some(row) = row {
                         let o = Object::decode(oid, &row)?;
                         if o.id == uuid {
@@ -333,6 +340,7 @@ impl Volume {
                         ));
                     }
                     replaced = source_from_origin(&s.cloud, s.config.id)
+                        .filter(|_| s.cloud.replica.is_none())
                         .filter(|old| same_root(old, &backing))
                         .map(|b| b["reader_pin"].clone());
                     s.promote_cache_capability()?;

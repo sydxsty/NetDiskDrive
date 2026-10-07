@@ -88,7 +88,7 @@ internal static partial class Program
             ,("object-size: invalid part indices checksums and declared sizes reject", ObjectSizeMultipartRejects)
             ,("object-size: 8/16 MiB known downloads preserve exact length without metadata probes", ObjectSizeKnownReads)
         };
-        tests = tests.Concat(ObjectTransportTests).Concat(EncodedObjectTests).ToArray();
+        tests = tests.Concat(ObjectTransportTests).Concat(EncodedObjectTests).Concat(ReplicaReaderBackendTests).ToArray();
         if (args.Length != 0)
         {
             if (args.Length != 2 || args[0] != "--filter") { Console.Error.WriteLine("Use --filter <test-name> to select a focused test."); return 2; }
@@ -722,6 +722,7 @@ internal static partial class Program
                     if (!directories.Contains(dir)) return Json(new { errno = -9 });
                     string Parent(string path) { var index = path.LastIndexOf('/'); return index == 0 ? "/" : path[..index]; }
                     var names = Files.Keys.Concat(directories.Where(x => x != "/")).Where(x => Parent(x) == dir).Order(StringComparer.Ordinal).ToArray();
+                    if (query.GetValueOrDefault("desc") == "1") Array.Reverse(names);
                     var page = RepeatPages ? 1 : int.Parse(query["page"]); var size = int.Parse(query["num"]);
                     return Json(new { errno = 0, list = names.Skip((page - 1) * size).Take(size).Select(x => Entry(x, directories.Contains(x))).ToArray() });
                 case "/api/precreate":

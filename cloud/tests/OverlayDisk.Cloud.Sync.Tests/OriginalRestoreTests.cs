@@ -20,13 +20,14 @@ internal static class OriginalRestoreTests
         ("original restore rechecks latest and refuses changed or divergent commits", LatestChanged),
         ("original restore safely abandons absent-container intents without cloud mutation", ProvenCache),
         ("original restore drops unprovable deletion proof and checks the native published root", UnprovenCache),
-        ("original restore cannot return a binding after its baseline cache save fails", SaveFailure)
+        ("original restore cannot return a binding after its baseline cache save fails", SaveFailure),
+        ("original restore reader variant checks fresh newest path without rereading known commit", ReaderDiscovery)
     ];
     private static void Assert(bool condition, string reason) { if (!condition) throw new Exception(reason); }
     private static async Task Reject(Func<Task> action)
     { try { await action(); } catch (IOException) { return; } throw new Exception("Unsafe original restore was accepted"); }
 
-    private sealed class Store : ICloudObjectStore
+    private sealed class Store : ICloudObjectStore, ICloudDescendingDirectoryReader
     {
         public string ProviderId => "original-restore-test";
         internal string AccountId = Account;
@@ -48,6 +49,13 @@ internal static class OriginalRestoreTests
         {
             Calls.Add("list:" + directory); Assert(directory == Root + "/commits", "Original attach enumerated the object inventory");
             foreach (var (path, bytes) in Metadata.Where(pair => pair.Key.StartsWith(directory + "/", StringComparison.Ordinal)).OrderBy(pair => pair.Key, StringComparer.Ordinal))
+            { cancellationToken.ThrowIfCancellationRequested(); yield return new(path, bytes.Length, false); }
+            await Task.CompletedTask;
+        }
+        public async IAsyncEnumerable<CloudObjectInfo> ListByNameDescendingAsync(string directory, [EnumeratorCancellation] CancellationToken cancellationToken = default)
+        {
+            Calls.Add("descending:" + directory); Assert(directory == Root + "/commits", "Reader original attach scanned objects");
+            foreach (var (path, bytes) in Metadata.Where(pair => pair.Key.StartsWith(directory + "/", StringComparison.Ordinal)).OrderByDescending(pair => pair.Key, StringComparer.Ordinal))
             { cancellationToken.ThrowIfCancellationRequested(); yield return new(path, bytes.Length, false); }
             await Task.CompletedTask;
         }
@@ -219,5 +227,16 @@ internal static class OriginalRestoreTests
         await using var store = new Store(); var cache = new RefusingSaveCache();
         await Reject(() => new CloudRepository(store, cache, Account).PrepareOriginalRestoreAsync(Volume, Commit()));
         await using var lease = await cache.AcquireAsync(Scope(store)); Assert(await cache.LoadAsync(Scope(store)) is null, "Failed cache write granted an original writer baseline");
+    }
+
+    private static async Task ReaderDiscovery()
+    {
+        await using var store = new Store(); var cache = new MemoryCloudSyncCache(); var repository = new CloudRepository(store, cache, Account);
+        var binding = await repository.PrepareOriginalRestoreForReplicaAsync(Volume, Commit());
+        Assert(binding == Binding(store) && store.Calls.SequenceEqual(new[] { "account", "read:" + Root + "/owner.json", "descending:" + Root + "/commits" }),
+            "Reader original attach probed directories, enumerated history or downloaded its known commit");
+        store.Add(Commit(8));
+        await Reject(() => repository.PrepareOriginalRestoreForReplicaAsync(Volume, Commit()));
+        Assert((await Load(cache, store)).Latest?.Generation == 7, "Failed fresh check changed original writer baseline");
     }
 }

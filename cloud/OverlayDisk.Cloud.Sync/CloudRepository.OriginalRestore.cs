@@ -14,7 +14,14 @@ public sealed partial class CloudRepository
     /// The caller must also exclude active local jobs/duplicate containers: an unconfirmed
     /// intent left by a deleted container can be abandoned after fresh cloud verification.
     /// </summary>
-    public async Task<CloudBinding> PrepareOriginalRestoreAsync(string volumeId, RemoteCommit expectedCommit, CancellationToken ct = default)
+    public Task<CloudBinding> PrepareOriginalRestoreAsync(string volumeId, RemoteCommit expectedCommit, CancellationToken ct = default)
+        => PrepareOriginalRestoreCoreAsync(volumeId, expectedCommit, false, ct);
+
+    /// <summary>Reader import variant with fresh newest-first discovery and known descriptor reuse.</summary>
+    public Task<CloudBinding> PrepareOriginalRestoreForReplicaAsync(string volumeId, RemoteCommit expectedCommit, CancellationToken ct = default)
+        => PrepareOriginalRestoreCoreAsync(volumeId, expectedCommit, true, ct);
+
+    private async Task<CloudBinding> PrepareOriginalRestoreCoreAsync(string volumeId, RemoteCommit expectedCommit, bool replicaReader, CancellationToken ct)
     {
         ArgumentNullException.ThrowIfNull(expectedCommit);
         string root = RootPath(volumeId), expectedPath = CommitPath(root, expectedCommit);
@@ -42,7 +49,7 @@ public sealed partial class CloudRepository
         var scope = Scope(binding, volumeId);
         await using var lease = await Cache.AcquireAsync(scope, ct);
         var state = await LoadCacheAsync(scope, ct);
-        var latest = await LatestAsync(root, ct);
+        var latest = replicaReader ? await LatestForReplicaAsync(root, expectedCommit, ct) : await LatestAsync(root, ct);
         if (latest is not { } current || current.Commit != expectedCommit || current.Path != expectedPath)
             throw new IOException("云端最新版本已变化，请重新选择版本；尚未接回原云盘写入身份。");
         if (state.Latest is { } previous && (previous.Generation > expectedCommit.Generation ||

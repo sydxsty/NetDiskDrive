@@ -50,6 +50,9 @@ public sealed partial class ApplicationService : IApplicationService
         public long FileSystemFlushMs;
         public DateTimeOffset PhaseStartedUtc = DateTimeOffset.UtcNow;
         public long? CompletedPages, TotalPages, CompletedIndexNodes;
+        public long DownloadedBytes;
+        public bool ReadyToMount;
+        public string? VerifiedScope;
     }
     public event EventHandler? StateChanged;
     public ApplicationService()
@@ -121,6 +124,9 @@ public sealed partial class ApplicationService : IApplicationService
                 foreach (var d in Disks())
                 {
                     string id = Text(d, "id"); bool eligible;
+                    if (replicaRuns.TryGetValue(id, out var replicaRun) && replicaRun.Active
+                        || d.TryGetProperty("replica", out var replicaState) && replicaState.ValueKind == JsonValueKind.Object
+                        && replicaState.TryGetProperty("candidate", out var replicaCandidate) && replicaCandidate.ValueKind == JsonValueKind.Object) continue;
                     lock (gate) eligible = settings.Bindings.ContainsKey(id) && !settings.PausedDisks.Contains(id);
                     bool cleanupDue = pendingMaintenance.GetValueOrDefault(id) && (!maintenanceAfter.TryGetValue(id, out var due) || DateTimeOffset.UtcNow >= due);
                     bool needsCacheSetup;
@@ -222,6 +228,7 @@ public sealed partial class ApplicationService : IApplicationService
             lock (gate) values["localCache"] = settings.LocalCaches.GetValueOrDefault(Text(disk, "id")) ?? new LocalCacheSettings();
             values["cacheError"] = cacheErrors.GetValueOrDefault(Text(disk, "id")) ?? Text(disk, "cacheError");
             values["sync"] = SyncView(disk); views.Add(values);
+            values["replica"] = ReplicaView(disk);
         }
         var tasks = runs.Values.Select(TaskView).ToList();
         var snapshot = CachedWorkerState();
@@ -246,13 +253,20 @@ public sealed partial class ApplicationService : IApplicationService
         if (run?.Task?.IsCompleted != false && enabled && !paused && NeedsSync(disk) && state == "synced") { state = "pending"; message = "有新变更，等待同步"; }
         return new { enabled, state, message, uploadedBytes = p?.UploadedBytes ?? 0, logicalUploadedBytes = p?.LogicalUploadedBytes ?? 0, reusedBytes = p?.ReusedBytes ?? 0, completedBytes = p?.CompletedBytes ?? 0, totalBytes = p?.TotalBytes ?? 0, pendingBytes = p?.Phase is "uploading" or "preparing" or "publishing" ? p.PendingBytes : estimate, estimated = p?.Estimated ?? true, lastSuccessUtc = last };
     }
-    private static object TaskView(JobRun r) => new { id = r.Id, diskId = r.DiskId, kind = r.Kind, title = r.Title, state = r.Progress.Phase, message = r.Progress.Message, uploadedBytes = r.Progress.UploadedBytes, logicalUploadedBytes = r.Progress.LogicalUploadedBytes, reusedBytes = r.Progress.ReusedBytes, completedBytes = r.Progress.CompletedBytes, totalBytes = r.Progress.TotalBytes, completedPages = r.CompletedPages, totalPages = r.TotalPages, completedIndexNodes = r.CompletedIndexNodes, pendingBytes = r.Kind == "sync" ? (long?)r.Progress.PendingBytes : null, error = r.Progress.Error, canPause = r.Task is { IsCompleted: false }, canResume = r.Task is not { IsCompleted: false } && r.Progress.Phase is "paused" or "error", requiresPassword = r.RequiresPassword };
+    private static object TaskView(JobRun r) => new { id = r.Id, diskId = r.DiskId, kind = r.Kind, title = r.Title, state = r.Progress.Phase, message = r.Progress.Message, uploadedBytes = r.Progress.UploadedBytes, logicalUploadedBytes = r.Progress.LogicalUploadedBytes, reusedBytes = r.Progress.ReusedBytes, downloadedBytes = r.Kind is "restore" or "replica" ? (long?)Interlocked.Read(ref r.DownloadedBytes) : null, readyToMount = r.ReadyToMount, verifiedScope = r.VerifiedScope, completedBytes = r.Progress.CompletedBytes, totalBytes = r.Progress.TotalBytes, completedPages = r.CompletedPages, totalPages = r.TotalPages, completedIndexNodes = r.CompletedIndexNodes, pendingBytes = r.Kind == "sync" ? (long?)r.Progress.PendingBytes : null, error = r.Progress.Error, canPause = r.Kind != "replica" && r.Task is { IsCompleted: false }, canResume = r.Kind != "replica" && r.Task is not { IsCompleted: false } && r.Progress.Phase is "paused" or "error", requiresPassword = r.RequiresPassword };
 
     public async Task<object?> InvokeAsync(string method, JsonElement args, CancellationToken ct)
     {
         string id = Text(args, "id");
+        if (method is "sync.enable" or "sync.cleanup" or "sync.now" or "sync.resume" or "cache.settings"
+            && replicaRuns.TryGetValue(id, out var replicaRun) && replicaRun.Active)
+            throw new IOException("正在准备或确认云端快照，请先完成加载或取消。");
         switch (method)
         {
+            case "replica.prepare": return await PrepareReplicaAsync(id, ct);
+            case "replica.apply": return await ApplyReplicaAsync(id, args, ct);
+            case "replica.cancel": return await CancelReplicaAsync(id, args, ct);
+            case "replica.status": return await ReplicaStatusAsync(id, ct);
             case "app.state": return await GetStateAsync(ct);
             case "tasks.logs":
             {
@@ -293,7 +307,7 @@ public sealed partial class ApplicationService : IApplicationService
                 }
                 finally { settingsGate.Release(); }
             }
-            case "cloud.list": return await Repository().ListDisksAsync(ct);
+            case "cloud.list": return await Repository().ListDisksForReplicaAsync(ct);
             case "cache.settings":
                 await accountGate.WaitAsync(ct);
                 try { RequireRunning(); return await SaveCacheSettingsAsync(id, args, ct); }
@@ -441,6 +455,19 @@ public sealed partial class ApplicationService : IApplicationService
         string recordId = pin[pinPrefix.Length..^5];
         if (!Guid.TryParse(recordId, out _)) throw new IOException("按需磁盘的来源引用无效。");
         string id = Text(disk, "id"), path = Text(disk, "containerPath");
+        var nativeReplica = disk.TryGetProperty("replica", out var replica) && replica.ValueKind == JsonValueKind.Object ? replica : Element(new { });
+        RemoteCommit? authenticatedCommit = null;
+        CloudBinding? authenticatedBinding = null;
+        if (Text(nativeReplica, "mode") == "original" && disk.TryGetProperty("cloud", out var nativeCloud) && nativeCloud.ValueKind == JsonValueKind.Object
+            && nativeCloud.TryGetProperty("binding", out var nativeBinding) && nativeBinding.ValueKind == JsonValueKind.Object
+            && Text(nativeBinding, "backend_id") == "baidu-private-web" && Text(nativeBinding, "account_id") == accountId
+            && Text(nativeBinding, "remote_root") == root && Guid.TryParse(Text(nativeBinding, "device_id"), out _))
+            authenticatedBinding = new("baidu-private-web", accountId, root, Text(nativeBinding, "device_id"));
+        if (nativeReplica.TryGetProperty("commit", out var commitValue) && commitValue.ValueKind == JsonValueKind.Object)
+            authenticatedCommit = commitValue.Deserialize<RemoteCommit>(SettingsStorage.Json);
+        if (authenticatedCommit is { } described && (described.VolumeId != sourceId || described.RootObjectId != rootId
+            || !described.RootSha256.Equals(hash, StringComparison.OrdinalIgnoreCase) || described.ObjectSizeBytes != DiskObjectSize(disk)))
+            throw new IOException("磁盘的云端提交记录与已认证来源不一致。");
         bool changed = false;
         lock (gate)
         {
@@ -450,12 +477,25 @@ public sealed partial class ApplicationService : IApplicationService
                     !existing.Commit.RootSha256.Equals(hash, StringComparison.OrdinalIgnoreCase) || existing.Commit.ObjectSizeBytes != DiskObjectSize(disk) || existing.LocalDiskId != id || existing.ContainerDeleted)
                     throw new IOException("云端磁盘来源与本地记录冲突。");
                 if (existing.TargetPath != path) { existing.TargetPath = path; changed = true; }
+                if (existing.PreparedReplicaOnly) { existing.PreparedReplicaOnly = false; changed = true; }
+                if (authenticatedBinding != null && existing.Mode == "original" && existing.OriginalBinding is null)
+                { existing.OriginalBinding = authenticatedBinding; changed = true; }
+                if (authenticatedCommit != null && !existing.VerifiedCommit)
+                { existing.Commit = authenticatedCommit; existing.VerifiedCommit = true; changed = true; }
             }
             else
             {
+                if (authenticatedCommit is null && settings.ReplicaCandidates.TryGetValue(id, out var completedCandidate)
+                    && completedCandidate.Commit.RootObjectId == rootId && completedCandidate.Commit.RootSha256.Equals(hash, StringComparison.OrdinalIgnoreCase))
+                    authenticatedCommit = completedCandidate.Commit;
+                string mode = Text(nativeReplica, "mode", "copy");
+                var predecessor = settings.Restores.Values.FirstOrDefault(r => r.LocalDiskId == id && r.AccountId == accountId && r.RemoteRoot == root);
                 settings.Restores[recordId] = new RestoreRecord { Id = recordId, LocalDiskId = id, AccountId = accountId, RemoteRoot = root,
                     ReaderPin = pin, TargetPath = path, Name = Text(disk, "name"), Lazy = true, Begun = true, Complete = true,
-                    Commit = new RemoteCommit(4, sourceId, settings.DeviceId, 0, Text(disk, "name"), UInt(disk, "capacityBytes"), Flag(disk, "encrypted"), rootId, hash, DateTimeOffset.MinValue) { ObjectSizeBytes = DiskObjectSize(disk) } };
+                    Mode = mode, OriginalConfirmed = mode == "original", OriginalBinding = mode == "original" ? authenticatedBinding ?? predecessor?.OriginalBinding ?? settings.Bindings.GetValueOrDefault(id) : null,
+                    VerifiedCommit = authenticatedCommit != null,
+                    Commit = authenticatedCommit ?? new RemoteCommit(4, sourceId, settings.DeviceId, UInt(nativeReplica, "generation"), Text(disk, "name"), UInt(disk, "capacityBytes"), Flag(disk, "encrypted"), rootId, hash, DateTimeOffset.MinValue) { ObjectSizeBytes = DiskObjectSize(disk) } };
+                settings.ReplicaCandidates.Remove(id);
                 changed = true;
             }
         }
@@ -466,7 +506,9 @@ public sealed partial class ApplicationService : IApplicationService
         lock (jobGate)
         {
             if (!cloudReadsOpen) throw new IOException("网盘连接正在切换，请稍后重试。");
-            var linked = CancellationTokenSource.CreateLinkedTokenSource(ct, cloudReadLifetime.Token);
+            var linked = replicaRuns.TryGetValue(request.DiskId, out var preparingReplica) && preparingReplica.Active && preparingReplica.Job.Progress.Phase != "switching"
+                ? CancellationTokenSource.CreateLinkedTokenSource(ct, cloudReadLifetime.Token, preparingReplica.Job.Cancellation.Token)
+                : CancellationTokenSource.CreateLinkedTokenSource(ct, cloudReadLifetime.Token);
             long sequence = Interlocked.Increment(ref cloudReadSequence);
             // Task.Run ensures registration precedes completion even for an immediate validation failure.
             var task = Task.Run(async () =>
@@ -481,9 +523,17 @@ public sealed partial class ApplicationService : IApplicationService
                         request.Prefetch ? "预取即将访问的云端块" : "等待网盘下载当前读写所需的块", objectId: request.ObjectId, bytes: request.Length);
                     try
                     {
-                        var bytes = await repository.ReadObjectAsync(remoteRoot, request.ObjectId, request.Sha256, request.Length, linked.Token);
+                        var downloaded = await repository.ReadObjectForReplicaAsync(remoteRoot, request.ObjectId, request.Sha256, request.Length, linked.Token);
+                        var bytes = downloaded.Canonical;
+                        if (replicaRuns.TryGetValue(request.DiskId, out var pulling) && pulling.Active)
+                            Interlocked.Add(ref pulling.Job.DownloadedBytes, downloaded.WireBytes);
+                        else
+                        {
+                            var restoring = runs.Values.FirstOrDefault(r => r.Kind == "restore" && r.DiskId == request.DiskId && r.Task is { IsCompleted: false });
+                            if (restoring != null) Interlocked.Add(ref restoring.DownloadedBytes, downloaded.WireBytes);
+                        }
                         Log(request.DiskId, "", "download", request.Prefetch ? "prefetch.verified" : "demand.verified",
-                            "云端块已通过长度和摘要校验，正在交给磁盘缓存", objectId: request.ObjectId, bytes: bytes.Length);
+                            "云端块已通过长度和摘要校验，正在交给磁盘缓存", objectId: request.ObjectId, bytes: bytes.Length, wireBytes: downloaded.WireBytes);
                         return bytes;
                     }
                     catch (OperationCanceledException) { throw; }
@@ -627,6 +677,7 @@ public sealed partial class ApplicationService : IApplicationService
         {
         if ((!networkAdmissionsOpen || exiting) && !allowDuringExit) throw new IOException("正在结束当前网络任务，请稍候。");
         if (deletingDisks.Contains(id)) throw new IOException("磁盘正在删除。");
+        if (replicaRuns.TryGetValue(id, out var pulling) && pulling.Active) throw new IOException("正在加载云端快照，请先完成或取消加载。");
         lock (gate) if (settings.PausedDisks.Contains(id) && !allowDuringExit) throw new IOException("同步已暂停，请点击继续。");
 
         var repository = Repository(); CloudBinding binding; int concurrency;
@@ -768,7 +819,10 @@ public sealed partial class ApplicationService : IApplicationService
             tasks = runs.Values.Where(r => r.Task is { IsCompleted: false }).ToArray();
             foreach (var task in tasks) task.Cancellation.Cancel();
         }
-        await Task.WhenAll(tasks.Select(t => t.Task!));
+        try { await Task.WhenAll(tasks.Select(t => t.Task!)); }
+        catch when (tasks.All(t => t.Task!.IsCompleted)) { /* Each task owns its logged failure/cancellation. */ }
+        foreach (var pair in replicaRuns.Where(p => p.Value.Active).ToArray())
+            await CancelReplicaAsync(pair.Key, Element(new { id = pair.Key }), CancellationToken.None);
     }
     private async Task UnmountAndSyncAsync(string id, CancellationToken ct)
     {
@@ -898,12 +952,12 @@ public sealed partial class ApplicationService : IApplicationService
             }
         }
         await worker.InvokeAsync("restore.preflight", Element(new { mode, sourceVolumeId = volumeId, path }), ct);
-        var current = await repository.LatestAsync(root, ct) ?? throw new IOException("云端没有完整版本。");
-        var originalBinding = original ? await repository.PrepareOriginalRestoreAsync(volumeId, current.Commit, ct) : null;
+        var current = await repository.LatestForReplicaAsync(root, ct: ct) ?? throw new IOException("云端没有完整版本。");
+        var originalBinding = original ? await repository.PrepareOriginalRestoreForReplicaAsync(volumeId, current.Commit, ct) : null;
         var record = new RestoreRecord { AccountId = account!.AccountId, RemoteRoot = root, TargetPath = path,
             Name = Text(args, "name", current.Commit.Name + (original ? "" : " 副本")), Commit = current.Commit,
-            Mode = mode, OriginalConfirmed = original, OriginalBinding = originalBinding,
-            Lazy = !args.TryGetProperty("lazy", out var lazyMode) || lazyMode.ValueKind != JsonValueKind.False };
+            Mode = mode, OriginalConfirmed = original, OriginalBinding = originalBinding, VerifiedCommit = true,
+            Lazy = true };
         record.ReaderPin = root + "/readers/" + record.Id + ".json";
         lock (gate)
         {
@@ -937,23 +991,17 @@ public sealed partial class ApplicationService : IApplicationService
             try
             {
                 run.Progress = new("downloading", "正在验证云端版本", 0, record.Commit.ObjectSizeBytes, 0); Changed();
-                if (record.Mode == "original")
+                if (record.Mode == "original" && (record.Begun || record.OriginalBinding is null))
                 {
-                    var binding = await repository.PrepareOriginalRestoreAsync(record.Commit.VolumeId, record.Commit, ct);
+                    var binding = await repository.PrepareOriginalRestoreForReplicaAsync(record.Commit.VolumeId, record.Commit, ct);
                     lock (gate) record.OriginalBinding = binding;
                     Save();
                 }
-                if (await repository.Store.HeadAsync(record.ReaderPin!, ct) is null)
-                    await repository.PinReaderAsync(record.RemoteRoot, record.Commit, record.Id, ct);
-                else
-                {
-                    var pinBytes = await repository.ReadBytesAsync(record.ReaderPin!, 16384, ct);
-                    using var pin = JsonDocument.Parse(pinBytes);
-                    if (pin.RootElement.GetProperty("rootObjectId").GetString() != record.Commit.RootObjectId || pin.RootElement.GetProperty("rootSha256").GetString() != record.Commit.RootSha256) throw new IOException("云端恢复引用与本地任务不一致。");
-                }
-                byte[] root = await repository.ReadObjectAsync(record.RemoteRoot, record.Commit.RootObjectId, record.Commit.RootSha256, record.Commit.ObjectSizeBytes, ct);
+                await repository.EnsureReplicaReaderAsync(record.RemoteRoot, record.Commit, record.Id, record.Begun, ct);
+                var downloadedRoot = await repository.ReadObjectForReplicaAsync(record.RemoteRoot, record.Commit.RootObjectId, record.Commit.RootSha256, record.Commit.ObjectSizeBytes, ct);
+                byte[] root = downloadedRoot.Canonical; Interlocked.Add(ref run.DownloadedBytes, downloadedRoot.WireBytes);
                 var begin = Element(await worker.BeginRestoreAsync(Element(new { path = record.TargetPath, name = record.Name, password, resume = record.Begun || File.Exists(record.TargetPath), lazy = record.Lazy,
-                    mode = record.Mode, sourceVolumeId = record.Commit.VolumeId, objectSizeBytes = record.Commit.ObjectSizeBytes,
+                    mode = record.Mode, sourceVolumeId = record.Commit.VolumeId, objectSizeBytes = record.Commit.ObjectSizeBytes, commit = record.Commit,
                     publication = record.OriginalBinding is { } originalBinding ? new { commit = record.Commit,
                         binding = new { backend_id = originalBinding.ProviderId, account_id = originalBinding.AccountId,
                             remote_root = originalBinding.RemoteRoot, device_id = originalBinding.DeviceId, enabled = true } } : null,
@@ -961,6 +1009,7 @@ public sealed partial class ApplicationService : IApplicationService
                         remote_root = record.RemoteRoot, root_object_id = record.Commit.RootObjectId, root_sha256 = record.Commit.RootSha256, reader_pin = record.ReaderPin }
                 }), root, ct));
                 workerId = begin.GetProperty("id").GetString()!;
+                run.DiskId = workerId; run.VerifiedScope = ReplicaVerification;
                 lock (gate) { record.WorkerId = workerId; record.LocalDiskId = workerId; record.Begun = true; } Save();
                 while (true)
                 {
@@ -980,8 +1029,8 @@ public sealed partial class ApplicationService : IApplicationService
                     run.CompletedIndexNodes = SyncCoordinator.GetLong(status, "completed_nodes");
                     string activePhase = phase == "building" ? Text(status, "work_phase") == "data" ? "verifying" : "indexing" : "downloading";
                     string indexProgress = run.TotalPages > 0
-                        ? $"已验证 {run.CompletedPages:N0} / {run.TotalPages:N0} 个页映射"
-                        : "正在验证索引根和对象引用";
+                        ? $"已验证 {run.CompletedPages:N0} 个页映射；未访问区域按需验证"
+                        : "正在验证挂载所需的索引根";
                     if (run.Progress.Phase != activePhase)
                     {
                         run.PhaseStartedUtc = DateTimeOffset.UtcNow;
@@ -1011,14 +1060,15 @@ public sealed partial class ApplicationService : IApplicationService
                     await Parallel.ForEachAsync(objects, new ParallelOptions { CancellationToken = ct, MaxDegreeOfParallelism = concurrency }, async (obj, token) =>
                     {
                         Log(run.DiskId, run.Id, "restore", "download.started", "开始下载恢复对象", objectId: obj.Id, objectKind: obj.Kind, bytes: obj.Length);
-                        var bytes = await repository.ReadObjectAsync(record.RemoteRoot, obj.Id, obj.Sha256, record.Commit.ObjectSizeBytes, token);
-                        await worker.AcceptRestoreObjectAsync(workerId!, obj.Id, bytes, token);
-                        Log(run.DiskId, run.Id, "restore", "download.confirmed", "恢复对象已校验并写入本地", objectId: obj.Id, objectKind: obj.Kind, bytes: obj.Length);
+                        var downloaded = await repository.ReadObjectForReplicaAsync(record.RemoteRoot, obj.Id, obj.Sha256, record.Commit.ObjectSizeBytes, token);
+                        await worker.AcceptRestoreObjectAsync(workerId!, obj.Id, downloaded.Canonical, token);
+                        Interlocked.Add(ref run.DownloadedBytes, downloaded.WireBytes);
+                        Log(run.DiskId, run.Id, "restore", "download.confirmed", "恢复对象已校验并写入本地", objectId: obj.Id, objectKind: obj.Kind, bytes: obj.Length, wireBytes: downloaded.WireBytes);
                     });
                 }
                 if (record.Mode == "original")
                 {
-                    var checkedBinding = await repository.PrepareOriginalRestoreAsync(record.Commit.VolumeId, record.Commit, ct);
+                    var checkedBinding = await repository.PrepareOriginalRestoreForReplicaAsync(record.Commit.VolumeId, record.Commit, ct);
                     if (checkedBinding != record.OriginalBinding) throw new IOException("恢复期间原硬盘的写入者记录发生变化。");
                 }
                 await worker.InvokeAsync("restore.finish", Element(new { id = workerId }), ct); workerId = null;
@@ -1038,7 +1088,8 @@ public sealed partial class ApplicationService : IApplicationService
                     try { await repository.Store.DeleteAsync(record.ReaderPin!, ct); lock (gate) record.ReaderPin = null; Save(); maintenanceAfter.TryRemove(record.Commit.VolumeId, out _); }
                     catch (IOException) { notice = "磁盘已恢复，远端恢复引用将在下次连接时清理。"; }
                 }
-                run.Progress = new("complete", record.Mode == "original" ? "原硬盘已恢复，可挂载；继续使用原云端目录和同步进度" : record.Lazy ? "副本索引已就绪，可挂载；文件内容在访问时下载并缓存" : "副本已恢复并校验，可在磁盘页挂载", run.Progress.TotalBytes, run.Progress.TotalBytes, 0); run.RequiresPassword = false;
+                run.Progress = new("complete", record.Mode == "original" ? "原硬盘已就绪，可挂载；未访问的索引和文件内容按需下载与验证" : record.Lazy ? "副本已就绪，可挂载；索引和文件内容按需下载与验证，云同步保持关闭" : "副本已恢复并校验，可在磁盘页挂载", run.Progress.TotalBytes, run.Progress.TotalBytes, 0); run.RequiresPassword = false;
+                run.ReadyToMount = true;
                 Log(run.DiskId, run.Id, "restore", "restore.completed", run.Progress.Message, generation: record.Commit.Generation);
                 await RefreshWorkerAsync(CancellationToken.None);
             }

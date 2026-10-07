@@ -45,6 +45,9 @@ internal static class Program
             if (args.Length > 0 && args[0] == "--lazy-smoke") return LazyHydrationSelfTests.RunAsync(RequirePath(args)).GetAwaiter().GetResult();
             if (args.Length > 0 && args[0] == "--lazy-mount-smoke") return LazyHydrationSelfTests.RunMountAsync(RequirePath(args)).GetAwaiter().GetResult();
             if (args.Length > 0 && args[0] == "--restore-mode-smoke") return RestoreModeSelfTests.RunAsync(RequirePath(args)).GetAwaiter().GetResult();
+            if (args.Length > 0 && args[0] == "--replica-smoke") return ReplicaSelfTests.RunAsync(RequirePath(args)).GetAwaiter().GetResult();
+            if (args.Length > 0 && args[0] == "--replica-gpt-smoke") return ReplicaSelfTests.RunGptAsync(RequirePath(args)).GetAwaiter().GetResult();
+            if (args.Length > 0 && args[0] == "--replica-mount-smoke") return ReplicaSelfTests.RunMountAsync(RequirePath(args)).GetAwaiter().GetResult();
             if (args.Length > 0 && args[0] == "--cache-smoke") return CachePolicySelfTests.RunAsync(RequirePath(args)).GetAwaiter().GetResult();
             if (args.Length > 0 && args[0] == "--readonly-smoke") return ReadOnlySelfTests.RunAsync(RequirePath(args)).GetAwaiter().GetResult();
             if (args.Length > 0 && args[0] == "--readonly-mount-smoke") return ReadOnlySelfTests.RunMountAsync(RequirePath(args)).GetAwaiter().GetResult();

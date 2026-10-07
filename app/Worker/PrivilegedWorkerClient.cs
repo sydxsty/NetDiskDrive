@@ -81,6 +81,11 @@ public sealed class PrivilegedWorkerClient : IAsyncDisposable
         var reply = await BulkAsync("restore.begin", args, rootObject, ct).ConfigureAwait(false);
         return reply.Header.TryGetProperty("data", out var data) ? data.Clone() : null;
     }
+    public async Task<object?> StageReplicaAsync(JsonElement args, ReadOnlyMemory<byte> rootObject, CancellationToken ct = default)
+    {
+        var reply = await BulkAsync("replica.stage", args, rootObject, ct).ConfigureAwait(false);
+        return reply.Header.TryGetProperty("data", out var data) ? data.Clone() : null;
+    }
     private async Task<WorkerReply> BulkAsync(string method, JsonElement args, ReadOnlyMemory<byte> bytes, CancellationToken ct)
     {
         if (_shuttingDown) throw new IOException("磁盘服务正在退出。");

@@ -60,8 +60,8 @@ pub(super) unsafe fn handle<'a>(pointer: *mut c_void) -> IoResult<&'a Handle> {
     if pointer.is_null() {
         return Err("V4 handle is null".into());
     }
-    // Inspect the tag before constructing a typed reference: V2/V3 handles have
-    // a different layout and must never be interpreted as a format-4 Handle.
+    // Inspect the tag before constructing a typed reference; a foreign handle
+    // must never be interpreted as this storage handle.
     if ptr::read_unaligned(pointer.cast::<u64>()) != HANDLE_MAGIC {
         return Err("handle does not belong to format 4".into());
     }
@@ -380,7 +380,7 @@ pub unsafe extern "C" fn od_v4_set_read_only(h: *mut c_void, enabled: u32) -> i3
         if enabled > 1 {
             return Err("read-only flag must be 0 or 1".into());
         }
-        handle(h)?.queue.call(Operation::V3Control(
+        handle(h)?.queue.call(Operation::Control(
             serde_json::json!({"cmd":"volume.read_only","enabled":enabled==1}),
         ))?;
         Ok(0)
@@ -736,7 +736,7 @@ pub unsafe extern "C" fn od_v4_control(
                 status.get("job").is_none_or(serde_json::Value::is_null)
             });
         let value = if needs_cut {
-            bytes(h.queue.call(Operation::V3Control(request))?)?
+            bytes(h.queue.call(Operation::Control(request))?)?
         } else {
             serde_json::to_vec(&h.volume.control(&request).map_err(|e| e.to_string())?)
                 .map_err(|e| e.to_string())?
@@ -769,6 +769,31 @@ pub unsafe extern "C" fn od_v4_read_export(
                 Err(error.to_string())
             }
         }
+    })
+}
+#[no_mangle]
+pub unsafe extern "C" fn od_v4_replica_identity(
+    h: *mut c_void, data: *const u8, length: u32,
+) -> i32 {
+    boundary(-1, || {
+        if length < 4 || length as usize > Volume::MAX_REPLICA_IDENTITY_FRAME {
+            return Err("invalid identity frame length".into());
+        }
+        handle(h)?.volume.replica_identity(input(data, length)?).map_err(|e| e.to_string())?;
+        Ok(0)
+    })
+}
+#[no_mangle]
+pub unsafe extern "C" fn od_v4_replica_stage(
+    h: *mut c_void, root: *const u8, length:u32, options:*const c_char,
+) -> i32 {
+    boundary(-1, || {
+        if !matches!(length,4_194_304|8_388_608|16_777_216){return Err("invalid replica root size".into());}
+        let options=text(options)?;
+        if options.len()>65536{return Err("replica options too large".into());}
+        let options=serde_json::from_str(&options).map_err(|e|format!("replica options: {e}"))?;
+        handle(h)?.volume.replica_stage(input(root,length)?,&options).map_err(|e|e.to_string())?;
+        Ok(0)
     })
 }
 #[no_mangle]
@@ -1022,22 +1047,29 @@ mod tests {
         }
     }
     #[test]
-    fn v4_rejects_legacy_containers_handles_and_small_mutation_outputs() {
+    fn v4_rejects_invalid_containers_handles_and_small_mutation_outputs() {
         unsafe {
             let directory = tempfile::tempdir().unwrap();
-            let old_path = c(directory.path().join("legacy.odv3").to_str().unwrap());
-            crate::v2::Volume::create_v3(directory.path().join("legacy.odv3"), 64 << 20, None)
-                .unwrap();
-            assert!(od_v4_open(old_path.as_ptr(), ptr::null()).is_null());
-            let old = crate::ffi_v3::od_v3_open(old_path.as_ptr(), ptr::null());
-            assert!(!old.is_null());
-            assert_eq!(od_v4_flush(old), -1);
-            crate::ffi_v2::od_v2_close(old);
+            let invalid = directory.path().join("invalid.odv4");
+            let mut bytes = [0u8; 4096];
+            bytes[..8].copy_from_slice(b"INVALID!");
+            std::fs::write(&invalid, bytes).unwrap();
+            let invalid_path = c(invalid.to_str().unwrap());
+            assert!(od_v4_open(invalid_path.as_ptr(), ptr::null()).is_null());
+            assert_eq!(od_v4_flush(ptr::null_mut()), -1);
+            let mut foreign_tag = 0u64;
+            assert_eq!(od_v4_flush((&mut foreign_tag as *mut u64).cast()), -1);
             let path = c(directory.path().join("new.odv4").to_str().unwrap());
             success(od_v4_create(path.as_ptr(), 64 << 20, ptr::null()));
             let disk = Disk(od_v4_open(path.as_ptr(), ptr::null()));
             assert!(!disk.0.is_null());
             let mut tiny = [0i8; 1];
+            assert_eq!(od_v4_replica_identity(disk.0, ptr::null(), 0), -1);
+            assert_eq!(od_v4_replica_identity(disk.0, ptr::null(), 4), -1);
+            assert_eq!(od_v4_replica_identity(disk.0, ptr::null(), u32::MAX), -1);
+            assert_eq!(od_v4_replica_identity(ptr::null_mut(), 0u32.to_le_bytes().as_ptr(), 4), -1);
+            // A valid empty frame still cannot override an ordinary disk.
+            assert_eq!(od_v4_replica_identity(disk.0, 0u32.to_le_bytes().as_ptr(), 4), -1);
             assert_eq!(
                 od_v4_control(
                     disk.0,

@@ -1,6 +1,6 @@
 namespace OverlayDisk.Cloud.Baidu;
 
-public sealed record BaiduRequestLimits(double RequestsPerSecond = 2, int MaximumConcurrentRequests = 2);
+public sealed record BaiduRequestLimits(double RequestsPerSecond = 3, int MaximumConcurrentRequests = 4);
 public sealed record BaiduRequestSnapshot(BaiduRequestLimits Limits, int QueuedRequests, int ActiveRequests, long StartedRequests);
 
 /// <summary>One FIFO budget for all clients, accounts, API calls and transfer bodies in this process.

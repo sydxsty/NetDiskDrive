@@ -17,7 +17,7 @@ const out=path.resolve(process.argv[2]),web=path.resolve(__dirname,'..');fs.mkdi
  const page=await context.newPage();page.on('pageerror',e=>errors.push(e.message));
  await page.addInitScript(()=>{
   const listeners=[],reply=m=>queueMicrotask(()=>listeners.forEach(f=>f({data:m})));
-  const state={connected:true,driverAvailable:true,account:{accountId:'fake',displayName:'功能测试'},settings:{syncIntervalSeconds:60,maxParallelTransfers:2,baiduRequestsPerSecond:2,baiduMaximumConcurrentRequests:2},disks:[],tasks:[]};
+  const state={connected:true,driverAvailable:true,account:{accountId:'fake',displayName:'功能测试'},settings:{},network:{activeRequests:7,queuedRequests:9},disks:[],tasks:[]};
   window.__calls=[];window.__state=state;
   window.chrome={webview:{addEventListener:(name,f)=>{if(name==='message')listeners.push(f);},postMessage:({requestId,method,args})=>{
    window.__calls.push({method,args});let data={};
@@ -34,7 +34,13 @@ const out=path.resolve(process.argv[2]),web=path.resolve(__dirname,'..');fs.mkdi
  const visit=async name=>{await page.locator('nav [data-page="'+name+'"]').click();await page.waitForFunction(n=>document.querySelector('#content').dataset.page===n,name);};
  try{
   await page.goto(origin+'/index.html');await visit('settings');
-  assert.equal(await page.locator('#baiduRequestRate').inputValue(),'2');assert.equal(await page.locator('#baiduConcurrency').inputValue(),'2');
+  assert.equal(await page.locator('#syncInterval').inputValue(),'3600');assert.equal(await page.locator('#concurrency').inputValue(),'4');
+  assert.equal(await page.locator('#baiduRequestRate').inputValue(),'3');assert.equal(await page.locator('#baiduConcurrency').inputValue(),'4');
+  assert.equal(await page.locator('#syncOnExit').isChecked(),false);assert.doesNotMatch(await page.locator('#content').innerText(),/请求进行中|个排队/);
+  await page.evaluate(async()=>{Object.assign(window.__state.settings,{syncIntervalSeconds:75,maxParallelTransfers:2,baiduRequestsPerSecond:2,baiduMaximumConcurrentRequests:2,syncOnExit:true});await refresh();});
+  assert.equal(await page.locator('#syncInterval').inputValue(),'75');assert.equal(await page.locator('#concurrency').inputValue(),'2');
+  assert.equal(await page.locator('#baiduRequestRate').inputValue(),'2');assert.equal(await page.locator('#baiduConcurrency').inputValue(),'2');assert.equal(await page.locator('#syncOnExit').isChecked(),true);
+  checks.push('Missing preferences use 3600-second/4-object/3-rps/4-request/exit-sync-off defaults; saved custom choices remain visible and settings contain no live request monitor.');
   await page.locator('#baiduRequestRate').fill('0.5');await page.locator('#baiduConcurrency').selectOption('1');
   await page.locator('[data-action="saveSettings"]').click();await page.waitForFunction(()=>window.__state.settings.baiduRequestsPerSecond===0.5);
   await visit('cloud');await visit('settings');
@@ -89,17 +95,15 @@ const out=path.resolve(process.argv[2]),web=path.resolve(__dirname,'..');fs.mkdi
   checks.push('Invalid zero rate is rejected before RPC.');
   await page.locator('#baiduRequestRate').fill('0.5');await page.locator('#pageTitle').click();
   await page.screenshot({path:path.join(out,'global-limits.png'),fullPage:true});
-  for(const lazy of [true,false]){
-   await visit('cloud');await page.locator('[data-action="cloudImport"]').click();
-   assert.equal(await page.locator('#lazyImport').isChecked(),true);
-   assert.match(await page.locator('#dialogBody').innerText(),/访问文件时下载/);
-   await page.locator('#lazyImport').setChecked(lazy);
-   await page.evaluate(()=>{document.querySelector('#restorePath').value='C:\\IsolatedFixture\\copy.odv4';});
-   await page.locator('#dialogSubmit').click();await page.locator('#dialog').waitFor({state:'hidden'});
-   const call=await page.evaluate(()=>window.__calls.filter(c=>c.method==='cloud.import').at(-1));
-   assert.equal(call.args.lazy,lazy);assert.equal(call.args.mode,'copy');assert.equal(call.args.originalConfirmed,false);
-  }
-  checks.push('Cloud import defaults to lazy and explicitly supports full-download mode.');
+  await visit('cloud');await page.locator('[data-action="cloudImport"]').click();
+  assert.equal(await page.locator('#lazyImport').count(),0);
+  assert.match(await page.locator('#dialogBody').innerText(),/索引和文件内容均按需加载/);
+  assert.match(await page.locator('#importModeDescription').innerText(),/默认关闭云同步/);
+  await page.evaluate(()=>{document.querySelector('#restorePath').value='C:\\IsolatedFixture\\copy.odv4';});
+  await page.locator('#dialogSubmit').click();await page.locator('#dialog').waitFor({state:'hidden'});
+  const imported=await page.evaluate(()=>window.__calls.filter(c=>c.method==='cloud.import').at(-1));
+  assert.equal(imported.args.lazy,true);assert.equal(imported.args.mode,'copy');assert.equal(imported.args.originalConfirmed,false);
+  checks.push('Cloud copy import always loads index and content lazily and explicitly describes its disabled-by-default cloud sync.');
   await visit('cloud');await page.locator('[data-action="cloudImport"]').click();
   assert.equal(await page.locator('#importMode').inputValue(),'copy');
   await page.locator('#importMode').selectOption('original');
@@ -110,7 +114,7 @@ const out=path.resolve(process.argv[2]),web=path.resolve(__dirname,'..');fs.mkdi
   await page.screenshot({path:path.join(out,'original-import.png'),fullPage:true});
   await page.locator('#dialogSubmit').click();await page.locator('#dialog').waitFor({state:'hidden'});
   const original=await page.evaluate(()=>window.__calls.filter(c=>c.method==='cloud.import').at(-1));
-  assert.equal(original.args.mode,'original');assert.equal(original.args.originalConfirmed,true);
+  assert.equal(original.args.mode,'original');assert.equal(original.args.originalConfirmed,true);assert.equal(original.args.lazy,true);
   checks.push('Original restore is explicit, requires absence-of-other-writers confirmation, preserves the suggested name and sends mode separately from lazy loading.');
 
   await page.evaluate(async()=>{window.__state.disks=[{id:'12345678-abcd-4321-abcd-123456789012',name:'已在本机',driveLetter:'Z',containerPath:'C:\\IsolatedFixture\\old.odv4',capacityBytes:1073741824,mounted:false,unlocked:false}];await refresh();});
@@ -129,7 +133,7 @@ const out=path.resolve(process.argv[2]),web=path.resolve(__dirname,'..');fs.mkdi
   await page.screenshot({path:path.join(out,'index-progress.png'),fullPage:true});
   checks.push('Index validation has its own page/node progress and does not display completed download bytes as completed index work.');
   await page.evaluate(async()=>{Object.assign(window.__state.tasks[0],{state:'verifying',message:'下载已完成，正在完成本地内容校验',completedPages:128});await refresh();});
-  assert.match(await page.locator('[data-task="index-job"]').innerText(),/校验内容/);
+  assert.match(await page.locator('[data-task="index-job"]').innerText(),/校验本地内容/);
   assert.equal(await page.locator('[data-task="index-job"] .progress').count(),0);
   checks.push('Local content verification after full download remains visibly active without a misleading completed progress bar.');
 

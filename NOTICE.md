@@ -38,7 +38,7 @@ See `docs/THIRD-PARTY.md`, `docs/RUST-DEPENDENCY-LICENSES.txt`,
 .NET Desktop Runtime and Visual C++ Runtime are installed separately.
 
 Source matching the public release, including the modified bindings and build
-scripts: https://github.com/sydxsty/NetDiskDrive/tree/v0.7.0
+scripts: https://github.com/sydxsty/NetDiskDrive/tree/v0.8.0
 GitHub provides source ZIP/TAR archives alongside the binary release. Exact
 Rust dependency versions and source checksums are in `engine/Cargo.lock`;
 NuGet package versions are pinned in the project files. Upstream source links

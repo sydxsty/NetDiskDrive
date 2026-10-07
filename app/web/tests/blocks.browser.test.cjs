@@ -92,7 +92,8 @@ const output=path.resolve(process.argv[2]),web=path.resolve(__dirname,'..');fs.m
   await page.locator('[data-block-op="auto-refresh"]').check();
   await page.waitForFunction(n=>window.__calls.filter(c=>c.method==='blocks.changes').length>n,reloadedAt);
   checks.push('Auto-refresh can be disabled persistently: no polling requests after stopping or reload, manual refresh still works, and enabling resumes polling.');
-  await page.locator('.blocks-diagnostics summary').click();await page.evaluate(()=>blockStatus.tick());assert.match(await page.locator('.blocks-diagnostics').innerText(),/等待网盘响应/);
+  assert.equal(await page.locator('.blocks-diagnostics').count(),0);assert.equal(await page.evaluate(()=>window.__calls.filter(c=>c.method==='sync.diagnostics').length),0);
+  checks.push('Block refresh and auto-refresh do not issue diagnostic requests; diagnostics have moved out of the block page.');
   await page.screenshot({path:path.join(output,'blocks.png')});assert.deepEqual(errors,[]);
   fs.writeFileSync(path.join(output,'result.json'),JSON.stringify({passed:true,checks},null,2));console.log('BLOCKS_UI_OK '+checks.length);
  }finally{await browser.close();await new Promise(r=>server.close(r));}

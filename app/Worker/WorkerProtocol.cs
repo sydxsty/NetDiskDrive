@@ -20,7 +20,8 @@ internal static class WorkerProtocol
         "reclaim.start", "reclaim.pause", "reclaim.resume", "compact.start", "compact.pause", "compact.resume", "compact.cancel", "compact.status", "cloud.status", "cloud.bind", "cloud.prepare", "cloud.objects",
         "cloud.delta", "cloud.transfer", "cloud.read", "cloud.receipts", "cloud.commit", "cloud.abandon", "cloud.commitBytes", "restore.begin", "restore.accept", "restore.status",
         "restore.preflight", "restore.step", "restore.finish", "restore.cancel", "blocks.summary", "blocks.query", "blocks.changes", "sync.diagnostics", "lazy.status",
-        "prefetch.configure", "cache.status", "cache.source", "cache.configure", "cache.bind", "cache.online", "cache.step", "cloud.gc_candidates"
+        "prefetch.configure", "cache.status", "cache.source", "cache.configure", "cache.bind", "cache.online", "cache.step", "cloud.gc_candidates",
+        "replica.prepare", "replica.apply", "replica.status", "replica.cancel", "replica.stageCurrent", "replica.stageCached"
     };
 
     internal static void ValidateMethod(string method)

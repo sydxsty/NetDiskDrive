@@ -75,7 +75,7 @@ internal sealed class WorkerServerSession(IWorkerDispatcher dispatcher, string t
                         object? result;
                         if (binary)
                         {
-                            if (method is not ("export.read" or "restore.accept" or "restore.begin") || dispatcher is not IWorkerBulkDispatcher bulkDispatcher)
+                            if (method is not ("export.read" or "restore.accept" or "restore.begin" or "replica.stage") || dispatcher is not IWorkerBulkDispatcher bulkDispatcher)
                                 throw new InvalidOperationException("不支持的对象传输操作。");
                             var response = await bulkDispatcher.InvokeBulkAsync(method, args, packet.Bytes, CancellationToken.None).ConfigureAwait(false);
                             result = response.Data; responseBytes = response.Bytes;

@@ -269,6 +269,7 @@ fn imported(s: &mut Store, work: &Work) -> Result<bool> {
         return Ok(false);
     };
     let o = store::Object::decode(oid(work.id)?, &row)?;
+    if o.missing && o.id == work.id && o.sha == work.sha { return Ok(false); }
     if o.id != work.id || o.sha != work.sha || !o.sealed || o.kind != 2 {
         return Err(integrity("restore object identity changed"));
     }
@@ -662,6 +663,8 @@ impl Volume {
             return Err(integrity("restore object kind or identity"));
         }
         store::external_table(&s.crypto, object_oid, raw)?;
+        let quick = s.cloud.replica.is_some();
+        if quick { s.validate_remote_identity(id,digest)?; s.validate_remote_dependencies(raw,object_oid)?; }
         if expected.kind == "data" {
             verify_base_data(&mut s, object_oid, raw, &header)?;
         }
@@ -672,6 +675,7 @@ impl Volume {
             } else {
                 tx.import_object(id, digest, raw)?;
             }
+            if quick { tx.register_remote(id,digest)?; tx.register_dependencies(raw,object_oid)?; }
             r.processed = tx.set(&SET, r.processed, &[(object_oid, Some(vec![1]))])?;
             r.received += 1;
             r.total = r.total.max(r.received);
@@ -868,11 +872,11 @@ impl Volume {
         let limit = number(request, "max_pages", 128).clamp(1, 256) as usize;
         match (command, kind.as_str()) {
             ("restore.step", "cloud") => {
-                self.step_base(
+                if !self.quick_restore_step()? { self.step_base(
                     number(request, "max_nodes", number(request, "max_pages", 64)).clamp(1, 256)
                         as usize,
                     number(request, "max_objects", 2).clamp(1, 4) as usize,
-                )?;
+                )?; }
             }
             ("snapshot.restore_step", "local") | ("restore.step", "local") => {
                 self.step_local(limit)?
@@ -1164,6 +1168,7 @@ impl Volume {
         Ok(())
     }
     fn finish_restore(&self) -> Result<()> {
+        if self.quick_restore_finish()? { return Ok(()); }
         {
             let mut s = self.shared.store.lock().map_err(|_| Error::Poisoned)?;
             let mut r = restore_state(&s)?;

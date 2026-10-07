@@ -3,6 +3,20 @@ use super::tree::{Node, Spec, Storage};
 use super::*;
 use std::collections::{BTreeSet, HashMap};
 pub(super) const PORTABLE: u64 = 1 << 63;
+/// Source writers use 0*, their copies 10*, copies of copies 110*, etc.
+/// Siblings never share an import source identity. Reserving the suffix for
+/// descendants prevents local COW allocations from colliding with future
+/// generations of a source, without renumbering any immutable object.
+pub(super) fn allocation_range(config: &Config) -> Result<std::ops::Range<u64>> {
+    let g = Geometry::new(config.object_size)?;
+    let limit = OBJECTS.capacity()?.min(SLOTSPEC.capacity()? / g.pages)
+        .min(EXTERNALS.capacity()? / g.external_stride).min(PORTABLE / g.object_size);
+    let remaining = limit.checked_shr(config.allocation_depth as u32).unwrap_or(0);
+    if remaining < 2048 {
+        return Err(Error::Invalid("copy ancestry has exhausted the object namespace".into()));
+    }
+    Ok((limit - remaining).max(1)..limit - remaining / 2)
+}
 pub(super) const PAGES: Spec = Spec {
     tag: 1,
     leaf_bits: 5,
@@ -134,6 +148,8 @@ pub(super) struct Root {
     pub data_generation: u64,
     pub changed_pages: u64,
     pub restore_required: bool,
+    #[serde(default)]
+    pub deferred_index: bool,
     pub revision: u64,
     pub cached_published_generation: u64,
     pub snapshot_count: usize,
@@ -171,6 +187,7 @@ impl Root {
             data_generation: 0,
             changed_pages: 0,
             restore_required: false,
+            deferred_index: false,
             revision: 0,
             cached_published_generation: 0,
             snapshot_count: 0,
@@ -630,6 +647,8 @@ impl Storage for Store {
         if r.offset & PORTABLE != 0 {
             let p = r.offset & !PORTABLE;
             let o = self.object(p / g.object_size)?;
+            super::portable_validation::validate_node_reference(r, &o, g)?;
+            if o.missing { return Err(Error::Missing(super::RemoteObject::from_object(&o, g.object_size))); }
             self.device
                 .read(o.extent * g.object_size + p % g.object_size, &mut b)?;
         } else {
@@ -709,6 +728,9 @@ impl Txn<'_> {
                     continue;
                 }
                 let mut o = self.object(oid)?;
+                // Imported immutable subtrees are protected by their source root, not
+                // by a guessed zero reference count before their leaves are visited.
+                if self.root.deferred_index && o.origin_backed { continue; }
                 o.current_refs = o
                     .current_refs
                     .checked_add_signed(delta)
@@ -727,6 +749,7 @@ impl Txn<'_> {
         }
     }
     fn refdelta(&mut self, r: MetaRef, n: i64, tag: u8) {
+        if self.root.deferred_index && r.offset & PORTABLE != 0 { return; }
         if !r.empty() {
             let e = self.refs.entry(r.offset).or_insert((0, tag));
             e.0 += n;
@@ -824,12 +847,9 @@ impl Txn<'_> {
     }
     pub fn allocate_object(&mut self, kind: u8, pool: u8) -> Result<Object> {
         let g = self.geometry();
-        let oid_limit = OBJECTS
-            .capacity()?
-            .min(SLOTSPEC.capacity()? / g.pages)
-            .min(EXTERNALS.capacity()? / g.external_stride)
-            .min(PORTABLE / g.object_size);
-        if self.root.next_oid == 0 || self.root.next_oid >= oid_limit {
+        let range = allocation_range(&self.store.config)?;
+        self.root.next_oid = self.root.next_oid.max(range.start);
+        if self.root.next_oid >= range.end {
             return Err(Error::Invalid(
                 "volume object identity space exhausted".into(),
             ));
@@ -1474,6 +1494,8 @@ impl Storage for Txn<'_> {
         if r.offset & PORTABLE != 0 {
             let p = r.offset & !PORTABLE;
             let o = self.object(p / g.object_size)?;
+            super::portable_validation::validate_node_reference(r, &o, g)?;
+            if o.missing { return Err(Error::Missing(super::RemoteObject::from_object(&o, g.object_size))); }
             self.read_frame(o.extent * g.object_size + p % g.object_size, &mut b)?;
         } else {
             self.read_frame(r.offset, &mut b)?;
@@ -1883,6 +1905,7 @@ pub(super) fn external_table(
             return Err(Error::Integrity("duplicate portable dependency".into()));
         }
     }
+    super::portable_validation::validate_object(crypto, oid, raw, &h, &refs)?;
     Ok(refs)
 }
 impl Txn<'_> {
@@ -2029,6 +2052,8 @@ impl Txn<'_> {
         self.store.device.write(extent * g.object_size, raw)?;
         o.extent = extent;
         o.missing = false;
+        o.kind = header["kind"].as_u64().unwrap() as u8;
+        o.external_count = header["external_count"].as_u64().unwrap_or(0) as u16;
         o.used = header["used"].as_u64().unwrap() as u16;
         self.objects.insert(oid, o);
         self.pending_blocks.push((extent, oid));
@@ -2048,6 +2073,7 @@ impl Txn<'_> {
         if let Some(v) = tree::get(self, &OBJECTS, existing, oid)? {
             let o = Object::decode(oid, &v)?;
             if o.id == id && o.sha == expected {
+                if o.missing { self.hydrate_object(oid,raw,&h)?; return self.object(oid); }
                 return Ok(o);
             }
             return Err(Error::Integrity(

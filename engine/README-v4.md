@@ -29,8 +29,10 @@ statistics use the volume geometry. The entire first control extent is protected
 from sparse deallocation.
 
 A UUID/ordinal-to-extent directory separates object identity from physical
-location. Object IDs use a persisted allocation nonce; imports continuing an
-original identity use a fresh allocation namespace for future objects. Relocation
+location. Object IDs use a persisted allocation nonce. A source and its descendant
+copies allocate in disjoint bounded ordinal ranges, selected by the authenticated
+`allocation_depth`: importing a later source generation cannot collide with a
+copy's local COW objects. Imports preserve existing object identities. Relocation
 preserves bytes, UUID, SHA, references and cloud receipts. Ordinal references are
 never treated as reconstructed UUIDs.
 
@@ -95,27 +97,57 @@ credentials or zstd transform. See `docs/ZSTD-PROVENANCE.md` for the wire profil
 
 ## Import, hydration and snapshots
 
-Imports authenticate the root and portable index, keep it as an immutable base,
-and maintain local COW deltas. The old per-page cloud reconstruction queue is
-removed. Metadata cache is bounded to 32 MiB (8/4/2 objects depending on geometry).
-Full import additionally materializes and validates referenced data; lazy import
-retains authenticated missing-object descriptors. Completion is required before
-mounting.
+Cloud imports authenticate the version, root object and initial index root, keep
+the portable index as an immutable base, and maintain local COW deltas. Startup
+does not enumerate all leaf mappings or fetch all metadata objects. Both copy and
+original imports use the same deferred index/data path, and read-only and writable
+mounts share it. Mounting may still demand partition-table and NTFS objects.
+Completion means the initial view is usable; unvisited objects are not claimed
+to be verified. The bounded metadata cache does not grow with virtual capacity.
 
-`copy` receives a new disk identity. Its initial publication includes its source
+`copy` receives a new disk identity and does not enable cloud upload. Its initial
+publication, only if upload is explicitly enabled later, includes its source
 baseline; it can use protected origin objects without permanently materializing
 the entire virtual disk. `original` retains identity and published baseline only
 with an authenticated matching source root and confirmed single-writer ownership.
 It does not permit concurrent writers. An unchanged original import needs no
 upload.
 
+The copy's MBR/GPT identity is a local presentation overlay. The application
+sends both partition tables together through `od_v4_replica_identity` using a
+bounded binary frame; it does not expand GPT bytes into the 64 KiB JSON control
+channel. Both regions become durable in one transaction without dirtying guest
+pages. Invalid, truncated or oversized frames are rejected before mutation.
+
 The object provider supplies exactly one canonical object of the volume's size.
 The application decompresses and verifies the downloaded object first; native
 then checks its saved SHA and authenticated header before atomically installing
-it. Missing data never reads as zero. Callbacks run outside storage and reader
+it. Metadata nodes are validated within the already downloaded object: roots and
+children must use valid portable slots, data references must belong to the
+authenticated dependency table, and contained parent/child ranges and counts
+must agree. Cross-object children are checked on access; these checks never fetch
+an unvisited subtree merely to validate the current object. Missing data never
+reads as zero. Callbacks run outside storage and reader
 locks while the original guest operation keeps its ordering and physical lease.
 Hydration changes neither guest generation nor dirty keys. Local persistence
 errors remain fatal to the handle; network failures can retry.
+
+Manual latest-version loading requires an unmounted volume and a staged token
+bound to the current local data revision. Applying a candidate atomically replaces
+the current root, retains explicit local snapshots and protected source roots, and
+requires explicit discard confirmation when local writes exist. Normal status
+queries never check for a newer cloud version. A clean unchanged source does not
+download object payloads. Immutable cache entries are reused by UUID and digest;
+only subsequently accessed missing objects are downloaded. Copy partition identity
+is a local presentation overlay until a guest write to that page materializes the
+visible bytes as COW data. Failed identity preparation after a committed switch
+is reported separately and retried before mounting.
+
+`index_complete` describes whether the source reference catalog has been expanded,
+not whether every data object has been read. Until then, lazy-object totals and
+block statistics are explicitly known-object counts. First publication of an
+imported source may need to build that catalog; ordinary import, reads and manual
+latest-version loading do not perform that traversal.
 
 `lazy.needs` traverses a bounded logical range, at most 4096 mapped pages and 16
 missing objects per call, and returns a continuation offset. Full-page overwrites

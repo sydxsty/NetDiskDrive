@@ -104,7 +104,7 @@ impl volume::Shared {
 fn import(shared: &volume::Shared, object: &str, bytes: &[u8]) -> Result<()> {
     let g = shared.crypto.geometry;
     if bytes.len() != g.object_size as usize {
-        return Err(Error::Invalid("lazy object must be exactly 4 MiB".into()));
+        return Err(Error::Invalid("lazy object length differs from disk geometry".into()));
     }
     let id = Uuid::parse_str(object).map_err(|_| Error::Invalid("lazy object ID".into()))?;
     let ordinal = u64::from_le_bytes(id.as_bytes()[8..].try_into().unwrap());
@@ -124,7 +124,8 @@ fn import(shared: &volume::Shared, object: &str, bytes: &[u8]) -> Result<()> {
     }
     let header = store::decode_header(&shared.crypto, ordinal, bytes)?;
     if header["id"] != object
-        || header["kind"] != 1
+        || !matches!(header["kind"].as_u64(),Some(1|2))
+        || (expected.kind != 0 && header["kind"].as_u64() != Some(expected.kind as u64))
         || header["used"]
             .as_u64()
             .is_none_or(|n| n < expected.used as u64 || n > g.slots)
@@ -144,7 +145,14 @@ fn import(shared: &volume::Shared, object: &str, bytes: &[u8]) -> Result<()> {
     if !current.missing {
         return Ok(());
     }
-    store.transaction(|tx| tx.hydrate_object(ordinal, bytes, &header))
+    let deferred=store.root.deferred_index;
+    // Validate dependency records before beginning a persistence transaction.
+    if deferred && header["kind"] == 2 { store.validate_remote_dependencies(bytes,ordinal)?; }
+    store.transaction(|tx| {
+        tx.hydrate_object(ordinal, bytes, &header)?;
+        if deferred { tx.register_dependencies(bytes,ordinal)?; }
+        Ok(())
+    })
 }
 impl Volume {
     pub fn set_object_provider(&self, provider: Option<Arc<ObjectProvider>>) -> Result<()> {
@@ -182,7 +190,7 @@ impl Volume {
         };
         match r["cmd"].as_str().unwrap_or("") {
             "lazy.status" => Ok(
-                json!({"object_size":g.object_size,"enabled":cloud.lazy_backing.is_some()||cloud.cache.backing.is_some(),"total_objects":reader.root.lazy_total_objects,"data_objects":reader.root.lazy_total_objects,"cached_objects":reader.root.lazy_cached_objects,"cached_bytes":reader.root.lazy_cached_objects*g.object_size,"missing_objects":reader.root.lazy_missing_objects,"missing_bytes":reader.root.lazy_missing_objects*g.object_size,"backing":cloud.lazy_backing}),
+                json!({"object_size":g.object_size,"enabled":cloud.lazy_backing.is_some()||cloud.cache.backing.is_some(),"index_complete":cloud.replica.as_ref().is_none_or(|r|r.counts_complete),"total_objects":reader.root.lazy_total_objects,"data_objects":reader.root.lazy_total_objects,"cached_objects":reader.root.lazy_cached_objects,"cached_bytes":reader.root.lazy_cached_objects*g.object_size,"missing_objects":reader.root.lazy_missing_objects,"missing_bytes":reader.root.lazy_missing_objects*g.object_size,"backing":cloud.lazy_backing}),
             ),
             "lazy.needs" => {
                 let offset = r["offset"]

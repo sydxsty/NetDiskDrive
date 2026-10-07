@@ -157,6 +157,9 @@ public sealed class DiskController : IDisposable
             core.SetReadOnly(readOnly);
             var mountInfo = core.GetInfo();
             if (mountInfo.TryGetProperty("restore_incomplete", out var incomplete) && incomplete.GetBoolean()) throw new IOException("恢复尚未完成，不能挂载此磁盘。");
+            var replica = core.Control(new { cmd = "replica.status" });
+            if (replica.TryGetProperty("candidate", out var candidate) && candidate.ValueKind == JsonValueKind.Object)
+                throw new IOException("有尚未确认的云端快照，请先解锁磁盘，完成加载或取消后再挂载。");
             // Before exposing the device, prove a retried initialization has no
             // logical data outside its partition tables. Catalog flags alone are
             // never permission to format an existing or damaged filesystem.

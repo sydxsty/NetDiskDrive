@@ -1,6 +1,7 @@
 using System.Buffers;
 using System.Text;
 using System.Text.Json;
+using OverlayDisk.Cloud.Baidu;
 using OverlayDisk.Services;
 
 namespace OverlayDisk;
@@ -39,14 +40,23 @@ internal static class ManagedIoSelfTests
             Check(concurrent[i].GetProperty("index").GetInt32() == i && concurrent[i].GetProperty("text").GetString() == new string((char)('a' + i), 100000),
                 "parallel large JSON results shared temporary storage");
 
-        var oldSettings = JsonSerializer.Deserialize<AppSettings>("{}", SettingsStorage.Json)!;
-        Check(oldSettings.SyncOnExit, "legacy settings must retain the safe existing exit default");
-        var optedOut = new AppSettings { SyncOnExit = false, Prefetch = new("adaptive", 16), DefaultObjectSizeBytes = 16 << 20 }; string pending = Guid.NewGuid().ToString(); optedOut.PendingDisks.Add(pending);
-        var reloaded = JsonSerializer.Deserialize<AppSettings>(JsonSerializer.Serialize(optedOut, SettingsStorage.Json), SettingsStorage.Json)!;
-        Check(!reloaded.SyncOnExit && reloaded.Prefetch == optedOut.Prefetch && reloaded.DefaultObjectSizeBytes == optedOut.DefaultObjectSizeBytes && reloaded.PendingDisks.SetEquals([pending]), "exit preference or unsynced marker was lost during settings serialization");
+        var defaults = JsonSerializer.Deserialize<AppSettings>("{}", SettingsStorage.Json)!;
+        var limits = new BaiduRequestLimits();
+        Check(!defaults.SyncOnExit && defaults.SyncIntervalSeconds == 3600 && defaults.MaxParallelTransfers == 4
+            && defaults.BaiduRequestsPerSecond == 3 && defaults.BaiduMaximumConcurrentRequests == 4
+            && limits.RequestsPerSecond == defaults.BaiduRequestsPerSecond && limits.MaximumConcurrentRequests == defaults.BaiduMaximumConcurrentRequests,
+            "missing settings did not receive the current application and shared scheduler defaults");
+        var customized = new AppSettings { SyncOnExit = true, SyncIntervalSeconds = 120, MaxParallelTransfers = 1,
+            BaiduRequestsPerSecond = 0.5, BaiduMaximumConcurrentRequests = 2, Prefetch = new("adaptive", 16), DefaultObjectSizeBytes = 16 << 20 };
+        string pending = Guid.NewGuid().ToString(); customized.PendingDisks.Add(pending);
+        var reloaded = JsonSerializer.Deserialize<AppSettings>(JsonSerializer.Serialize(customized, SettingsStorage.Json), SettingsStorage.Json)!;
+        Check(reloaded.SyncOnExit && reloaded.SyncIntervalSeconds == 120 && reloaded.MaxParallelTransfers == 1
+            && reloaded.BaiduRequestsPerSecond == 0.5 && reloaded.BaiduMaximumConcurrentRequests == 2
+            && reloaded.Prefetch == customized.Prefetch && reloaded.DefaultObjectSizeBytes == customized.DefaultObjectSizeBytes && reloaded.PendingDisks.SetEquals([pending]),
+            "saved preferences or unsynced markers were replaced by defaults during settings serialization");
         return [
             "Pooled native JSON is detached before reuse, isolated across concurrent large responses, and cleared on native/parse/termination failures.",
-            "Missing SyncOnExit keeps the prior true default; explicit false and persistent pending disk markers survive settings serialization."
+            "Missing preferences use 3600-second sync, 4 transfers, 3 requests/second, 4 concurrent requests and no sync on exit; saved preferences and pending disk markers survive serialization."
         ];
     }
     private static void Fill(byte[] bytes, string json)

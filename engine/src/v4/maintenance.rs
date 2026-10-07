@@ -779,6 +779,7 @@ impl<C: CatalogRead> DebugView<'_, C> {
         Ok(
             json!({"object_size":g.object_size,"revision":self.root.revision,"total_blocks":self.reader.catalog_len()?/g.object_size,
             "objects":stats.counts[0]+stats.missing_counts[0],"resident_objects":stats.counts[0],"missing_objects":stats.missing_counts[0],"counts":counts,"types":types,
+            "index_complete":self.cloud.replica.as_ref().is_none_or(|r|r.counts_complete),
             "pending_objects":pending_objects,"pending_bytes":pending_objects*g.object_size,"pending_resident_objects":stats.counts[2],"pending_missing_objects":stats.missing_counts[2],
             "changed_pages":self.root.changed_pages,"current_job":current_job,
             "new_changes":{"changed_pages":new_dirty,"logical_changed_bytes":new_dirty*super::PAGE as u64},

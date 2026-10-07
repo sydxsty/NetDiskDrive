@@ -67,6 +67,17 @@ internal sealed class DiskHydrationService : IDisposable
         if (planCancellation is not null) cancel.Add(planCancellation);
         return cancel.ToArray();
     }
+    internal void CancelPrefetch()
+    {
+        CancellationTokenSource[] cancel;
+        lock (gate)
+        {
+            if (stopped) return;
+            hasRead = false; hintEnd = 0; readStreak = 0; sequentialBytes = 0;
+            cancel = CancelSpeculationLocked();
+        }
+        Cancel(cancel);
+    }
     private CancellationTokenSource[] DetachSpeculationLocked(bool includeQueued)
     {
         var cancel = new List<CancellationTokenSource>();

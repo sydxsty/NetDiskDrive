@@ -46,6 +46,7 @@ pub(super) struct Shared {
     pub provider: super::lazy::ProviderRegistry,
     pub cache_runtime: Arc<super::cache::Runtime>,
     pub read_only: AtomicBool,
+    pub identity: Mutex<Vec<super::replica::IdentityRegion>>,
     pub device: Arc<Device>,
     pub crypto: Arc<Crypto>,
     pub readers: Arc<Mutex<ReadRegistry>>,
@@ -101,14 +102,14 @@ impl Reader {
         let mut bytes = Zeroizing::new([0; PAGE]);
         if let Some(p) = self.page(index)? {
             let object = self.object(p.reference.object)?;
-            if object.kind != 1 || p.reference.slot >= object.used as u64 {
-                return Err(Error::Integrity("read view slot outside object".into()));
-            }
             if object.missing {
                 return Err(Error::Missing(RemoteObject::from_object(
                     &object,
                     self.object_size(),
                 )));
+            }
+            if object.kind != 1 || p.reference.slot >= object.used as u64 {
+                return Err(Error::Integrity("read view slot outside object".into()));
             }
             self.cache_runtime
                 .touch(object.oid, index * PAGE as u64, PAGE as u64);
@@ -152,6 +153,7 @@ impl Storage for Reader {
         let offset = if reference.offset & PORTABLE != 0 {
             let address = reference.offset & !PORTABLE;
             let object = self.object(address / self.object_size())?;
+            super::portable_validation::validate_node_reference(reference, &object, self.crypto.geometry)?;
             if object.missing {
                 return Err(Error::Missing(RemoteObject::from_object(
                     &object,
@@ -276,6 +278,7 @@ impl Volume {
         ));
         store.cache_runtime = Some(cache_runtime.clone());
         let shared = Arc::new(Shared {
+            identity: Mutex::new(store.cloud.replica.as_ref().map(|r|r.identity.clone()).unwrap_or_default()),
             device: store.device.clone(),
             crypto: store.crypto.clone(),
             readers: store.readers.clone(),
@@ -378,18 +381,18 @@ impl Volume {
                     plan.push(None);
                 } else if let Some(reference) = reader.page(index)? {
                     let object = reader.object(reference.reference.object)?;
-                    if object.kind != 1 || reference.reference.slot >= object.used as u64 {
-                        return Err(Error::Integrity("read slot outside object".into()));
-                    }
                     if object.missing {
                         return Err(Error::Missing(RemoteObject::from_object(
                             &object,
                             self.object_size(),
                         )));
                     }
+                    if object.kind != 1 || reference.reference.slot >= object.used as u64 {
+                        return Err(Error::Integrity("read slot outside object".into()));
+                    }
                     let physical = object.extent * self.object_size()
                         + (self.geometry().payload_pages + reference.reference.slot) * PAGE as u64;
-                    plan.push(Some((reference, physical)));
+                    plan.push(Some((reference, physical, object.origin_backed)));
                 } else {
                     copy_to_output(offset, output, index, &[0; PAGE]);
                     plan.push(None);
@@ -397,7 +400,7 @@ impl Volume {
             }
             let mut at = 0;
             while at < plan.len() {
-                let Some((_, physical)) = &plan[at] else {
+                let Some((_, physical, _)) = &plan[at] else {
                     at += 1;
                     continue;
                 };
@@ -405,7 +408,7 @@ impl Volume {
                 while until < plan.len()
                     && plan[until]
                         .as_ref()
-                        .is_some_and(|(_, p)| *p == *physical + (until - at) as u64 * PAGE as u64)
+                        .is_some_and(|(_, p, _)| *p == *physical + (until - at) as u64 * PAGE as u64)
                 {
                     until += 1;
                 }
@@ -425,6 +428,9 @@ impl Volume {
                         .decode_page(index, reference.reference, bytes)?;
                     if codec::hash(bytes) != reference.digest {
                         return Err(Error::Integrity("read content digest".into()));
+                    }
+                    if plan[at+i].as_ref().unwrap().2 {
+                        self.apply_identity(index * PAGE as u64,bytes)?;
                     }
                     copy_to_output(offset, output, index, bytes);
                 }
@@ -562,7 +568,17 @@ impl Volume {
                 let index = at / PAGE as u64;
                 let within = at as usize % PAGE;
                 let take = (PAGE - within).min(length - done);
-                let old_digest = if let Some(value) = visible.get(&index) {
+                let inherited_identity = self.shared.identity_intersects(index * PAGE as u64, PAGE)?
+                    && !visible.contains_key(&index)
+                    && match reader.page(index)? {
+                        Some(p) => reader.object(p.reference.object)?.origin_backed,
+                        None => false,
+                    };
+                let old_digest = if inherited_identity {
+                    // Even a write equal to the raw source must consume the
+                    // presentation overlay. Persist a local COW page for it.
+                    None
+                } else if let Some(value) = visible.get(&index) {
                     value.as_ref().map(|v| v.digest)
                 } else {
                     reader.page(index)?.map(|p| p.digest)
@@ -577,6 +593,9 @@ impl Volume {
                 } else {
                     reader.read_page(index)?
                 };
+                if inherited_identity && !(within == 0 && take == PAGE) {
+                    self.apply_identity(index * PAGE as u64,page.as_mut())?;
+                }
                 if let Some(bytes) = input {
                     page[within..within + take].copy_from_slice(&bytes[done..done + take]);
                 } else {
@@ -588,7 +607,7 @@ impl Volume {
                 } else {
                     Some(codec::hash(page.as_ref()))
                 };
-                if old_digest == digest {
+                if old_digest == digest && !inherited_identity {
                     same += 1;
                 } else {
                     updates.insert(
@@ -689,6 +708,10 @@ impl Volume {
     }
 }
 impl Shared {
+    pub(super) fn identity_intersects(&self,offset:u64,length:usize)->Result<bool> {
+        if offset >= 65536 && offset+length as u64 <= self.capacity.saturating_sub(65536) {return Ok(false);}
+        Ok(self.identity.lock().map_err(|_|Error::Poisoned)?.iter().any(|r|offset<r.offset+r.bytes.len()as u64 && r.offset<offset+length as u64))
+    }
     pub(super) fn geometry(&self) -> Geometry {
         self.crypto.geometry
     }
@@ -758,7 +781,9 @@ impl Shared {
             for ((index, value), old) in frozen.iter().zip(previous) {
                 let old = old.as_deref().map(StoredPage::decode).transpose()?;
                 let digest = value.as_ref().map(|v| v.digest);
-                if old.as_ref().map(|p| p.digest) != digest {
+                let materialize_identity = self.identity_intersects(*index * PAGE as u64, PAGE)?
+                    && old.as_ref().map(|p|store.object(p.reference.object).map(|o|o.origin_backed)).transpose()?.unwrap_or(false);
+                if old.as_ref().map(|p| p.digest) != digest || materialize_identity {
                     effective.push((*index, value.clone(), old.is_some()));
                 }
             }

@@ -51,37 +51,14 @@ impl Backend for CoreBackend {
                 v.flush().map_err(error)?;
                 Ok(Output::Unit)
             }
-            Operation::Compact => {
-                v.compact().map_err(error)?;
-                Ok(Output::Unit)
-            }
-            Operation::Capacity => Ok(Output::Number(v.capacity())),
-            Operation::Info => Ok(Output::Bytes(
-                serde_json::to_vec(&v.info().map_err(error)?).map_err(|e| e.to_string())?,
-            )),
             Operation::SnapshotCreate => Ok(Output::Bytes(
                 v.snapshot_create().map_err(error)?.into_bytes(),
             )),
-            Operation::SnapshotManifest(id) => Ok(Output::Bytes(
-                serde_json::to_vec(&v.snapshot_manifest(id).map_err(error)?)
-                    .map_err(|e| e.to_string())?,
-            )),
-            Operation::ObjectRead {
-                snapshot,
-                object,
-                offset,
-                length,
-            } => {
-                let mut data = Zeroizing::new(vec![0; (*length).max(READ_ALLOCATION)]);
-                v.object_read(snapshot, object, *offset, &mut data[..*length])
-                    .map_err(error)?;
-                Ok(Output::Data(data, *length))
-            }
             Operation::SnapshotRelease(id) => {
                 v.snapshot_release(id).map_err(error)?;
                 Ok(Output::Unit)
             }
-            Operation::V3Control(request) => Ok(Output::Bytes(
+            Operation::Control(request) => Ok(Output::Bytes(
                 serde_json::to_vec(&v.control(request).map_err(error)?)
                     .map_err(|e| e.to_string())?,
             )),

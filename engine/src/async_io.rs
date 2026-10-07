@@ -32,26 +32,15 @@ pub(crate) enum Operation {
         fua: bool,
     },
     Flush,
-    Compact,
-    Capacity,
-    Info,
     SnapshotCreate,
-    SnapshotManifest(String),
-    ObjectRead {
-        snapshot: String,
-        object: String,
-        offset: u64,
-        length: usize,
-    },
     SnapshotRelease(String),
-    V3Control(serde_json::Value),
+    Control(serde_json::Value),
 }
 
 pub(crate) enum Output {
     Unit,
     Data(Zeroizing<Vec<u8>>, usize),
     Bytes(Vec<u8>),
-    Number(u64),
 }
 
 pub(crate) trait Backend: Send + Sync + 'static {
@@ -125,9 +114,6 @@ impl Operation {
                 length,
                 fua,
             } => Spec::io(*offset, *length, *fua, 0, None),
-            Self::ObjectRead { length, .. } => {
-                Spec::io(0, 0, true, (*length).max(READ_ALLOCATION), None)
-            }
             Self::Flush => {
                 let mut spec = Spec::io(0, 0, true, 0, None)?;
                 spec.control = true;

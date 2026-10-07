@@ -6,7 +6,7 @@ using OverlayDisk.Cloud.Contracts;
 
 namespace OverlayDisk.Services;
 
-public sealed class WorkerApplicationService : IWorkerDispatcher, IWorkerBulkDispatcher, IWorkerObjectProviderDispatcher
+public sealed partial class WorkerApplicationService : IWorkerDispatcher, IWorkerBulkDispatcher, IWorkerObjectProviderDispatcher
 {
     private readonly DiskController controller;
     private readonly Func<Guid, CancellationToken, Task<bool>> mountedIdentityProbe;
@@ -18,6 +18,7 @@ public sealed class WorkerApplicationService : IWorkerDispatcher, IWorkerBulkDis
     private PrefetchSettings prefetch = new();
     private readonly object prefetchGate = new();
     private readonly HashSet<CoreDisk> prefetchCores = new();
+    private readonly ConcurrentDictionary<string, CoreDisk> openingCores = new();
     private long prefetchRevision = 1;
     public void SetObjectProvider(Func<LazyObjectRequest, CancellationToken, Task<byte[]>>? provider)
     {
@@ -56,7 +57,13 @@ public sealed class WorkerApplicationService : IWorkerDispatcher, IWorkerBulkDis
         core.SetObjectProvider((request, ct) =>
             (Volatile.Read(ref objectProvider) ?? throw new IOException("主界面连接已断开，未缓存的云端内容暂时不可读取。"))(request, ct));
         var info = core.GetInfo();
-        if (!info.TryGetProperty("restore_incomplete", out var incomplete) || !incomplete.GetBoolean()) StartCacheLoop(core);
+        if (!info.TryGetProperty("restore_incomplete", out var incomplete) || !incomplete.GetBoolean())
+        {
+            openingCores[id] = core;
+            try { EnsureReplicaIdentity(core); }
+            finally { openingCores.TryRemove(id, out _); }
+            StartCacheLoop(core);
+        }
     }
     private readonly string localRestoreCatalog;
     private readonly ConcurrentDictionary<string, LocalRestoreRecord> localRestores = new();
@@ -144,7 +151,7 @@ public sealed class WorkerApplicationService : IWorkerDispatcher, IWorkerBulkDis
     public async Task<object?> InvokeAsync(string method, JsonElement args, CancellationToken cancellationToken)
     {
         if (method == "snapshots.restorePause") return await PauseLocalRestoreAsync(args, cancellationToken);
-        if (IsQuery(method)) return await Task.Run(() => DispatchAsync(method, args, cancellationToken), cancellationToken);
+        if (IsQuery(method) || method == "replica.status") return await Task.Run(() => DispatchAsync(method, args, cancellationToken), cancellationToken);
         var commands = method.StartsWith("cloud.", StringComparison.Ordinal)
             ? cloudGates.GetOrAdd(CommandId(args), _ => new(1, 1)) : CommandFor(CommandId(args));
         await commands.WaitAsync(cancellationToken);
@@ -159,7 +166,7 @@ public sealed class WorkerApplicationService : IWorkerDispatcher, IWorkerBulkDis
             var core = Core(Entry(args));
             return new(null, await Task.Run(() => core.ReadExport(Text(args, "job_id"), Text(args, "object_id")), ct));
         }
-        if (method is not ("restore.begin" or "restore.accept") || !CloudObjectGeometry.IsSupported(bytes.Length))
+        if (method is not ("restore.begin" or "restore.accept" or "replica.stage") || !CloudObjectGeometry.IsSupported(bytes.Length))
             throw new IOException("恢复对象长度或操作无效。");
         string id = Text(args, "id", Text(args, "taskId", Text(args, "path")));
         var commands = CommandFor(id);
@@ -167,6 +174,7 @@ public sealed class WorkerApplicationService : IWorkerDispatcher, IWorkerBulkDis
         try
         {
             if (method == "restore.begin") return new(await BeginRestoreAsync(args, bytes, ct), Array.Empty<byte>());
+            if (method == "replica.stage") return new(StageReplica(args, bytes), Array.Empty<byte>());
             if (!restores.TryGetValue(id, out var session)) throw new IOException("恢复任务尚未打开。");
             if (bytes.Length != session.Core.ObjectSizeBytes) throw new IOException("恢复对象大小与磁盘不一致。");
             session.Core.AcceptRestoreObject(Text(args, "object_id"), bytes.ToArray());
@@ -192,7 +200,9 @@ public sealed class WorkerApplicationService : IWorkerDispatcher, IWorkerBulkDis
         {
             // A restore.finish callback can require this query while its mutation
             // gate is held. Never route it through that gate or a storage I/O barrier.
-            var current = restores.TryGetValue(Text(args, "id"), out var restoring) ? restoring.Core : Core(Entry(args));
+            string sourceId = Text(args, "id");
+            var current = restores.TryGetValue(sourceId, out var restoring) ? restoring.Core
+                : openingCores.TryGetValue(sourceId, out var opening) ? opening : Core(Entry(args));
             return current.Control(new { cmd = method, object_id = Text(args, "object_id") });
         }
         if (method == "restore.preflight")
@@ -226,6 +236,8 @@ public sealed class WorkerApplicationService : IWorkerDispatcher, IWorkerBulkDis
         if (method is "restore.begin" or "restore.accept" or "cloud.read") throw new IOException("对象数据必须通过独立传输通道发送。");
         if (method.StartsWith("restore.", StringComparison.Ordinal)) return await RestoreActionAsync(method, args);
         var entry = Entry(args);
+        if (method.StartsWith("replica.", StringComparison.Ordinal)) return await ReplicaActionAsync(method, entry, args, ct);
+        if (!IsQuery(method)) RequireNoReplicaChange(entry, method is "disks.close" or "disks.quiesce");
         if (method == "disks.delete")
         {
             static bool SamePath(string a, string b) => string.Equals(Path.GetFullPath(a), Path.GetFullPath(b), StringComparison.OrdinalIgnoreCase);
@@ -240,6 +252,7 @@ public sealed class WorkerApplicationService : IWorkerDispatcher, IWorkerBulkDis
         }
         if (method == "disks.mount")
         {
+            if (controller.TryGetCore(entry.Id) is { } mounting) EnsureReplicaIdentity(mounting);
             var selected = OptionalBool(args, "readOnly");
             if (selected is { } mode && mode != entry.ReadOnly)
             {
@@ -360,15 +373,15 @@ public sealed class WorkerApplicationService : IWorkerDispatcher, IWorkerBulkDis
     {
         var items = controller.Disks.Select(d =>
         {
-            var core = controller.TryGetCore(d.Id); JsonElement? info = null, cloud = null, compact = null, lazy = null, cache = null;
+            var core = controller.TryGetCore(d.Id); JsonElement? info = null, cloud = null, compact = null, lazy = null, cache = null, replica = null;
             if (core != null)
             {
-                try { info = core.GetInfo(); cloud = core.Control(new { cmd = "cloud.status" }); compact = core.Control(new { cmd = "compact.status" }); lazy = core.GetLazyStatus(); cache = core.Control(new { cmd = "cache.status" }); }
+                try { info = core.GetInfo(); cloud = core.Control(new { cmd = "cloud.status" }); compact = core.Control(new { cmd = "compact.status" }); lazy = core.GetLazyStatus(); cache = core.Control(new { cmd = "cache.status" }); replica = core.Control(new { cmd = "replica.status" }); }
                 catch (Exception e) { d.Status = e.Message; }
             }
             if (compact is { } saved && Text(saved, "state") is "running" or "paused" && !maintenance.ContainsKey(d.Id))
                 maintenance.TryAdd(d.Id, new Maintenance { DiskId = d.Id, State = "paused", Progress = saved, Mode = Text(saved, "mode", "normal") });
-            return new { d.Id, d.Name, d.ContainerPath, d.CapacityBytes, d.ObjectSizeBytes, d.DriveLetter, d.Encrypted, d.ReadOnly, d.Initialized, d.FormatVersion, d.Mounted, d.Unlocked, d.Status, info, cloud, compact, lazy, cache,
+            return new { d.Id, d.Name, d.ContainerPath, d.CapacityBytes, d.ObjectSizeBytes, d.DriveLetter, d.Encrypted, d.ReadOnly, d.Initialized, d.FormatVersion, d.Mounted, d.Unlocked, d.Status, info, cloud, compact, lazy, cache, replica,
                 cacheError = (cacheLoops.TryGetValue(d.Id, out var cacheLoop) ? cacheLoop.Error : null) ?? cacheErrors.GetValueOrDefault(d.Id), hydration = core?.GetHydrationState() };
         }).ToArray();
         return new { connected = true, driverAvailable = controller.DriverAvailable, disks = items, tasks = maintenance.Values.Select(TaskView).ToArray() };
@@ -486,6 +499,7 @@ public sealed class WorkerApplicationService : IWorkerDispatcher, IWorkerBulkDis
         try
         {
             if (core.ObjectSizeBytes != objectSize) throw new IOException("恢复磁盘的块大小与云端版本不一致。");
+            if (lazy) core.Control(new { cmd = "replica.bootstrap", commit = args.TryGetProperty("commit", out var declaredCommit) ? (object)declaredCommit.Clone() : null });
             ConfigureCore(core);
             var status = core.Control(new { cmd = "restore.status", cursor = 0, limit = 128 });
             if (Text(status, "kind") == "uninitialized")
@@ -496,6 +510,7 @@ public sealed class WorkerApplicationService : IWorkerDispatcher, IWorkerBulkDis
                 core.Dispose();
                 core = Begin(verifiedRoot);
                 if (core.ObjectSizeBytes != objectSize) throw new IOException("恢复磁盘的块大小与云端版本不一致。");
+                if (lazy) core.Control(new { cmd = "replica.bootstrap", commit = args.TryGetProperty("commit", out var resumedCommit) ? (object)resumedCommit.Clone() : null });
                 ConfigureCore(core);
                 status = core.Control(new { cmd = "restore.status", cursor = 0, limit = 128 });
             }
@@ -735,7 +750,11 @@ public sealed class WorkerApplicationService : IWorkerDispatcher, IWorkerBulkDis
         // alongside its source. Only the newly restored private target is changed.
         if (session.Mode == "copy")
         {
-            DiskIdentityRewriter.AssignCopyIdentity(session.Core);
+            if (!session.Local && session.Core.GetLazyStatus().GetProperty("enabled").GetBoolean())
+            {
+                EnsureReplicaIdentity(session.Core);
+            }
+            else DiskIdentityRewriter.AssignCopyIdentity(session.Core);
         }
         session.Core.Flush(); session.Core.Dispose(); restores.TryRemove(id, out _);
         string volumeId = session.Core.Id.ToString();

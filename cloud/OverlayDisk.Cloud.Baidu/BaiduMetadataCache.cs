@@ -28,6 +28,8 @@ internal sealed partial class BaiduMetadataCache : IDisposable
     private sealed class DirectoryState
     {
         public Dictionary<string, CachedCloudObject>? Entries;
+        // Fresh partial reader observations have no negative/absence meaning and are not persisted.
+        public Dictionary<string, CachedCloudObject>? PartialEntries;
         public bool Loaded;
         public int Mutations;
         public long Used;
@@ -57,7 +59,8 @@ internal sealed partial class BaiduMetadataCache : IDisposable
         try
         {
             var state = await StateAsync(Parent(path), ct).ConfigureAwait(false);
-            var result = state.Entries is { } items ? new CloudCacheLookup(true, items.GetValueOrDefault(path)) : default;
+            var result = state.Entries is { } items ? new CloudCacheLookup(true, items.GetValueOrDefault(path)) :
+                state.PartialEntries?.GetValueOrDefault(path) is { } positive ? new CloudCacheLookup(true, positive) : default;
             Evict(); return result;
         }
         finally { gate.Release(); }
@@ -83,10 +86,38 @@ internal sealed partial class BaiduMetadataCache : IDisposable
             foreach (var item in items)
             {
                 if (Parent(item.Path) != path || !values.TryAdd(item.Path, new(item))) throw Failure("InvalidMetadataListing");
-                if (state.Entries?.GetValueOrDefault(item.Path) is { } prior && SameIdentity(prior.Info, item)) values[item.Path] = new(item, prior.Sha256, prior.Canonical);
+                if ((state.Entries?.GetValueOrDefault(item.Path) ?? state.PartialEntries?.GetValueOrDefault(item.Path)) is { } prior && SameIdentity(prior.Info, item)) values[item.Path] = new(item, prior.Sha256, prior.Canonical);
             }
-            state.Entries = values; state.Loaded = true; state.Used = ++clock;
+            state.Entries = values; state.PartialEntries = null; state.Loaded = true; state.Used = ++clock;
             await SaveAsync(path, state, ct).ConfigureAwait(false); Evict();
+        }
+        finally { gate.Release(); }
+    }
+
+    public async Task RecordPartialListingAsync(string path, IReadOnlyList<CloudObjectInfo> items, long observedRevision, CancellationToken ct)
+    {
+        await gate.WaitAsync(ct).ConfigureAwait(false);
+        try
+        {
+            var state = await StateAsync(path, ct).ConfigureAwait(false);
+            if (revision != observedRevision || state.Mutations != 0) return;
+            var previous = state.Entries;
+            // Reader refreshes can observe an external writer. Even a previously complete
+            // checkpoint may no longer prove absence; retire it before publishing positives.
+            if (previous is not null) { InvalidateFile(path); state.Entries = null; }
+            state.PartialEntries ??= new(StringComparer.Ordinal);
+            foreach (var item in items)
+            {
+                if (Parent(item.Path) != path) throw Failure("InvalidMetadataListing");
+                var prior = previous?.GetValueOrDefault(item.Path) ?? state.PartialEntries.GetValueOrDefault(item.Path);
+                state.PartialEntries[item.Path] = prior is not null && SameIdentity(prior.Info, item)
+                    ? new(item, prior.Sha256, prior.Canonical) : new(item);
+            }
+            int limit = Math.Min(maximumMemoryEntries, MaximumDirectoryEntries);
+            while (state.PartialEntries.Count > limit) state.PartialEntries.Remove(state.PartialEntries.Keys.First());
+            if (state.PartialEntries.Count == 0) state.PartialEntries = null;
+            state.Loaded = true; state.Used = ++clock;
+            Evict();
         }
         finally { gate.Release(); }
     }
@@ -112,8 +143,8 @@ internal sealed partial class BaiduMetadataCache : IDisposable
         try
         {
             var state = await StateAsync(path, ct).ConfigureAwait(false);
-            if (state.Mutations != 0 || revision != expectedRevision || state.Entries is { Count: > 0 }) return;
-            state.Entries = new(StringComparer.Ordinal); state.Loaded = true; state.Used = ++clock;
+            if (state.Mutations != 0 || revision != expectedRevision || state.Entries is { Count: > 0 } || state.PartialEntries is { Count: > 0 }) return;
+            state.Entries = new(StringComparer.Ordinal); state.PartialEntries = null; state.Loaded = true; state.Used = ++clock;
             await SaveAsync(path, state, ct).ConfigureAwait(false); Evict();
         }
         finally { gate.Release(); }
@@ -132,6 +163,7 @@ internal sealed partial class BaiduMetadataCache : IDisposable
                 foreach (var parent in parents)
                 {
                     var state = await StateAsync(parent, ct).ConfigureAwait(false);
+                    state.PartialEntries = null;
                     if (state.Entries is null) InvalidateFile(parent);
                     else await AppendAsync(parent, state, "begin", mutationId, null, null, ct).ConfigureAwait(false);
                 }
@@ -161,7 +193,7 @@ internal sealed partial class BaiduMetadataCache : IDisposable
     private void InvalidateAllLocked()
     {
         revision++;
-        foreach (var state in states.Values) { state.Entries = null; state.Loaded = true; }
+        foreach (var state in states.Values) { state.Entries = null; state.PartialEntries = null; state.Loaded = true; }
         if (directory is null) return;
         foreach (var file in Directory.EnumerateFiles(directory, "*.cache")) InvalidateFilePath(file);
     }
@@ -237,12 +269,12 @@ internal sealed partial class BaiduMetadataCache : IDisposable
     }
     private void Evict()
     {
-        foreach (var key in states.Where(p => p.Value.Mutations == 0 && p.Value.Entries is null).Select(p => p.Key).ToArray()) states.Remove(key);
-        var used = states.Values.Sum(s => s.Entries is null ? 0 : Math.Max(1, s.Entries.Count));
+        foreach (var key in states.Where(p => p.Value.Mutations == 0 && p.Value.Entries is null && p.Value.PartialEntries is null).Select(p => p.Key).ToArray()) states.Remove(key);
+        var used = states.Values.Sum(s => s.Entries is not null ? Math.Max(1, s.Entries.Count) : s.PartialEntries?.Count ?? 0);
         foreach (var pair in states.Where(p => p.Value.Mutations == 0).OrderBy(p => p.Value.Used).ToArray())
         {
             if (used <= maximumMemoryEntries) break;
-            used -= pair.Value.Entries is null ? 0 : Math.Max(1, pair.Value.Entries.Count);
+            used -= pair.Value.Entries is not null ? Math.Max(1, pair.Value.Entries.Count) : pair.Value.PartialEntries?.Count ?? 0;
             states.Remove(pair.Key); // Disk checkpoints remain intact.
         }
     }

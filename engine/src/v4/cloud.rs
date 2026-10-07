@@ -69,6 +69,8 @@ pub(super) struct Cloud {
     pub last_job: Option<Job>,
     pub compact: Option<Compact>,
     pub restore: Option<Restore>,
+    #[serde(default)]
+    pub replica: Option<super::replica::Replica>,
     pub lazy_backing: Option<Value>,
     pub base_index: MetaRef,
     pub base_counts: MetaRef,
@@ -192,6 +194,7 @@ fn reconcile_delta(
 impl Volume {
     pub fn control(&self, r: &Value) -> Result<Value> {
         let cmd = string(r, "cmd")?;
+        if cmd.starts_with("replica.") { return self.replica_control(r); }
         if cmd.starts_with("cache.") || cmd == "cloud.gc_candidates" {
             return self.cache_control(r);
         }
@@ -216,6 +219,7 @@ impl Volume {
             self.flush()?;
         }
         if cmd == "cloud.prepare" {
+            self.materialize_replica_counts()?;
             let begin = {
                 let s = self.shared.store.lock().map_err(|_| Error::Poisoned)?;
                 s.cloud.job.is_none()
@@ -461,6 +465,9 @@ impl Volume {
         Ok(())
     }
     pub fn snapshot_manifest(&self, id: &str) -> Result<Value> {
+        self.with_hydration(||self.snapshot_manifest_inner(id))
+    }
+    fn snapshot_manifest_inner(&self, id: &str) -> Result<Value> {
         let mut s = self.shared.store.lock().map_err(|_| Error::Poisoned)?;
         let snapshot = s
             .snapshots

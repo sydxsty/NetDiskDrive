@@ -9,6 +9,14 @@ public sealed partial class ApplicationService
     private readonly ConcurrentDictionary<string, string> cacheErrors = new();
     private readonly ConcurrentDictionary<string, SemaphoreSlim> cacheSettingsGates = new();
 
+    internal static bool RetainReplicaSourcePins(AppSettings settings, string id)
+    {
+        bool changed = false;
+        foreach (var record in settings.Restores.Values.Where(r => r.LocalDiskId == id && !r.ContainerDeleted && r.SourcePinReplaced))
+        { record.SourcePinReplaced = false; changed = true; }
+        return changed;
+    }
+
     internal static LocalCacheSettings ParseCacheSettings(JsonElement args)
     {
         if (!args.TryGetProperty("limitBytes", out var limit) || !limit.TryGetUInt64(out ulong bytes) ||
@@ -67,7 +75,8 @@ public sealed partial class ApplicationService
             if (!settings.Bindings.ContainsKey(id)) { settings.Bindings[id] = binding; changed = true; }
             // Repair the tiny GUI checkpoint window after a durable native pin
             // handoff. This marks eligibility only; deletion still needs manual GC.
-            if (cache.TryGetProperty("origin_backing", out var origin) && Text(origin, "backend_id") == provider &&
+            if (Flag(cache, "origin_pin_required")) changed |= RetainReplicaSourcePins(settings, id);
+            else if (cache.TryGetProperty("origin_backing", out var origin) && Text(origin, "backend_id") == provider &&
                 Text(origin, "account_id") == accountId && Text(origin, "remote_root") == root)
             {
                 string oldPin = Text(origin, "reader_pin");
@@ -93,7 +102,7 @@ public sealed partial class ApplicationService
             var cache = Element(await worker.InvokeAsync("cache.status", Element(new { id }), ct));
             if (UInt(cache, "max_bytes") != preference.LimitBytes || Text(cache, "policy", "lru") != preference.Policy)
                 cache = Element(await worker.InvokeAsync("cache.configure", Element(new { id, max_bytes = preference.LimitBytes, policy = preference.Policy }), ct));
-            bool sameOrigin = handOffOriginalPin && binding is not null && cache.TryGetProperty("origin_backing", out var origin) &&
+            bool sameOrigin = handOffOriginalPin && !Flag(cache, "origin_pin_required") && binding is not null && cache.TryGetProperty("origin_backing", out var origin) &&
                 Text(origin, "remote_root") == binding.RemoteRoot && Text(origin, "account_id") == binding.AccountId;
             if ((preference.LimitBytes > 0 || sameOrigin) && !Flag(cache, "source_ready") && binding is not null && binding.AccountId == account?.AccountId && client is not null)
             {

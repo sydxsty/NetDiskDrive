@@ -94,7 +94,12 @@ pub struct Config {
     pub direct_base: bool,
     pub wide: bool,
     pub cache_capable: bool,
+    /// A fork allocates in the next disjoint ordinal range, leaving all source
+    /// ordinals stable so later source generations and local snapshots coexist.
+    #[serde(default, skip_serializing_if = "zero_allocation_depth")]
+    pub allocation_depth: u8,
 }
+fn zero_allocation_depth(value: &u8) -> bool { *value == 0 }
 impl Config {
     fn ad(&self) -> Vec<u8> {
         let mut a = b"OverlayDisk v4 volume key".to_vec();
@@ -112,6 +117,10 @@ impl Config {
         }
         a.extend_from_slice(b"object-geometry-v1");
         a.extend_from_slice(&self.object_size.to_le_bytes());
+        if self.allocation_depth != 0 {
+            a.extend_from_slice(b"fork-object-namespace");
+            a.push(self.allocation_depth);
+        }
         a
     }
     #[cfg(test)]
@@ -139,6 +148,7 @@ impl Config {
             direct_base: false,
             wide: capacity > 1024 * 1024 * 1024 * 1024,
             cache_capable: false,
+            allocation_depth: 0,
         };
         let key = if let Some(password) = password {
             if password.is_empty() {
@@ -172,6 +182,7 @@ impl Config {
     }
     pub fn unlock(&self, password: Option<&str>) -> Result<Crypto> {
         let geometry = super::Geometry::new(self.object_size)?;
+        super::store::allocation_range(self)?;
         if self.format_version != 4
             || self.capacity_bytes < 64 * 1024 * 1024
             || self.capacity_bytes > super::MAX_CAPACITY
@@ -218,6 +229,11 @@ impl Config {
     }
     pub fn fork_identity(&self, crypto: &Crypto, password: Option<&str>, id: Uuid) -> Result<Self> {
         let mut c = self.clone();
+        if id != self.id {
+            c.allocation_depth = c.allocation_depth.checked_add(1)
+                .ok_or_else(|| Error::Invalid("copy ancestry is exhausted".into()))?;
+            super::store::allocation_range(&c)?;
+        }
         c.id = id;
         c.crypto_id = Some(crypto.id);
         c.restoring = true;

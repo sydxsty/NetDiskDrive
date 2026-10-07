@@ -13,7 +13,7 @@
 powershell -ExecutionPolicy Bypass -File scripts/build.ps1
 ```
 
-默认输出 `artifacts/OverlayDisk-v0.7.0/`。为避免夹带上次构建的文件，输出目录必须为空；保留旧目录，复建时指定新的目录：
+默认输出 `artifacts/OverlayDisk-v0.8.0/`。为避免夹带上次构建的文件，输出目录必须为空；保留旧目录，复建时指定新的目录：
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File scripts/build.ps1 -OutputDirectory C:\Builds\NetDiskDrive-public
@@ -38,7 +38,7 @@ powershell -ExecutionPolicy Bypass -File scripts/build.ps1 -OutputDirectory C:\B
 powershell -ExecutionPolicy Bypass -File scripts/test-local.ps1
 ```
 
-如指定自定义发布目录，为测试传同一个 `-ApplicationDirectory`。测试使用新的临时目录，包括启动、原生存储核心、日志、4/8/16 MiB 压缩同步及缓存校验，不是吞吐 benchmark。
+如指定自定义发布目录，为测试传同一个 `-ApplicationDirectory`。测试使用新的临时目录，包括启动、原生存储核心、日志、4/8/16 MiB 压缩同步、缓存，以及懒加载副本的准备/确认/取消/切换校验，不是吞吐 benchmark。
 
 需要驱动和管理员权限的真实挂载验证单独选择：
 
@@ -46,7 +46,19 @@ powershell -ExecutionPolicy Bypass -File scripts/test-local.ps1
 powershell -ExecutionPolicy Bypass -File scripts/test-local.ps1 -IncludeMount
 ```
 
-该选项只创建新的隔离测试容器，验证 NTFS、卸载重挂和文件校验，不接受已有磁盘号作为目标。建议在测试电脑中运行。
+该选项只创建新的隔离测试容器，验证 NTFS、卸载重挂、懒加载最新快照切换和文件校验，不接受已有磁盘号作为目标。建议在测试电脑中运行。
+
+只验证本轮副本功能时，可在构建目录运行 `dotnet OverlayDisk.dll --replica-smoke C:\Temp\ReplicaCheck`。管理员终端中的 `dotnet OverlayDisk.dll --replica-mount-smoke C:\Temp\ReplicaMountCheck` 另创建新 256 MiB 加密测试盘，检查只读/读写挂载、卸载后切换及文件内容；两条命令都要求新的空输出目录，不访问真实网盘账户。
+
+GPT 恢复回归可单独运行 `dotnet OverlayDisk.dll --replica-gpt-smoke C:\Temp\ReplicaGptCheck`。它在新的空目录中创建 4 TiB 虚拟容量的稀疏测试容器，通过真实应用服务与原生接口检查分区表、恢复重试及快照更新；只写入少量测试数据，无需管理员权限或真实挂载，云对象来自内存模拟后端。
+
+界面交互可以单独用 Node.js、Playwright 和 Microsoft Edge 验证。以下示例中的 Playwright 路径按本机安装位置填写，结果保存在指定临时目录：
+
+```powershell
+node app/web/tests/replica.browser.test.cjs C:\Temp\NetDiskDrive-replica-ui C:\Tools\node_modules\playwright
+```
+
+该测试加载实际界面代码，以模拟的磁盘服务检查挂载限制、解锁、版本确认、覆盖警告、取消和缓存状态；阻止外网请求，不接触真实磁盘或百度账户。它证明界面交互符合约定，不能代替存储原子性、真实挂载或云端协议检查。
 
 ## 项目结构
 
@@ -59,6 +71,6 @@ powershell -ExecutionPolicy Bypass -File scripts/test-local.ps1 -IncludeMount
 | `cloud/OverlayDisk.Cloud.Baidu` | 百度私有网页接口、限流与凭据隔离 |
 | `app/ThirdParty/WinSpd` | 上游 C# 绑定、修改说明与许可 |
 
-当前用户入口只读取当前格式。仓库保留较早的研究实现及测试以供参考，这不表示当前程序兼容旧磁盘。
+仓库只保留当前存储核心及其接口、测试和格式说明。旧版存储实现、原生接口和专用示例已移除；当前程序不读取或迁移旧格式磁盘。
 
 WinSpd - Windows Storage Proxy Driver, Copyright (C) Bill Zissimopoulos — https://github.com/winfsp/winspd

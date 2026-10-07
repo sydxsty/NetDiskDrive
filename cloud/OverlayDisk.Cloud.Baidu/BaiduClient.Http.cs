@@ -9,7 +9,7 @@ using OverlayDisk.Cloud.Contracts;
 
 namespace OverlayDisk.Cloud.Baidu;
 
-public sealed partial class BaiduClient : ICloudObjectStore, ICloudBatchDeleteStore, ICloudPreparedUploadStore, ICloudKnownObjectReader, ICloudEncodedObjectStore, ICloudBoundedObjectReader
+public sealed partial class BaiduClient : ICloudObjectStore, ICloudBatchDeleteStore, ICloudPreparedUploadStore, ICloudKnownObjectReader, ICloudEncodedObjectStore, ICloudBoundedObjectReader, ICloudDescendingDirectoryReader
 {
     private static readonly Uri Pan = new("https://pan.baidu.com/");
     private static readonly Uri Pcs = new("https://pcs.baidu.com/");

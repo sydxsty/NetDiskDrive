@@ -1,3 +1,4 @@
+using System.Buffers.Binary;
 using System.Runtime.InteropServices;
 using System.Text;
 using System.Text.Json;
@@ -110,13 +111,17 @@ public sealed class CoreDisk : IDisposable
     }
 
     public void Read(ulong offset, byte[] buffer, int length)
+        => ReadCore(offset, buffer, length, prefetch: true);
+    internal void ReadForManagement(ulong offset, byte[] buffer, int length)
+        => ReadCore(offset, buffer, length, prefetch: false);
+    private void ReadCore(ulong offset, byte[] buffer, int length, bool prefetch)
     {
         ArgumentOutOfRangeException.ThrowIfNegative(length);
         if (length > buffer.Length) throw new ArgumentOutOfRangeException(nameof(length));
         lifetime.EnterReadLock();
         try { EnsureOpen(); Check(Native.od_v4_read(handle, offset, buffer, (uint)length)); }
         finally { lifetime.ExitReadLock(); }
-        hydration?.AfterRead(offset, (uint)length, Capacity);
+        if (prefetch) hydration?.AfterRead(offset, (uint)length, Capacity);
     }
     public void Write(ulong offset, byte[] buffer, int length)
     {
@@ -265,7 +270,39 @@ public sealed class CoreDisk : IDisposable
     }
 
     public JsonElement GetLazyStatus() => Control(new { cmd = "lazy.status" });
+    internal void SetReplicaIdentity(IReadOnlyList<DiskIdentityRewriter.WriteRegion> regions)
+    {
+        if (regions.Count > 4) throw new IOException("磁盘身份区域数量超过限制。");
+        int payloadLength = 0;
+        foreach (var region in regions)
+        {
+            if (region.Bytes.Length == 0 || region.Bytes.Length > 65536 - payloadLength)
+                throw new IOException("磁盘身份数据大小超过限制。");
+            payloadLength += region.Bytes.Length;
+        }
+        byte[] frame = new byte[4 + regions.Count * 12 + payloadLength];
+        BinaryPrimitives.WriteUInt32LittleEndian(frame, (uint)regions.Count);
+        int cursor = 4;
+        foreach (var region in regions)
+        {
+            BinaryPrimitives.WriteUInt64LittleEndian(frame.AsSpan(cursor), region.Offset);
+            BinaryPrimitives.WriteUInt32LittleEndian(frame.AsSpan(cursor + 8), (uint)region.Bytes.Length);
+            region.Bytes.CopyTo(frame, cursor + 12);
+            cursor += 12 + region.Bytes.Length;
+        }
+        WithHandle(h => Check(Native.od_v4_replica_identity(h, frame, (uint)frame.Length)));
+    }
+    public JsonElement StageReplica(byte[] rootObject, JsonElement options)
+    {
+        if (rootObject.Length != ObjectSizeBytes) throw new IOException("云端快照对象大小与磁盘不一致。");
+        WithHandle(h => Check(Native.od_v4_replica_stage(h, rootObject, (uint)rootObject.Length, options.GetRawText())));
+        return Control(new { cmd = "replica.status" });
+    }
     public object? GetHydrationState() => hydration?.GetState();
+    internal void CancelPrefetch()
+    {
+        lock (hydrationGate) hydration?.CancelPrefetch();
+    }
     public void ConfigurePrefetch(PrefetchSettings settings, long revision = 0)
     {
         lock (hydrationGate)
@@ -393,6 +430,8 @@ public sealed class CoreDisk : IDisposable
         [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)] internal static extern int od_v4_set_object_provider(IntPtr handle, ObjectProviderCallback? callback, IntPtr context);
         [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)] internal static extern IntPtr od_v4_lazy_begin([MarshalAs(UnmanagedType.LPUTF8Str)] string path, byte[] root, uint length, [MarshalAs(UnmanagedType.LPUTF8Str)] string? password, [MarshalAs(UnmanagedType.LPUTF8Str)] string backingJson);
         [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)] internal static extern int od_v4_lazy_import(IntPtr handle, [MarshalAs(UnmanagedType.LPUTF8Str)] string objectId, byte[] data, uint length);
+        [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)] internal static extern int od_v4_replica_stage(IntPtr handle, byte[] root, uint length, [MarshalAs(UnmanagedType.LPUTF8Str)] string optionsJson);
+        [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)] internal static extern int od_v4_replica_identity(IntPtr handle, byte[] frame, uint length);
         [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)] internal static extern int od_v4_create([MarshalAs(UnmanagedType.LPUTF8Str)] string path, ulong capacity, [MarshalAs(UnmanagedType.LPUTF8Str)] string? password);
         [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)] internal static extern IntPtr od_v4_open([MarshalAs(UnmanagedType.LPUTF8Str)] string path, [MarshalAs(UnmanagedType.LPUTF8Str)] string? password);
         [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)] internal static extern int od_v4_inspect([MarshalAs(UnmanagedType.LPUTF8Str)] string path, [Out] byte[] output, uint length);

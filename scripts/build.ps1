@@ -7,7 +7,7 @@ param(
 )
 $ErrorActionPreference = 'Stop'
 $project = [IO.Path]::GetFullPath((Split-Path $PSScriptRoot -Parent))
-if (!$OutputDirectory) { $OutputDirectory = Join-Path $project 'artifacts\OverlayDisk-v0.7.0' }
+if (!$OutputDirectory) { $OutputDirectory = Join-Path $project 'artifacts\OverlayDisk-v0.8.0' }
 $OutputDirectory = [IO.Path]::GetFullPath($OutputDirectory)
 $BuildDirectory = [IO.Path]::GetFullPath($BuildDirectory)
 if (!$DotNetPath) {
@@ -55,8 +55,6 @@ try {
         & $DotNetPath run --project (Join-Path $project 'cloud\tests\OverlayDisk.Cloud.Sync.Tests') -c Release
         if ($LASTEXITCODE -ne 0) { throw 'Cloud synchronization tests failed.' }
     }
-    & $CargoPath build --manifest-path $manifest --target-dir $target --release --locked --examples
-    if ($LASTEXITCODE -ne 0) { throw 'Rust examples build failed.' }
     & $CargoPath build --manifest-path $manifest --target-dir $target --release --locked --lib
     if ($LASTEXITCODE -ne 0) { throw 'Rust library build failed.' }
     Copy-Item -LiteralPath (Join-Path $target 'release\overlaydisk_core.dll') -Destination (Join-Path $project 'app\runtime\overlaydisk_core.dll') -Force

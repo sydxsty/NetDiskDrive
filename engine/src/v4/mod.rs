@@ -8,7 +8,13 @@ mod io;
 mod lazy;
 mod maintenance;
 mod ntfs;
+mod portable_validation;
+#[cfg(test)]
+mod portable_validation_tests;
 mod restore;
+mod replica;
+#[cfg(test)]
+mod replica_tests;
 mod store;
 mod tree;
 mod volume;

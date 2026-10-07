@@ -7,7 +7,7 @@ extern "C" {
 /* All entrypoints use the C calling convention. Never close concurrently with
  * any handle call. Stop admissions, drain and flush while replies are still
  * being consumed, release completions, then close. Close itself does NOT flush. */
-int32_t od_v4_create(const char *path_utf8, uint64_t capacity, const char *password_or_null); /* Legacy default: 4 MiB. */
+int32_t od_v4_create(const char *path_utf8, uint64_t capacity, const char *password_or_null); /* Default: 4 MiB. */
 /* Creation only: one immutable object per 4, 8 or 16 MiB; internal pages remain 4 KiB. */
 int32_t od_v4_create_sized(const char *path_utf8, uint64_t capacity, const char *password_or_null, uint32_t object_size_bytes);
 void *od_v4_open(const char *path_utf8, const char *password_or_null);
@@ -28,6 +28,19 @@ void *od_v4_lazy_begin(const char *path_utf8, const uint8_t *root_object,
 /* Authenticated immutable object import, outside the ordered I/O queue.
  * length must match Info.object_size; restore roots carry and authenticate the same geometry. */
 int32_t od_v4_lazy_import(void *, const char *object_id, const uint8_t *data, uint32_t length);
+/* Prepare a newer source root without replacing the current root. The caller
+ * must keep the disk unmounted throughout preparation and confirmation.
+ * options: {backing,commit,publication?}; replica.status returns the candidate
+ * token/revision for replica.apply. Does not upload local modifications. */
+int32_t od_v4_replica_stage(void *, const uint8_t *root_object, uint32_t length,
+    const char *options_json);
+/* Install a copy's local partition identity in one atomic commit while unmounted.
+ * Binary frame: little-endian uint32 count, then count entries of
+ * uint64 offset, uint32 byte_length, byte_length bytes. Maximum 4 entries and
+ * 65536 payload bytes; each entry must be within the disk's first/last 64 KiB.
+ * Empty count is valid. Malformed/truncated/trailing input makes no change.
+ * This presentation overlay does not dirty guest pages or trigger uploads. */
+int32_t od_v4_replica_identity(void *, const uint8_t *frame, uint32_t length);
 int32_t od_v4_read(void *, uint64_t offset, uint8_t *data, uint32_t length);
 int32_t od_v4_read_persistent(void *, uint64_t offset, uint8_t *data, uint32_t length);
 int32_t od_v4_write(void *, uint64_t offset, const uint8_t *data, uint32_t length);
