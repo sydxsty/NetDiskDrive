@@ -9,6 +9,7 @@ public sealed class AppSettings
     public string DeviceId { get; set; } = Guid.NewGuid().ToString();
     public int SyncIntervalSeconds { get; set; } = 3600;
     public int MaxParallelTransfers { get; set; } = 4;
+    public int SyncPreparationCacheMiB { get; set; } = SyncPreparationLimits.DefaultCacheMiB;
     public bool SyncOnExit { get; set; } = false;
     public PrefetchSettings Prefetch { get; set; } = new();
     public uint DefaultObjectSizeBytes { get; set; } = 4 * 1024 * 1024;
@@ -73,6 +74,13 @@ internal static class SettingsStorage
     internal static string DirectoryPath => Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "OverlayDisk", "current");
     // The login vault and WebView profile are stable account storage, independent of container schemas.
     internal static string SessionPath => Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "OverlayDisk", "v4", "baidu-session.dpapi");
+    internal static int PreparationCacheMiB(JsonElement update, int current)
+    {
+        if (!update.TryGetProperty("syncPreparationCacheMiB", out var value)) return SyncPreparationLimits.ValidateCacheMiB(current);
+        if (value.ValueKind != JsonValueKind.Number || !value.TryGetInt32(out int parsed))
+            throw new IOException("同步整理缓存应为 16–1024 MiB 的整数。");
+        return SyncPreparationLimits.ValidateCacheMiB(parsed);
+    }
     internal static AppSettings Load()
     {
         Directory.CreateDirectory(DirectoryPath);

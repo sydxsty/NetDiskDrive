@@ -39,8 +39,9 @@ internal sealed partial class BaiduMetadataCache : IDisposable
     }
     private sealed record Payload(int Version, string ProviderId, string AccountId, string Directory, Guid CheckpointId, CachedCloudObject[] Entries);
 
-    public BaiduMetadataCache(string? root, string providerId, string accountId, int maximumMemoryEntries)
+    public BaiduMetadataCache(string? root, string providerId, string accountId, int maximumMemoryEntries, MetadataJournalTestHooks? testHooks = null)
     {
+        journalTestHooks = testHooks;
         this.providerId = providerId; this.accountId = accountId; this.maximumMemoryEntries = maximumMemoryEntries;
         if (root is null) return;
         try
@@ -69,7 +70,7 @@ internal sealed partial class BaiduMetadataCache : IDisposable
     public async Task<long> ListingRevisionAsync(CancellationToken ct)
     {
         await gate.WaitAsync(ct).ConfigureAwait(false);
-        try { return revision; }
+        try { ObjectDisposedException.ThrowIf(disposed, this); return revision; }
         finally { gate.Release(); }
     }
 
@@ -124,17 +125,17 @@ internal sealed partial class BaiduMetadataCache : IDisposable
 
     public async Task RememberVerifiedAsync(CachedCloudObject item, CancellationToken ct)
     {
-        await gate.WaitAsync(ct).ConfigureAwait(false);
-        try
+        await QueueJournalAsync(async () =>
         {
             var parent = Parent(item.Info.Path); var state = await StateAsync(parent, ct).ConfigureAwait(false);
             if (state.Entries is null) return; // A single receipt cannot prove all siblings absent.
+            if (state.Entries.GetValueOrDefault(item.Info.Path) == item) return;
+            journalBatch!.Touched.Add(parent);
             state.Entries[item.Info.Path] = item;
             await AppendAsync(parent, state, "patch", Guid.Empty, [item], null, ct).ConfigureAwait(false);
             await MaybeCheckpointAsync(parent, state, ct).ConfigureAwait(false);
             Evict();
-        }
-        finally { gate.Release(); }
+        }, ct).ConfigureAwait(false);
     }
 
     public async Task RememberEmptyDirectoryAsync(string path, long expectedRevision, CancellationToken ct)
@@ -153,8 +154,7 @@ internal sealed partial class BaiduMetadataCache : IDisposable
     public async Task<Mutation> BeginMutationAsync(IReadOnlyList<string> paths, bool deletingDirectory, CancellationToken ct)
     {
         var parents = paths.Select(Parent).Distinct(StringComparer.Ordinal).ToArray();
-        await gate.WaitAsync(ct).ConfigureAwait(false);
-        try
+        return await QueueJournalAsync(async () =>
         {
             if (deletingDirectory) InvalidateAllLocked(); // Descendant cache files must not survive a directory deletion.
             var mutationId = Guid.NewGuid();
@@ -162,6 +162,7 @@ internal sealed partial class BaiduMetadataCache : IDisposable
             {
                 foreach (var parent in parents)
                 {
+                    journalBatch!.Touched.Add(parent);
                     var state = await StateAsync(parent, ct).ConfigureAwait(false);
                     state.PartialEntries = null;
                     if (state.Entries is null) InvalidateFile(parent);
@@ -179,9 +180,9 @@ internal sealed partial class BaiduMetadataCache : IDisposable
             }
             revision++;
             foreach (var parent in parents) states[parent].Mutations++;
+            journalBatch!.UnreturnedBegins.Add(parents);
             return new Mutation(this, parents, revision, mutationId);
-        }
-        finally { gate.Release(); }
+        }, ct).ConfigureAwait(false);
     }
 
     public async Task InvalidateAsync(CancellationToken ct = default)
@@ -192,6 +193,7 @@ internal sealed partial class BaiduMetadataCache : IDisposable
     }
     private void InvalidateAllLocked()
     {
+        ObjectDisposedException.ThrowIf(disposed, this);
         revision++;
         foreach (var state in states.Values) { state.Entries = null; state.PartialEntries = null; state.Loaded = true; }
         if (directory is null) return;
@@ -200,8 +202,7 @@ internal sealed partial class BaiduMetadataCache : IDisposable
 
     private async Task<long?> FinishAsync(string[] parents, long startedRevision, Guid mutationId, IReadOnlyList<CachedCloudObject>? changed, IReadOnlyList<string>? removed, bool success)
     {
-        await gate.WaitAsync().ConfigureAwait(false);
-        try
+        return await QueueJournalAsync<long?>(async () =>
         {
             var uninterrupted = revision == startedRevision;
             revision++;
@@ -210,6 +211,7 @@ internal sealed partial class BaiduMetadataCache : IDisposable
             {
             foreach (var parent in parents)
             {
+                journalBatch!.Touched.Add(parent);
                 var state = states[parent];
                 if (!success) { state.Entries = null; state.Loaded = true; InvalidateFile(parent); continue; }
                 if (state.Entries is { } values)
@@ -234,8 +236,7 @@ internal sealed partial class BaiduMetadataCache : IDisposable
                 }
                 throw;
             }
-        }
-        finally { gate.Release(); }
+        }, CancellationToken.None).ConfigureAwait(false);
     }
 
     internal sealed class Mutation(BaiduMetadataCache owner, string[] parents, long startedRevision, Guid mutationId) : IAsyncDisposable
@@ -269,6 +270,7 @@ internal sealed partial class BaiduMetadataCache : IDisposable
     }
     private void Evict()
     {
+        if (journalBatch is not null) return;
         foreach (var key in states.Where(p => p.Value.Mutations == 0 && p.Value.Entries is null && p.Value.PartialEntries is null).Select(p => p.Key).ToArray()) states.Remove(key);
         var used = states.Values.Sum(s => s.Entries is not null ? Math.Max(1, s.Entries.Count) : s.PartialEntries?.Count ?? 0);
         foreach (var pair in states.Where(p => p.Value.Mutations == 0).OrderBy(p => p.Value.Used).ToArray())
@@ -297,5 +299,17 @@ internal sealed partial class BaiduMetadataCache : IDisposable
     private static bool SameIdentity(CloudObjectInfo a, CloudObjectInfo b) => a.Path == b.Path && a.Length == b.Length && a.IsDirectory == b.IsDirectory &&
         a.RemoteId == b.RemoteId && a.ProviderChecksum == b.ProviderChecksum && a.LastModified == b.LastModified;
     private static CloudProviderException Failure(string code) => new(code, "The local Baidu metadata cache could not be safely updated.");
-    public void Dispose() { disposed = true; lease?.Dispose(); gate.Dispose(); }
+    public void Dispose()
+    {
+        Task? drain;
+        lock (journalAdmission) { stopping = true; drain = journalPump; }
+        // Never wait for the pump while owning gate: its final durable flush
+        // needs that gate before queued callers can complete.
+        drain?.GetAwaiter().GetResult();
+        gate.Wait();
+        try { if (disposed) return; disposed = true; lease?.Dispose(); }
+        finally { gate.Release(); }
+        // Keep this managed semaphore alive for already queued readers, which
+        // must observe disposed instead of racing a disposed synchronization object.
+    }
 }

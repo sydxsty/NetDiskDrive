@@ -32,14 +32,22 @@ internal sealed partial class BaiduMetadataCache
             BinaryPrimitives.WriteInt32LittleEndian(frame, payload.Length);
             payload.CopyTo(frame, 4);
             SHA256.HashData(payload).CopyTo(frame, 4 + payload.Length);
-            await using (var file = new FileStream(JournalPath(path), FileMode.Open, FileAccess.Write, FileShare.None,
-                64 * 1024, FileOptions.Asynchronous | FileOptions.WriteThrough))
+            ct.ThrowIfCancellationRequested();
+            if (journalBatch is { } batch)
             {
+                if (!batch.Files.TryGetValue(path, out var pending)) batch.Files.Add(path, pending = new(path, state));
+                pending.Frames.Add(frame); batch.Bytes += frame.Length;
+            }
+            else
+            {
+                await using var file = new FileStream(JournalPath(path), FileMode.Open, FileAccess.Write, FileShare.None,
+                    64 * 1024, FileOptions.Asynchronous);
                 if (file.Length != state.JournalBytes) throw new IOException("Directory journal changed.");
                 file.Position = file.Length;
                 await file.WriteAsync(frame, ct).ConfigureAwait(false);
-                await file.FlushAsync(ct).ConfigureAwait(false);
                 file.Flush(true);
+                Interlocked.Increment(ref journalRecordsWritten); Interlocked.Increment(ref journalFlushes);
+                maximumRecordsPerFlush = Math.Max(maximumRecordsPerFlush, 1);
             }
             state.JournalSequence++;
             state.JournalRecords++;
@@ -67,7 +75,10 @@ internal sealed partial class BaiduMetadataCache
         // Small deltas append only. Growth adapts to live directory size, so a
         // large directory is not copied once per fixed small batch of objects.
         if (state.JournalRecords >= Math.Max(256, state.Entries.Count) || state.JournalBytes >= CheckpointJournalBytes)
-            await SaveAsync(path, state, ct).ConfigureAwait(false);
+        {
+            if (journalBatch is { } batch) batch.Checkpoints.Add(path);
+            else await SaveAsync(path, state, ct).ConfigureAwait(false);
+        }
     }
 
     private async Task<Dictionary<string, CachedCloudObject>?> LoadAsync(string path, DirectoryState state, CancellationToken ct)

@@ -176,6 +176,419 @@ mod tests {
         );
     }
 
+    fn catalog_job(store: &mut Store, objects: &[Object]) {
+        let mut cloud = store.cloud.clone();
+        let empty = MetaRef::default();
+        let mut job = super::super::cloud::Job {
+            id: uuid::Uuid::new_v4().to_string(),
+            phase: "ready".into(),
+            generation: 1,
+            snapshot: empty,
+            pending: empty,
+            cursor: 0,
+            index: empty,
+            counts: empty,
+            add: empty,
+            remove: empty,
+            receipts: empty,
+            receipt_epoch: 0,
+            meta_tail: 0,
+            root_oid: 0,
+            root_sha256: String::new(),
+            processed_pages: 0,
+            changed_pages: 0,
+            seal_tails: Vec::new(),
+            seal_cursor: 0,
+            seed_base: false,
+            seed_cursor: 0,
+        };
+        store
+            .transaction(|tx| {
+                job.add = tx.set(
+                    &super::super::store::SET,
+                    empty,
+                    &objects
+                        .iter()
+                        .filter(|o| matches!(o.sync_state, 1 | 2))
+                        .map(|o| (o.oid, Some(vec![1])))
+                        .collect::<Vec<_>>(),
+                )?;
+                job.receipts = tx.set(
+                    &super::super::store::SET,
+                    empty,
+                    &objects
+                        .iter()
+                        .filter(|o| o.sync_state == 2)
+                        .map(|o| (o.oid, Some(vec![1])))
+                        .collect::<Vec<_>>(),
+                )?;
+                cloud.job = Some(job.clone());
+                tx.save_cloud(&cloud)
+            })
+            .unwrap();
+        store.cloud = cloud;
+    }
+
+    #[test]
+    fn receipt_catalog_statistics_filters_and_rank_pages_remain_read_only() {
+        let folder = tempfile::tempdir().unwrap();
+        let mut store = fresh(&folder.path().join("receipt-catalog.odv4"));
+        let mut objects = fixture_objects(&mut store, 96);
+        let pending = objects
+            .iter()
+            .filter(|o| o.sync_state == 1)
+            .map(|o| o.oid)
+            .collect::<Vec<_>>();
+        // One confirmed and one unconfirmed object are no longer resident.
+        for oid in [pending[0], pending[10]] {
+            let object = objects.iter_mut().find(|o| o.oid == oid).unwrap();
+            let extent = object.extent;
+            object.missing = true;
+            object.extent = 0;
+            store
+                .transaction(|tx| {
+                    tx.objects.insert(oid, object.clone());
+                    tx.root.blocks = tx.set(
+                        &BLOCKS,
+                        tx.root.blocks,
+                        &[(extent, Some(u64::MAX.to_le_bytes().to_vec()))],
+                    )?;
+                    Ok(())
+                })
+                .unwrap();
+        }
+        catalog_job(&mut store, &objects);
+        let confirmed = pending
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| *i < 6 || *i % 5 == 2)
+            .map(|(_, oid)| *oid)
+            .collect::<BTreeSet<_>>();
+        let job = store.cloud.job.as_ref().unwrap();
+        store.receipts.view = Arc::new(super::super::receipts::View {
+            job_id: job.id.clone(),
+            epoch: job.receipt_epoch,
+            objects: confirmed.clone(),
+        });
+        // Stale transfer callbacks must not override successful receipts. Include
+        // one persisted uploaded object in failed state to exercise rank removal.
+        for (oid, state) in [
+            (pending[1], "failed"),
+            (pending[2], "uploading"),
+            (pending[8], "uploading"),
+            (pending[9], "failed"),
+            (objects[12].oid, "failed"),
+        ] {
+            store.cloud.transfer.insert(oid, state.into());
+        }
+        let expected = objects
+            .iter()
+            .map(|o| {
+                let state = if confirmed.contains(&o.oid) {
+                    "uploaded"
+                } else {
+                    store
+                        .cloud
+                        .transfer
+                        .get(&o.oid)
+                        .map(String::as_str)
+                        .unwrap_or(STATUS_NAMES[effective_state(o).unwrap()])
+                };
+                (o.clone(), state.to_owned())
+            })
+            .collect::<Vec<_>>();
+        let writes = store.device.diagnostics()["physical_write_bytes"];
+        let seq = store.root.seq;
+        let stats = store.root.stats;
+        let summary = store.debug_summary().unwrap();
+        assert_eq!(summary["pending_objects"], pending.len() - confirmed.len());
+        assert_eq!(summary["pending_missing_objects"], 1);
+        assert_eq!(
+            summary["pending_resident_objects"],
+            pending.len() - confirmed.len() - 1
+        );
+        assert_eq!(
+            summary["current_job"]["pending_objects"],
+            pending.len() - confirmed.len()
+        );
+        for state in STATUS_NAMES.into_iter().chain(["uploading", "failed"]) {
+            assert_eq!(
+                summary["counts"][state],
+                expected.iter().filter(|(_, s)| s == state).count()
+            );
+        }
+        for (kind, name) in TYPE_NAMES.iter().enumerate() {
+            let left = objects
+                .iter()
+                .filter(|o| {
+                    o.sync_state == 1 && content_type(o) == kind && !confirmed.contains(&o.oid)
+                })
+                .count();
+            assert_eq!(summary["types"][kind]["id"], *name);
+            assert_eq!(summary["types"][kind]["pending_objects"], left);
+            assert_eq!(
+                summary["types"][kind]["pending_bytes"],
+                left as u64 * store.geometry().object_size
+            );
+        }
+        for state in STATUS_NAMES
+            .into_iter()
+            .chain(["uploading", "failed"])
+            .map(Some)
+            .chain([None])
+        {
+            for kind in TYPE_NAMES.into_iter().map(Some).chain([None]) {
+                if state.is_none() && kind.is_none() {
+                    continue;
+                }
+                let mut wanted = expected
+                    .iter()
+                    .filter(|(object, actual)| {
+                        !object.missing
+                            && state.is_none_or(|s| s == actual)
+                            && kind.is_none_or(|k| k == TYPE_NAMES[content_type(object)])
+                    })
+                    .map(|(object, _)| object.extent)
+                    .collect::<Vec<_>>();
+                wanted.sort_unstable();
+                for start in 0..=wanted.len() + 1 {
+                    let result = store
+                        .debug_query(&json!({"start":start,"limit":3,
+                        "sync_state":state,"content_type":kind}))
+                        .unwrap();
+                    assert_eq!(result["total_count"], wanted.len(), "{state:?}/{kind:?}");
+                    let actual = result["items"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .map(|item| {
+                            let (object, status) = expected
+                                .iter()
+                                .find(|(o, _)| Some(o.oid) == item["oid"].as_u64())
+                                .unwrap();
+                            assert_eq!(item["sync_state"], status.as_str());
+                            assert_eq!(
+                                item["uploaded"],
+                                object.sync_state >= 2 || confirmed.contains(&object.oid)
+                            );
+                            item["index"].as_u64().unwrap()
+                        })
+                        .collect::<Vec<_>>();
+                    assert_eq!(
+                        actual,
+                        wanted
+                            .iter()
+                            .skip(start)
+                            .take(3)
+                            .copied()
+                            .collect::<Vec<_>>(),
+                        "{state:?}/{kind:?}, start={start}"
+                    );
+                }
+            }
+        }
+        let resident_receipt = objects
+            .iter()
+            .find(|o| !o.missing && confirmed.contains(&o.oid))
+            .unwrap();
+        let direct = store
+            .debug_query(&json!({"start":resident_receipt.extent,"limit":1}))
+            .unwrap();
+        assert_eq!(direct["items"][0]["sync_state"], "uploaded");
+        assert_eq!(direct["items"][0]["uploaded"], true);
+        assert_eq!(store.root.seq, seq);
+        assert_eq!(store.root.stats, stats);
+        assert_eq!(store.device.diagnostics()["physical_write_bytes"], writes);
+    }
+
+    #[test]
+    fn receipt_catalog_overlay_is_bound_to_ready_job_and_checkpoint_epoch() {
+        let folder = tempfile::tempdir().unwrap();
+        let mut store = fresh(&folder.path().join("receipt-identity.odv4"));
+        let objects = fixture_objects(&mut store, 24);
+        catalog_job(&mut store, &objects);
+        let job = store.cloud.job.clone().unwrap();
+        let oid = objects.iter().find(|o| o.sync_state == 1).unwrap().oid;
+        let matching = super::super::receipts::View {
+            job_id: job.id.clone(),
+            epoch: job.receipt_epoch,
+            objects: [oid].into_iter().collect(),
+        };
+        for mismatch in ["epoch", "identity", "phase", "committed"] {
+            let mut overlay = matching.clone();
+            store.cloud.job = Some(job.clone());
+            match mismatch {
+                "epoch" => overlay.epoch += 1,
+                "identity" => overlay.job_id = uuid::Uuid::new_v4().to_string(),
+                "phase" => store.cloud.job.as_mut().unwrap().phase = "preparing".into(),
+                "committed" => {
+                    store.cloud.job = None;
+                    store.cloud.last_job = Some(job.clone());
+                }
+                _ => unreachable!(),
+            }
+            store.receipts.view = Arc::new(overlay);
+            assert_eq!(
+                store.debug_summary().unwrap()["pending_objects"],
+                6,
+                "{mismatch}"
+            );
+            assert_eq!(
+                store
+                    .debug_query(&json!({"sync_state":"uploaded"}))
+                    .unwrap()["total_count"],
+                6,
+                "{mismatch}"
+            );
+            assert_eq!(
+                store.debug_query(&json!({"sync_state":"pending"})).unwrap()["total_count"],
+                6,
+                "{mismatch}"
+            );
+        }
+        store.cloud.job = Some(job);
+        store.receipts.view = Arc::new(matching);
+        let before = store.debug_summary().unwrap();
+        assert_eq!(before["pending_objects"], 5);
+        store.checkpoint_receipts().unwrap();
+        // Simulate a reader acquired after the new root published but before the
+        // registry overlay was replaced; identity mismatch must avoid double count.
+        let old_overlay = Arc::new(super::super::receipts::View {
+            job_id: store.cloud.job.as_ref().unwrap().id.clone(),
+            epoch: 0,
+            objects: [oid].into_iter().collect(),
+        });
+        store.receipts.view = old_overlay;
+        let after = store.debug_summary().unwrap();
+        assert_eq!(after["pending_objects"], before["pending_objects"]);
+        assert_eq!(after["current_job"], before["current_job"]);
+        assert_eq!(after["counts"], before["counts"]);
+        assert_eq!(
+            store
+                .debug_query(&json!({"sync_state":"uploaded"}))
+                .unwrap()["total_count"],
+            7
+        );
+    }
+
+    #[test]
+    fn receipt_catalog_read_lease_keeps_its_view_across_checkpoint_and_reopen() {
+        let folder = tempfile::tempdir().unwrap();
+        let path = folder.path().join("receipt-reader.odv4");
+        Volume::create(&path, 64 * 1024 * 1024, None).unwrap();
+        let volume = Volume::open(&path, None).unwrap();
+        volume.write(0, &[18; super::super::PAGE]).unwrap();
+        volume.flush().unwrap();
+        let mut job = volume.control(&json!({"cmd":"cloud.prepare"})).unwrap()["job"].clone();
+        for _ in 0..64 {
+            if job["phase"] == "ready" {
+                break;
+            }
+            job = volume
+                .control(&json!({"cmd":"cloud.prepare","job_id":job["id"]}))
+                .unwrap()["job"]
+                .clone();
+        }
+        assert_eq!(job["phase"], "ready");
+        let items = volume
+            .control(&json!({"cmd":"cloud.list","job_id":job["id"],"limit":128}))
+            .unwrap();
+        let object = &items["items"][0];
+        let before = volume
+            .debug_control(&json!({"cmd":"blocks.summary"}))
+            .unwrap();
+        volume
+            .control(
+                &json!({"cmd":"cloud.receipt","job_id":job["id"],"records":[{
+                    "object_id":object["id"],"sha256":object["sha256"],"length":object["length"]
+                }]}),
+            )
+            .unwrap();
+        assert_eq!(
+            volume
+                .debug_control(&json!({"cmd":"blocks.changes",
+            "since_revision":before["revision"]}))
+                .unwrap()["changed"],
+            true
+        );
+        let confirmed = volume
+            .debug_control(&json!({"cmd":"blocks.summary"}))
+            .unwrap();
+        assert_eq!(
+            confirmed["pending_objects"].as_u64().unwrap() + 1,
+            before["pending_objects"]
+        );
+        assert_eq!(confirmed["counts"]["uploaded"], 1);
+        assert_eq!(
+            volume
+                .debug_control(&json!({"cmd":"blocks.query","sync_state":"uploaded"}))
+                .unwrap()["total_count"],
+            1
+        );
+        drop(volume);
+        let volume = Volume::open(&path, None).unwrap();
+        let replayed = volume
+            .debug_control(&json!({"cmd":"blocks.summary"}))
+            .unwrap();
+        for key in [
+            "counts",
+            "types",
+            "pending_objects",
+            "pending_bytes",
+            "current_job",
+        ] {
+            assert_eq!(replayed[key], confirmed[key], "journal replay {key}");
+        }
+        let (lease, mut reader) = volume.read_context().unwrap();
+        let mut old_cloud: super::super::cloud::Cloud =
+            serde_json::from_slice(&reader.blob(lease.root.cloud).unwrap()).unwrap();
+        old_cloud.receipt_overlay = lease.receipts.clone();
+        volume
+            .shared
+            .store
+            .lock()
+            .unwrap()
+            .checkpoint_receipts()
+            .unwrap();
+        let current = volume
+            .debug_control(&json!({"cmd":"blocks.summary"}))
+            .unwrap();
+        let old = DebugView {
+            reader: &mut reader,
+            root: lease.root.clone(),
+            cloud: old_cloud,
+            has_snapshots: false,
+        }
+        .debug_summary()
+        .unwrap();
+        for key in [
+            "counts",
+            "types",
+            "pending_objects",
+            "pending_bytes",
+            "current_job",
+        ] {
+            assert_eq!(old[key], confirmed[key], "old lease {key}");
+            assert_eq!(current[key], confirmed[key], "checkpoint {key}");
+        }
+        drop(reader);
+        drop(lease);
+        drop(volume);
+        let reopened = Volume::open(&path, None).unwrap();
+        let after = reopened
+            .debug_control(&json!({"cmd":"blocks.summary"}))
+            .unwrap();
+        for key in [
+            "counts",
+            "types",
+            "pending_objects",
+            "pending_bytes",
+            "current_job",
+        ] {
+            assert_eq!(after[key], confirmed[key], "reopen {key}");
+        }
+    }
+
     #[test]
     fn compact_pause_reopen_protects_published_objects_and_updates_statistics() {
         let folder = tempfile::tempdir().unwrap();
@@ -527,7 +940,35 @@ pub(super) fn apply_object_changes(
     tx: &mut Txn<'_>,
     changes: &[(Option<Object>, Option<Object>)],
 ) -> Result<()> {
-    let mut stats = read_statistics(tx.store, tx.root.stats)?;
+    let identity = |value: &Option<Object>| -> Result<_> {
+        value
+            .as_ref()
+            .map(|o| {
+                Ok((
+                    o.missing,
+                    if o.missing { 0 } else { o.extent },
+                    effective_state(o)?,
+                    content_type(o),
+                ))
+            })
+            .transpose()
+    };
+    let mut changed = false;
+    for (before, after) in changes {
+        if identity(before)? != identity(after)? {
+            changed = true;
+            break;
+        }
+    }
+    if !changed {
+        return Ok(());
+    }
+    let mut stats: Statistics = if tx.root.stats.empty() {
+        Statistics::default()
+    } else {
+        serde_json::from_slice(&tx.read_blob(tx.root.stats)?)?
+    };
+    stats.validate()?;
     let mut rows = BTreeMap::new();
     let mut missing_changed = false;
     for (before, after) in changes {
@@ -684,6 +1125,7 @@ impl super::Volume {
             .iter()
             .map(|(oid, state)| (*oid, state.clone()))
             .collect();
+        cloud.receipt_overlay = lease.receipts.clone();
         let mut view = DebugView {
             reader: &mut reader,
             root: lease.root.clone(),
@@ -712,17 +1154,31 @@ impl<C: CatalogRead> DebugView<'_, C> {
         self.reader.catalog_geometry()
     }
     fn overlays(&mut self) -> Result<Vec<Overlay>> {
-        let entries: Vec<_> = self
+        let mut entries: BTreeMap<_, _> = self
             .cloud
             .transfer
             .iter()
             .filter(|(_, state)| matches!(state.as_str(), "uploading" | "failed"))
             .map(|(oid, state)| (*oid, state.clone()))
             .collect();
+        if let Some(job) = self.cloud.job.as_ref() {
+            if self.cloud.receipt_overlay.matches(job) {
+                // A durable receipt wins over a transfer notification captured
+                // before the upload callback cleared its transient state.
+                entries.extend(
+                    self.cloud
+                        .receipt_overlay
+                        .objects
+                        .iter()
+                        .map(|oid| (*oid, "uploaded".to_owned())),
+                );
+            }
+        }
         let mut out = Vec::with_capacity(entries.len());
-        for (oid, state) in entries {
-            let root = self.root.objects;
-            if let Some(value) = tree::get(self, &OBJECTS, root, oid)? {
+        let keys = entries.keys().copied().collect::<Vec<_>>();
+        let values = tree::get_many(self, &OBJECTS, self.root.objects, &keys)?;
+        for ((oid, state), value) in entries.into_iter().zip(values) {
+            if let Some(value) = value {
                 out.push(Overlay {
                     object: Object::decode(oid, &value)?,
                     state,
@@ -746,7 +1202,14 @@ impl<C: CatalogRead> DebugView<'_, C> {
         }
         counts.insert("uploading", 0);
         counts.insert("failed", 0);
-        let pending_types = &stats.counts[PAIR_START + TYPE_COUNT..PAIR_START + 2 * TYPE_COUNT];
+        let mut pending_types = (0..TYPE_COUNT)
+            .map(|kind| {
+                stats.counts[PAIR_START + TYPE_COUNT + kind]
+                    + stats.missing_counts[PAIR_START + TYPE_COUNT + kind]
+            })
+            .collect::<Vec<_>>();
+        let mut pending_resident = stats.counts[2];
+        let mut pending_missing = stats.missing_counts[2];
         for entry in &overlays {
             let source = STATUS_NAMES
                 .get(effective_state(&entry.object)?)
@@ -756,15 +1219,31 @@ impl<C: CatalogRead> DebugView<'_, C> {
                 .checked_sub(1)
                 .ok_or_else(|| integrity("runtime statistics underflow"))?;
             *counts.get_mut(entry.state.as_str()).unwrap() += 1;
+            if *source == "pending" && entry.state == "uploaded" {
+                let pending = if entry.object.missing {
+                    &mut pending_missing
+                } else {
+                    &mut pending_resident
+                };
+                *pending = pending
+                    .checked_sub(1)
+                    .ok_or_else(|| integrity("runtime pending statistics underflow"))?;
+                let pending_type = &mut pending_types[content_type(&entry.object)];
+                *pending_type = pending_type
+                    .checked_sub(1)
+                    .ok_or_else(|| integrity("runtime pending type statistics underflow"))?;
+            }
         }
-        let pending_objects = stats.counts[2] + stats.missing_counts[2];
+        let pending_objects = pending_resident + pending_missing;
         let current_job = if let Some(job) = &self.cloud.job {
             let add = job.add;
             let receipts = job.receipts;
             let phase = job.phase.clone();
             let generation = job.generation;
+            let journal_receipts = self.cloud.receipt_overlay.count(job);
             let additions = tree::len(self, &super::store::SET, add)?;
-            let confirmed = tree::len(self, &super::store::SET, receipts)?;
+            // Append/recovery exclude receipts already checkpointed in the tree.
+            let confirmed = tree::len(self, &super::store::SET, receipts)? + journal_receipts;
             let remaining = additions
                 .checked_sub(confirmed)
                 .ok_or_else(|| integrity("receipt cardinality exceeds additions"))?;
@@ -773,14 +1252,14 @@ impl<C: CatalogRead> DebugView<'_, C> {
             json!({"pending_objects":0,"pending_bytes":0})
         };
         let types: Vec<_> = TYPE_NAMES.iter().enumerate().map(|(kind, name)| json!({
-            "id":name,"objects":stats.counts[5+kind]+stats.missing_counts[5+kind],"pending_objects":pending_types[kind]+stats.missing_counts[PAIR_START+TYPE_COUNT+kind],"pending_bytes":(pending_types[kind]+stats.missing_counts[PAIR_START+TYPE_COUNT+kind])*g.object_size
+            "id":name,"objects":stats.counts[5+kind]+stats.missing_counts[5+kind],"pending_objects":pending_types[kind],"pending_bytes":pending_types[kind]*g.object_size
         })).collect();
         let new_dirty = tree::len(self, &super::store::DIRTY, self.root.dirty)?;
         Ok(
             json!({"object_size":g.object_size,"revision":self.root.revision,"total_blocks":self.reader.catalog_len()?/g.object_size,
             "objects":stats.counts[0]+stats.missing_counts[0],"resident_objects":stats.counts[0],"missing_objects":stats.missing_counts[0],"counts":counts,"types":types,
             "index_complete":self.cloud.replica.as_ref().is_none_or(|r|r.counts_complete),
-            "pending_objects":pending_objects,"pending_bytes":pending_objects*g.object_size,"pending_resident_objects":stats.counts[2],"pending_missing_objects":stats.missing_counts[2],
+            "pending_objects":pending_objects,"pending_bytes":pending_objects*g.object_size,"pending_resident_objects":pending_resident,"pending_missing_objects":pending_missing,
             "changed_pages":self.root.changed_pages,"current_job":current_job,
             "new_changes":{"changed_pages":new_dirty,"logical_changed_bytes":new_dirty*super::PAGE as u64},
             "normal_reclaimable_bytes":Value::Null,"deep_reclaimable_bytes":Value::Null}),
@@ -792,14 +1271,22 @@ impl<C: CatalogRead> DebugView<'_, C> {
         let persisted = *STATUS_NAMES
             .get(effective_state(object)?)
             .ok_or_else(|| integrity("object sync state"))?;
-        let state = self
+        let receipt_confirmed = self
             .cloud
-            .transfer
-            .get(&object.oid)
-            .filter(|s| matches!(s.as_str(), "uploading" | "failed"))
-            .map(String::as_str)
-            .unwrap_or(persisted)
-            .to_owned();
+            .job
+            .as_ref()
+            .is_some_and(|job| self.cloud.receipt_overlay.contains(job, object.oid));
+        let state = if receipt_confirmed {
+            "uploaded"
+        } else {
+            self.cloud
+                .transfer
+                .get(&object.oid)
+                .filter(|s| matches!(s.as_str(), "uploading" | "failed"))
+                .map(String::as_str)
+                .unwrap_or(persisted)
+        }
+        .to_owned();
         let upload_pinned = if let Some((counts, ready)) = self
             .cloud
             .job
@@ -819,7 +1306,7 @@ impl<C: CatalogRead> DebugView<'_, C> {
         Ok(
             json!({"index":object.extent,"block":object.extent,"object_id":object.id,"oid":object.oid,
             "kind":if object.kind==1 {"data"} else {"metadata"},"content_type":TYPE_NAMES[content_type(object)],
-            "sync_state":state,"uploaded":object.sync_state>=2,"sealed":object.sealed,
+            "sync_state":state,"uploaded":object.sync_state>=2||receipt_confirmed,"sealed":object.sealed,
             "used_pages":object.used,"used_bytes":object.used as u64*super::PAGE as u64,
             "local_reference_count":object.refs,"current_reference_count":object.current_refs,"cloud_reference_count":object.cloud_refs,
             "snapshot_pinned":if object.refs==0||!self.has_snapshots{Some(false)}else if object.current_refs==0&&self.cloud.job.is_none(){Some(true)}else{None},
@@ -970,6 +1457,20 @@ impl<C: CatalogRead> DebugView<'_, C> {
                 .iter()
                 .filter(|entry| {
                     effective_state(&entry.object).is_ok_and(|actual| actual == state)
+                        && entry.state != STATUS_NAMES[state]
+                        && kind_index.is_none_or(|kind| content_type(&entry.object) == kind)
+                })
+                .map(|entry| entry.object.extent)
+                .collect()
+        } else {
+            BTreeSet::new()
+        };
+        let added: BTreeSet<_> = if let Some(state) = state_index {
+            overlays
+                .iter()
+                .filter(|entry| {
+                    entry.state == STATUS_NAMES[state]
+                        && effective_state(&entry.object).is_ok_and(|actual| actual != state)
                         && kind_index.is_none_or(|kind| content_type(&entry.object) == kind)
                 })
                 .map(|entry| entry.object.extent)
@@ -979,6 +1480,7 @@ impl<C: CatalogRead> DebugView<'_, C> {
         };
         let count = stats.counts[category]
             .checked_sub(excluded.len() as u64)
+            .and_then(|n| n.checked_add(added.len() as u64))
             .ok_or_else(|| integrity("runtime filter cardinality"))?;
         let mut excluded_ranks = Vec::with_capacity(excluded.len());
         for extent in &excluded {
@@ -989,24 +1491,39 @@ impl<C: CatalogRead> DebugView<'_, C> {
             );
         }
         excluded_ranks.sort_unstable();
-        let mut raw_skip = start;
-        for rank in excluded_ranks {
-            if rank <= raw_skip {
-                raw_skip += 1;
+        // Locate the requested rank in the merged view without walking the
+        // persistent prefix. Only the bounded receipt/transfer overlay is read.
+        let mut added_before = 0;
+        for (index, extent) in added.iter().enumerate() {
+            let rank = tree::rank(self, &INDEX, stats.index, index_key(category, *extent))?
+                .checked_sub(stats.before(category))
+                .and_then(|rank| rank.checked_sub(excluded.range(..extent).count() as u64))
+                .ok_or_else(|| integrity("runtime added index rank"))?
+                + index as u64;
+            if rank < start {
+                added_before += 1;
             }
         }
-        let physical = self.category_page(
-            &stats,
-            category,
-            raw_skip,
-            limit.saturating_add(excluded.len()),
-        )?;
-        let mut items = Vec::new();
-        for extent in physical
+        let mut raw_skip = start.saturating_sub(added_before as u64);
+        for rank in excluded_ranks {
+            if rank <= raw_skip {
+                raw_skip = raw_skip.saturating_add(1);
+            }
+        }
+        let mut physical = self
+            .category_page(
+                &stats,
+                category,
+                raw_skip,
+                limit.saturating_add(excluded.len()),
+            )?
             .into_iter()
             .filter(|extent| !excluded.contains(extent))
-            .take(limit)
-        {
+            .collect::<Vec<_>>();
+        physical.extend(added.iter().skip(added_before).copied());
+        physical.sort_unstable();
+        let mut items = Vec::new();
+        for extent in physical.into_iter().take(limit) {
             let root = self.root.blocks;
             let block = tree::get(self, &BLOCKS, root, extent)?
                 .map(|v| u64::from_le_bytes(v.try_into().unwrap()));
@@ -1019,7 +1536,8 @@ impl<C: CatalogRead> DebugView<'_, C> {
 impl Store {
     pub fn debug_summary(&mut self) -> Result<Value> {
         let root = self.root.clone();
-        let cloud = self.cloud.clone();
+        let mut cloud = self.cloud.clone();
+        cloud.receipt_overlay = self.receipt_view();
         let has_snapshots = !self.snapshots.is_empty();
         DebugView {
             reader: self,
@@ -1031,7 +1549,8 @@ impl Store {
     }
     pub fn debug_query(&mut self, r: &Value) -> Result<Value> {
         let root = self.root.clone();
-        let cloud = self.cloud.clone();
+        let mut cloud = self.cloud.clone();
+        cloud.receipt_overlay = self.receipt_view();
         let has_snapshots = !self.snapshots.is_empty();
         DebugView {
             reader: self,

@@ -42,6 +42,8 @@ impl ReadCache {
 pub(super) struct Shared {
     pub store: Mutex<Store>,
     pub flush_lock: Mutex<()>,
+    pub flush_requests: AtomicU64,
+    pub preparation: Mutex<super::preparation::Runtime>,
     pub restore_source: Mutex<Option<Arc<Shared>>>,
     pub provider: super::lazy::ProviderRegistry,
     pub cache_runtime: Arc<super::cache::Runtime>,
@@ -108,7 +110,7 @@ impl Reader {
                     self.object_size(),
                 )));
             }
-            if object.kind != 1 || p.reference.slot >= object.used as u64 {
+            if object.kind != 1 || object.used as u64 > self.geometry().slots || p.reference.slot >= object.used as u64 {
                 return Err(Error::Integrity("read view slot outside object".into()));
             }
             self.cache_runtime
@@ -287,6 +289,8 @@ impl Volume {
             encrypted: store.config.encrypted,
             store: Mutex::new(store),
             flush_lock: Mutex::new(()),
+            flush_requests: AtomicU64::new(0),
+            preparation: Mutex::new(super::preparation::Runtime::default()),
             restore_source: Mutex::new(None),
             provider: super::lazy::ProviderRegistry::default(),
             cache_runtime,
@@ -335,6 +339,14 @@ impl Volume {
     }
     pub fn capacity(&self) -> u64 {
         self.shared.capacity
+    }
+    #[cfg(test)]
+    pub(super) fn stop_background_commit_for_test(&self) {
+        self.shared.stop.store(true, Ordering::Release);
+        self.shared.wake.notify_all();
+        if let Some(worker) = self.worker.lock().unwrap().take() {
+            worker.join().unwrap();
+        }
     }
     fn bounds(&self, offset: u64, length: usize) -> Result<()> {
         if !offset.is_multiple_of(512)
@@ -387,7 +399,7 @@ impl Volume {
                             self.object_size(),
                         )));
                     }
-                    if object.kind != 1 || reference.reference.slot >= object.used as u64 {
+                    if object.kind != 1 || object.used as u64 > self.geometry().slots || reference.reference.slot >= object.used as u64 {
                         return Err(Error::Integrity("read slot outside object".into()));
                     }
                     let physical = object.extent * self.object_size()
@@ -753,6 +765,12 @@ impl Shared {
         Ok((lease, changes))
     }
     fn flush(&self) -> Result<()> {
+        struct Request<'a>(&'a AtomicU64);
+        impl Drop for Request<'_> {
+            fn drop(&mut self) { self.0.fetch_sub(1, Ordering::Relaxed); }
+        }
+        self.flush_requests.fetch_add(1, Ordering::Relaxed);
+        let _request = Request(&self.flush_requests);
         let _commit = self.flush_lock.lock().map_err(|_| Error::Poisoned)?;
         let frozen = {
             let mut views = self.views.lock().map_err(|_| Error::Poisoned)?;

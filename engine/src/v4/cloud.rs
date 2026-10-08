@@ -46,6 +46,8 @@ pub(super) struct Job {
     pub add: MetaRef,
     pub remove: MetaRef,
     pub receipts: MetaRef,
+    #[serde(default)]
+    pub receipt_epoch: u64,
     pub meta_tail: u64,
     pub root_oid: u64,
     pub root_sha256: String,
@@ -78,6 +80,8 @@ pub(super) struct Cloud {
     pub cache: super::cache::Policy,
     #[serde(skip)]
     pub transfer: HashMap<u64, String>,
+    #[serde(skip)]
+    pub receipt_overlay: Arc<super::receipts::View>,
 }
 #[derive(Clone, Serialize, Deserialize)]
 pub(super) struct Need {
@@ -136,7 +140,7 @@ fn prepare_stage(j: &Job) -> &'static str {
 fn job_public(s: &mut Store, j: &Job) -> Result<Value> {
     let g = s.geometry();
     let total = tree::len(s, &SET, j.add)?;
-    let uploaded = tree::len(s, &SET, j.receipts)?;
+    let uploaded = tree::len(s, &SET, j.receipts)? + s.receipt_view().count(j);
     let root = if j.root_oid == 0 {
         None
     } else {
@@ -160,9 +164,12 @@ fn reconcile_delta(
 ) -> Result<()> {
     let mut add = Vec::new();
     let mut remove = Vec::new();
-    for oid in keys {
-        let old = tree::get(tx, &COUNTS, baseline, oid)?.is_some();
-        let new = tree::get(tx, &COUNTS, j.counts, oid)?.is_some();
+    let keys = keys.into_iter().collect::<BTreeSet<_>>().into_iter().collect::<Vec<_>>();
+    let previous = tree::get_many(tx, &COUNTS, baseline, &keys)?;
+    let current = tree::get_many(tx, &COUNTS, j.counts, &keys)?;
+    for ((oid, old), new) in keys.into_iter().zip(previous).zip(current) {
+        let old = old.is_some();
+        let new = new.is_some();
         if new && !old {
             let mut o = tx.object(oid)?;
             o.sync_state = 1;
@@ -219,14 +226,7 @@ impl Volume {
             self.flush()?;
         }
         if cmd == "cloud.prepare" {
-            self.materialize_replica_counts()?;
-            let begin = {
-                let s = self.shared.store.lock().map_err(|_| Error::Poisoned)?;
-                s.cloud.job.is_none()
-            };
-            if begin {
-                self.flush()?;
-            }
+            return self.prepare_control(r);
         }
         if cmd.starts_with("snapshot.restore") || cmd.starts_with("restore.") {
             return self.restore_control(r);
@@ -271,16 +271,19 @@ impl Volume {
                     s.transaction(|tx| tx.save_cloud(&c))?;
                     s.cloud = c;
                 }
+                if s.cloud.paused {
+                    s.end_prepare_cache();
+                    self.shared.preparation.lock().map_err(|_| Error::Poisoned)?.release_cache();
+                }
                 Ok(json!({"paused":s.cloud.paused}))
             }
-            "cloud.prepare" => cloud_prepare(&mut s, r),
             "cloud.list" | "cloud.delta" | "cloud.published_objects" => cloud_list(&mut s, r, &cmd),
             "cloud.receipt" => cloud_receipt(&mut s, r),
             "cloud.transfer" => {
                 let j = s
                     .cloud
                     .job
-                    .as_ref()
+                    .clone()
                     .ok_or_else(|| Error::Invalid("no active cloud job".into()))?;
                 if j.id != string(r, "job_id")? {
                     return Err(Error::Invalid("cloud job mismatch".into()));
@@ -290,14 +293,16 @@ impl Volume {
                 if !["pending", "uploading", "failed"].contains(&state.as_str()) {
                     return Err(Error::Invalid("invalid transfer state".into()));
                 }
-                if state == "pending" {
+                let confirmed = s.receipt_view().contains(&j, o.oid)
+                    || tree::get(&mut *s, &SET, j.receipts, o.oid)?.is_some();
+                if state == "pending" || confirmed {
                     s.cloud.transfer.remove(&o.oid);
                 } else {
                     s.cloud.transfer.insert(o.oid, state.clone());
                 }
                 let mut registry = s.readers.lock().map_err(|_| Error::Poisoned)?;
                 let transfers = Arc::make_mut(&mut registry.transfer);
-                if state == "pending" {
+                if state == "pending" || confirmed {
                     transfers.remove(&o.oid);
                 } else {
                     transfers.insert(o.oid, state);
@@ -387,7 +392,7 @@ impl Volume {
                 Ok(s.debug_changes(number(r, "since_revision", 0)))
             }
             "sync.diagnostics" => Ok(
-                json!({"format_version":4,"data_generation":s.root.data_generation,"metadata_generation":s.root.seq,"changed_pages":s.root.changed_pages,"counters":s.diagnostics,"incremental":true,"sealed_bytes_are_remote_bytes":true}),
+                json!({"format_version":4,"data_generation":s.root.data_generation,"metadata_generation":s.root.seq,"changed_pages":s.root.changed_pages,"counters":s.diagnostics,"incremental":true,"canonical_object_bytes_are_remote_bytes":true,"logical_zero_tails":true}),
             ),
             _ => Err(Error::Invalid(format!("unsupported control command {cmd}"))),
         };
@@ -399,6 +404,77 @@ impl Volume {
             }
         }
         Ok(result)
+    }
+    fn prepare_control(&self, request: &Value) -> Result<Value> {
+        let cache_mib = match request.get("prepare_cache_mib") {
+            None => 64,
+            Some(value) => value.as_u64().filter(|n| (16..=1024).contains(n))
+                .ok_or_else(|| Error::Invalid("preparation cache must be 16–1024 whole MiB".into()))?,
+        };
+        // Validate identity before flushing or changing the runtime cache.
+        let initial_job = {
+            let store = self.shared.store.lock().map_err(|_| Error::Poisoned)?;
+            store.check()?;
+            if store.root.restore_required { return Err(Error::Invalid("restore is incomplete".into())); }
+            if let Some(value) = request.get("job_id") {
+                let expected = value.as_str().ok_or_else(|| Error::Invalid("cloud job mismatch".into()))?;
+                if store.cloud.job.as_ref().is_none_or(|j| j.id != expected) {
+                    return Err(Error::Invalid("cloud job mismatch".into()));
+                }
+            }
+            store.cloud.job.clone()
+        };
+        let phase = initial_job.as_ref().map(prepare_stage).unwrap_or("freeze");
+        if let Some(job) = initial_job.as_ref().filter(|j| j.phase == "preparing") {
+            self.shared.preparation.lock().map_err(|_| Error::Poisoned)?.begin(&job.id, phase);
+        }
+        let io = self.shared.device.io_scope();
+        let started = std::time::Instant::now();
+        let prerequisites = (|| {
+            if initial_job.is_none() { self.flush()?; }
+            // A freshly imported original may have its first changes only in the
+            // frontend cache. Flush makes them visible to baseline setup.
+            self.materialize_replica_counts()
+        })();
+        if let Err(error) = prerequisites {
+            if let Ok(mut store) = self.shared.store.lock() { store.end_prepare_cache(); }
+            if let Ok(mut runtime) = self.shared.preparation.lock() { runtime.release_cache(); }
+            return Err(error);
+        }
+        let foreground = self.has_local_dirty() || self.shared.flush_requests.load(Ordering::Relaxed) != 0;
+        let mut store = self.shared.store.lock().map_err(|_| Error::Poisoned)?;
+        store.check()?;
+        if store.cloud.job.is_none() && store.root.changed_pages == 0 && store.cloud.published_root != 0
+            && store.root.data_generation == store.cloud.published_generation {
+            return Ok(json!({"job":null,"up_to_date":true}));
+        }
+        store.configure_prepare_cache(cache_mib)?;
+        let cache_before = store.prepare_cache_metrics();
+        let mut bounded = request.clone();
+        let maximum = number(request, "max_leaf_groups", 512).clamp(1, 512) as usize;
+        bounded["max_leaf_groups"] = json!(self.shared.preparation.lock().map_err(|_| Error::Poisoned)?.budget(maximum, foreground));
+        bounded["max_pages"] = json!(number(request, "max_pages", 16384).clamp(1, 16384));
+        let mut result = cloud_prepare(&mut store, &bounded);
+        let cache_after = store.prepare_cache_metrics();
+        if let Some(job) = store.cloud.job.as_ref() {
+            let mut runtime = self.shared.preparation.lock().map_err(|_| Error::Poisoned)?;
+            if phase != "ready" {
+                runtime.begin(&job.id, phase);
+                runtime.record(phase, io.snapshot(), started.elapsed(), &cache_before, cache_after, foreground);
+            }
+        }
+        if result.is_err() || store.cloud.job.as_ref().is_none_or(|j| j.phase != "preparing") {
+            store.end_prepare_cache();
+            self.shared.preparation.lock().map_err(|_| Error::Poisoned)?.release_cache();
+        }
+        if let Ok(value) = &mut result {
+            if value["job"].is_object() {
+                let id = value["job"]["id"].as_str().unwrap_or("");
+                let diagnostics = self.preparation_diagnostics(Some(id));
+                value["job"]["preparation_diagnostics"] = diagnostics;
+            }
+        }
+        result
     }
     pub fn read_export(&self, job: &str, object: &str, offset: u64, out: &mut [u8]) -> Result<()> {
         self.with_hydration(|| self.read_export_inner(job, object, offset, out))
@@ -441,14 +517,17 @@ impl Volume {
                 self.object_size(),
             )));
         }
-        // Expected SHA comes from authenticated object directory. The prepared upload factory
-        // checks this raw buffer and computes provider MD5 in the same single pass.
-        reader.device.read(o.extent * g.object_size + offset, out)?;
+        // The unused local suffix is not stored content. Authenticate its boundary
+        // and synthesize canonical zeros; the upload factory verifies the expected
+        // full-object SHA and computes provider MD5 over these same bytes.
+        let (_, zero_bytes) = super::object_bytes::read_range(
+            &reader.device, &reader.crypto, &o, offset, out)?;
         if let Ok(mut registry) = self.shared.readers.lock() {
             *registry
                 .metrics
                 .entry("upload_read_bytes".into())
                 .or_default() += out.len() as u64;
+            *registry.metrics.entry("upload_zero_fill_bytes".into()).or_default() += zero_bytes;
         }
         Ok(())
     }
@@ -589,6 +668,7 @@ fn cloud_prepare(s: &mut Store, r: &Value) -> Result<Value> {
             add: MetaRef::default(),
             remove: MetaRef::default(),
             receipts: MetaRef::default(),
+            receipt_epoch: 0,
             meta_tail: 0,
             root_oid: 0,
             root_sha256: String::new(),
@@ -670,25 +750,9 @@ fn cloud_prepare(s: &mut Store, r: &Value) -> Result<Value> {
         s.cloud = c;
         return Ok(json!({"job":job_public(s,&j)?}));
     }
-    let limit = number(r, "max_pages", 256).clamp(1, 4096) as usize;
-    let mut rows = tree::scan_after(s, &DIRTY, j.pending, j.cursor, limit)?;
-    // A larger sequential checkpoint must not turn a sparse workload into an
-    // unbounded lock hold. At most 128 different leaf groups enter this batch.
-    let mut groups = 0;
-    let mut last = None;
-    let mut keep = 0;
-    for (key, _) in &rows {
-        let leaf = *key >> PAGES.leaf_bits;
-        if last != Some(leaf) {
-            if groups == 128 {
-                break;
-            }
-            groups += 1;
-            last = Some(leaf);
-        }
-        keep += 1;
-    }
-    rows.truncate(keep);
+    let limit = number(r, "max_pages", 16384).clamp(1, 16384) as usize;
+    let groups = number(r, "max_leaf_groups", 128).clamp(1, 512) as usize;
+    let rows = tree::scan_after_leaves(s, &DIRTY, j.pending, j.cursor, limit, groups)?;
     if !rows.is_empty() {
         let keys = rows.iter().map(|(key, _)| *key).collect::<Vec<_>>();
         let values = tree::get_many(s, &PAGES, j.snapshot, &keys)?;
@@ -759,7 +823,7 @@ fn cloud_list(s: &mut Store, r: &Value, cmd: &str) -> Result<Value> {
             s.object(oid)?.desc(s.object_size())
         };
         if let Some(j) = &job {
-            value["uploaded"] = json!(tree::get(s, &SET, j.receipts, oid)?.is_some());
+            value["uploaded"] = json!(s.receipt_view().contains(j, oid) || tree::get(s, &SET, j.receipts, oid)?.is_some());
             value["is_root"] = json!(oid == j.root_oid);
         }
         items.push(value);
@@ -772,8 +836,7 @@ fn cloud_list(s: &mut Store, r: &Value, cmd: &str) -> Result<Value> {
 fn cloud_receipt(s: &mut Store, r: &Value) -> Result<Value> {
     let g = s.geometry();
     let id = string(r, "job_id")?;
-    let mut c = s.cloud.clone();
-    let mut j = c
+    let j = s.cloud
         .job
         .clone()
         .filter(|j| j.id == id)
@@ -804,31 +867,19 @@ fn cloud_receipt(s: &mut Store, r: &Value) -> Result<Value> {
         }
         objects.insert(o.oid, o);
     }
-    s.transaction(|tx| {
-        let rows = objects
-            .keys()
-            .map(|id| (*id, Some(vec![1])))
-            .collect::<Vec<_>>();
-        j.receipts = tx.set(&SET, j.receipts, &rows)?;
-        for o in objects.values() {
-            let mut o = o.clone();
-            o.sync_state = 2;
-            tx.objects.insert(o.oid, o);
-        }
-        c.job = Some(j.clone());
-        tx.save_cloud(&c)
-    })?;
-    for oid in objects.keys() {
-        c.transfer.remove(oid);
+    let ids = objects.keys().copied().collect::<Vec<_>>();
+    s.append_receipts(objects)?;
+    for oid in &ids {
+        s.cloud.transfer.remove(oid);
     }
     if let Ok(mut registry) = s.readers.lock() {
         let transfer = Arc::make_mut(&mut registry.transfer);
-        for oid in objects.keys() {
+        for oid in &ids {
             transfer.remove(oid);
         }
         registry.volatile_revision += 1;
     }
-    s.cloud = c;
+    let j = s.cloud.job.clone().unwrap();
     Ok(json!({"job":job_public(s,&j)?}))
 }
 fn cloud_commit(s: &mut Store, r: &Value) -> Result<Value> {
@@ -852,21 +903,23 @@ fn cloud_commit(s: &mut Store, r: &Value) -> Result<Value> {
     {
         return Err(Error::Invalid("commit root mismatch".into()));
     }
-    if tree::len(s, &SET, j.add)? != tree::len(s, &SET, j.receipts)? {
+    if tree::len(s, &SET, j.add)? != tree::len(s, &SET, j.receipts)? + s.receipt_view().count(&j) {
         return Err(Error::Invalid(
             "all prepared objects including root require durable receipts".into(),
         ));
     }
     // Delta is retained after publication for a crashed external cache to recover its deletion plan.
-    s.transaction(|tx|{tx.replace(&COUNTS,c.published_counts,MetaRef::default());tx.replace(&COUNTS,c.base_counts,MetaRef::default());c.base_counts=MetaRef::default();c.base_index=MetaRef::default();c.base_root=0;if let Some(old)=&c.last_job{for r in [old.add,old.receipts]{tx.replace(&SET,r,MetaRef::default());}tx.replace(&DELTA,old.remove,MetaRef::default());}
+    s.transaction(|tx|{tx.replace(&SET,j.receipts,j.add);j.receipts=j.add;tx.replace(&COUNTS,c.published_counts,MetaRef::default());tx.replace(&COUNTS,c.base_counts,MetaRef::default());c.base_counts=MetaRef::default();c.base_index=MetaRef::default();c.base_root=0;if let Some(old)=&c.last_job{for r in [old.add,old.receipts]{tx.replace(&SET,r,MetaRef::default());}tx.replace(&DELTA,old.remove,MetaRef::default());}
  tx.replace(&PAGES,j.snapshot,MetaRef::default());tx.replace(&DIRTY,j.pending,MetaRef::default());j.snapshot=MetaRef::default();j.pending=MetaRef::default();let mut cursor=0;loop{let rows=tree::scan_after(tx,&SET,j.add,cursor,128)?;if rows.is_empty(){break}cursor=rows.last().unwrap().0+1;for(oid,_)in rows{let mut o=tx.object(oid)?;o.sync_state=3;if o.kind==1 {o.remote=true;o.remote_source=2;if c.cache.backing.is_some(){o.cache_backed=true;}}tx.objects.insert(oid,o);}}
  cursor=0;loop{let rows=tree::scan_after(tx,&DELTA,j.remove,cursor,128)?;if rows.is_empty(){break}cursor=rows.last().unwrap().0+1;for(oid,_)in rows{let mut o=tx.object(oid)?;o.sync_state=0;if o.kind==1&&c.cache.backing.is_some(){o.remote=true;o.remote_source=2;o.cache_backed=true;}tx.objects.insert(oid,o);}}
  c.published_generation=j.generation;c.published_counts=j.counts;c.published_index=j.index;c.published_root=j.root_oid;c.published_commit=Some(json!({"id":j.id,"delta_id":j.id,"root_object_id":root.id,"root_sha256":j.root_sha256,"root_slot":0,"generation":j.generation,"receipt":r["receipt"]}));j.phase="committed".into();c.last_job=Some(j.clone());c.job=None;c.transfer.clear();tx.save_cloud(&c)})?;
     if let Ok(mut registry) = s.readers.lock() {
         registry.transfer = Arc::new(BTreeMap::new());
+        registry.receipts = Arc::default();
         registry.volatile_revision += 1;
     }
     s.cloud = c;
+    s.receipts = Default::default();
     Ok(json!({"status":status(s)?}))
 }
 impl Volume {
@@ -885,7 +938,25 @@ impl Volume {
         ) {
             return Ok(None);
         }
-        let (_lease, mut reader) = self.read_context()?;
+        let (lease, mut reader) = self.read_context()?;
+        if cmd == "sync.diagnostics" {
+            let mut fields = reader.device.diagnostics();
+            fields.extend(self.frontend_diagnostics());
+            if let Ok(registry) = self.shared.readers.lock() {
+                fields.extend(registry.metrics.clone());
+            }
+            fields.insert("data_generation".into(), reader.root.data_generation);
+            fields.insert("metadata_generation".into(), reader.root.seq);
+            fields.insert("pending_changed_pages".into(), reader.root.changed_pages);
+            fields.insert("buffered_changed_pages".into(), self.local_dirty_pages());
+            let mut result = serde_json::to_value(fields)?;
+            result["format_version"] = json!(4);
+            result["incremental"] = json!(true);
+            result["canonical_object_bytes_are_remote_bytes"] = json!(true);
+            result["logical_zero_tails"] = json!(true);
+            result["preparation_diagnostics"] = self.preparation_diagnostics(None);
+            return Ok(Some(result));
+        }
         if cmd == "debug.pages" {
             // The immutable lease exposes only persisted references. No cache flush,
             // data-page read, key material or store mutation is performed by this query.
@@ -931,15 +1002,15 @@ impl Volume {
         };
         let public_job = |reader: &mut volume::Reader, j: &Job| -> Result<Value> {
             let total = tree::len(reader, &SET, j.add)?;
-            let uploaded = tree::len(reader, &SET, j.receipts)?;
+            let uploaded = tree::len(reader, &SET, j.receipts)? + lease.receipts.count(j);
             let root = if j.root_oid == 0 {
                 None
             } else {
                 Some(reader.object(j.root_oid)?.id.to_string())
             };
-            Ok(
-                json!({"object_size":g.object_size,"id":j.id,"phase":j.phase,"generation":j.generation,"root_object_id":root,"root_sha256":j.root_sha256,"root_slot":0,"total_objects":total,"uploaded_objects":uploaded,"estimated_bytes":total*g.object_size,"processed_pages":j.processed_pages,"changed_pages":j.changed_pages,"prepare_stage":prepare_stage(j),"sealed_objects":j.seal_cursor,"total_tail_objects":j.seal_tails.len()}),
-            )
+            let mut value = json!({"object_size":g.object_size,"id":j.id,"phase":j.phase,"generation":j.generation,"root_object_id":root,"root_sha256":j.root_sha256,"root_slot":0,"total_objects":total,"uploaded_objects":uploaded,"estimated_bytes":total*g.object_size,"processed_pages":j.processed_pages,"changed_pages":j.changed_pages,"prepare_stage":prepare_stage(j),"sealed_objects":j.seal_cursor,"total_tail_objects":j.seal_tails.len()});
+            value["preparation_diagnostics"] = self.preparation_diagnostics(Some(&j.id));
+            Ok(value)
         };
         Ok(Some(match cmd {
             "cloud.status" => {
@@ -971,22 +1042,6 @@ impl Volume {
                 None => json!({"state":"idle","phase":"idle"}),
                 Some(c) => c.public(),
             },
-            "sync.diagnostics" => {
-                let mut fields = reader.device.diagnostics();
-                fields.extend(self.frontend_diagnostics());
-                if let Ok(registry) = self.shared.readers.lock() {
-                    fields.extend(registry.metrics.clone());
-                }
-                fields.insert("data_generation".into(), reader.root.data_generation);
-                fields.insert("metadata_generation".into(), reader.root.seq);
-                fields.insert("pending_changed_pages".into(), reader.root.changed_pages);
-                fields.insert("buffered_changed_pages".into(), self.local_dirty_pages());
-                let mut result = serde_json::to_value(fields)?;
-                result["format_version"] = json!(4);
-                result["incremental"] = json!(true);
-                result["sealed_bytes_are_remote_bytes"] = json!(true);
-                result
-            }
             _ => {
                 let j = if cmd == "cloud.published_objects" {
                     None
@@ -1024,7 +1079,7 @@ impl Volume {
                     };
                     if let Some(j) = j {
                         v["uploaded"] =
-                            json!(tree::get(&mut reader, &SET, j.receipts, oid)?.is_some());
+                            json!(lease.receipts.contains(j, oid) || tree::get(&mut reader, &SET, j.receipts, oid)?.is_some());
                         v["is_root"] = json!(oid == j.root_oid);
                     }
                     items.push(v);

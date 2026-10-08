@@ -234,7 +234,7 @@ public sealed partial class ApplicationService : IApplicationService
         var snapshot = CachedWorkerState();
         if (snapshot.ValueKind == JsonValueKind.Object && snapshot.TryGetProperty("tasks", out var nativeTasks)) tasks.AddRange(nativeTasks.EnumerateArray().Select(t => (object)t.Clone()));
         object preferences;
-        lock (gate) preferences = new { settings.SyncIntervalSeconds, settings.MaxParallelTransfers, settings.SyncOnExit, settings.BaiduRequestsPerSecond, settings.BaiduMaximumConcurrentRequests, settings.DefaultCapacityGiB, settings.DefaultDirectory, settings.DefaultObjectSizeBytes, settings.Prefetch };
+        lock (gate) preferences = new { settings.SyncIntervalSeconds, settings.MaxParallelTransfers, settings.SyncPreparationCacheMiB, settings.SyncOnExit, settings.BaiduRequestsPerSecond, settings.BaiduMaximumConcurrentRequests, settings.DefaultCapacityGiB, settings.DefaultDirectory, settings.DefaultObjectSizeBytes, settings.Prefetch };
         bool? driver = snapshot.ValueKind == JsonValueKind.Object && snapshot.TryGetProperty("driverAvailable", out var hasDriver) ? hasDriver.GetBoolean() : null;
         return new { connected = worker.IsConnected, driverAvailable = driver, disks = views, tasks, settings = preferences, network = BaiduRequestScheduler.Shared.Snapshot(), account, authChecking = !initialization.IsCompleted, error = notice, logWarning = journalWarning };
     }
@@ -287,6 +287,7 @@ public sealed partial class ApplicationService : IApplicationService
                 RequireRunning();
                 int interval = args.GetProperty("syncIntervalSeconds").GetInt32(), parallel = args.GetProperty("maxParallelTransfers").GetInt32();
                 if (interval is < 15 or > 3600 || parallel is < 1 or > 4) throw new IOException("同步间隔应为 15–3600 秒，并发数为 1–4。");
+                int prepareCacheMiB = SettingsStorage.PreparationCacheMiB(args, settings.SyncPreparationCacheMiB);
                 double rate = args.TryGetProperty("baiduRequestsPerSecond", out var rateValue) ? rateValue.GetDouble() : settings.BaiduRequestsPerSecond;
                 int networkParallel = args.TryGetProperty("baiduMaximumConcurrentRequests", out var networkValue) ? networkValue.GetInt32() : settings.BaiduMaximumConcurrentRequests;
                 if (!double.IsFinite(rate) || rate is < 0.1 or > 20 || networkParallel is < 1 or > 8)
@@ -297,13 +298,14 @@ public sealed partial class ApplicationService : IApplicationService
                 lock (gate)
                 {
                     settings.SyncIntervalSeconds = interval; settings.MaxParallelTransfers = parallel;
+                    settings.SyncPreparationCacheMiB = prepareCacheMiB;
                     if (syncOnExit.HasValue) settings.SyncOnExit = syncOnExit.Value;
                     if (prefetch is not null) settings.Prefetch = prefetch;
                     settings.BaiduRequestsPerSecond = rate; settings.BaiduMaximumConcurrentRequests = networkParallel;
                 }
                 Save(); BaiduRequestScheduler.Shared.Configure(new BaiduRequestLimits(rate, networkParallel));
                 if (prefetch is not null) await worker.ConfigurePrefetchAsync(prefetch, ct);
-                Changed(); return new { ok = true };
+                Changed(); return new { ok = true, syncPreparationCacheMiB = prepareCacheMiB };
                 }
                 finally { settingsGate.Release(); }
             }
@@ -680,12 +682,13 @@ public sealed partial class ApplicationService : IApplicationService
         if (replicaRuns.TryGetValue(id, out var pulling) && pulling.Active) throw new IOException("正在加载云端快照，请先完成或取消加载。");
         lock (gate) if (settings.PausedDisks.Contains(id) && !allowDuringExit) throw new IOException("同步已暂停，请点击继续。");
 
-        var repository = Repository(); CloudBinding binding; int concurrency;
+        var repository = Repository(); CloudBinding binding; int concurrency, prepareCacheMiB;
         lock (gate)
         {
             if (!settings.Bindings.TryGetValue(id, out binding!)) throw new IOException("请先启用此磁盘的云同步。");
             if (binding.AccountId != account!.AccountId) throw new IOException("这块磁盘绑定了另一个网盘账户。");
             concurrency = settings.MaxParallelTransfers;
+            prepareCacheMiB = SyncPreparationLimits.ValidateCacheMiB(settings.SyncPreparationCacheMiB);
         }
         if (runs.TryGetValue(id, out var existing) && existing.Task is { IsCompleted: false }) return;
         var disk = Disk(id); if (!Flag(disk, "unlocked")) throw new IOException("请先解锁磁盘以继续同步。");
@@ -715,7 +718,7 @@ public sealed partial class ApplicationService : IApplicationService
                     run.Progress = p; Changed();
                 });
                 var events = new InlineProgress<SyncLogEntry>(e => Log(id, run.Id, "sync", e.Action, e.Message, e.Level, e.ObjectId, e.ObjectKind, e.Bytes, e.Generation, e.TimestampUtc, e.WireBytes));
-                var result = await new SyncCoordinator(repository).RunAsync(new WorkerVolume(worker, id, DiskObjectSize(Disk(id))), binding, Text(disk, "name"), UInt(disk, "capacityBytes"), Flag(disk, "encrypted"), concurrency, observer, run.Cancellation.Token, events);
+                var result = await new SyncCoordinator(repository).RunAsync(new WorkerVolume(worker, id, DiskObjectSize(Disk(id))), binding, Text(disk, "name"), UInt(disk, "capacityBytes"), Flag(disk, "encrypted"), concurrency, observer, run.Cancellation.Token, events, prepareCacheMiB);
                 lock (gate)
                 {
                     settings.LastSuccess[id] = result.Commit.UpdatedUtc;

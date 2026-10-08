@@ -36,11 +36,32 @@ const out=path.resolve(process.argv[2]),web=path.resolve(__dirname,'..');fs.mkdi
   await page.goto(origin+'/index.html');await visit('settings');
   assert.equal(await page.locator('#syncInterval').inputValue(),'3600');assert.equal(await page.locator('#concurrency').inputValue(),'4');
   assert.equal(await page.locator('#baiduRequestRate').inputValue(),'3');assert.equal(await page.locator('#baiduConcurrency').inputValue(),'4');
+  assert.equal(await page.locator('#syncPreparationCacheMiB').inputValue(),'64');
   assert.equal(await page.locator('#syncOnExit').isChecked(),false);assert.doesNotMatch(await page.locator('#content').innerText(),/请求进行中|个排队/);
-  await page.evaluate(async()=>{Object.assign(window.__state.settings,{syncIntervalSeconds:75,maxParallelTransfers:2,baiduRequestsPerSecond:2,baiduMaximumConcurrentRequests:2,syncOnExit:true});await refresh();});
+  await page.evaluate(async()=>{Object.assign(window.__state.settings,{syncIntervalSeconds:75,syncPreparationCacheMiB:128,maxParallelTransfers:2,baiduRequestsPerSecond:2,baiduMaximumConcurrentRequests:2,syncOnExit:true});await refresh();});
   assert.equal(await page.locator('#syncInterval').inputValue(),'75');assert.equal(await page.locator('#concurrency').inputValue(),'2');
   assert.equal(await page.locator('#baiduRequestRate').inputValue(),'2');assert.equal(await page.locator('#baiduConcurrency').inputValue(),'2');assert.equal(await page.locator('#syncOnExit').isChecked(),true);
+  assert.equal(await page.locator('#syncPreparationCacheMiB').inputValue(),'128');
   checks.push('Missing preferences use 3600-second/4-object/3-rps/4-request/exit-sync-off defaults; saved custom choices remain visible and settings contain no live request monitor.');
+  assert.match(await page.locator('#syncPreparationCacheMiB').locator('..').innerText(),/每个正在整理的磁盘分别占用/);
+  assert.match(await page.locator('#syncPreparationCacheMiB').locator('..').innerText(),/与本地磁盘容量上限无关/);
+  for(const value of [16,1024]){
+   await page.locator('#syncPreparationCacheMiB').fill(String(value));await page.locator('[data-action="saveSettings"]').click();
+   await page.waitForFunction(value=>window.__state.settings.syncPreparationCacheMiB===value,value);
+   const saved=await page.evaluate(()=>window.__calls.filter(c=>c.method==='settings.save').at(-1).args);
+   assert.equal(saved.syncPreparationCacheMiB,value);assert.equal(saved.maxParallelTransfers,2);assert.equal(saved.baiduMaximumConcurrentRequests,2);
+   await visit('cloud');await visit('settings');assert.equal(await page.locator('#syncPreparationCacheMiB').inputValue(),String(value));
+  }
+  checks.push('Preparation cache defaults to 64 MiB per disk, honors a stored custom value, and persists the valid 16/1024 MiB boundaries without changing transfer concurrency.');
+  const cacheSaves=await page.evaluate(()=>window.__calls.filter(c=>c.method==='settings.save').length);
+  for(const value of ['', '15','1025','64.5']){
+   await page.locator('#syncPreparationCacheMiB').fill(value);await page.locator('[data-action="saveSettings"]').click();
+   assert.equal(await page.locator('#syncPreparationCacheMiB').evaluate(node=>node.validity.valid),false);
+   assert.equal(await page.evaluate(()=>window.__calls.filter(c=>c.method==='settings.save').length),cacheSaves);
+   assert.equal(await page.evaluate(()=>window.__state.settings.syncPreparationCacheMiB),1024);
+  }
+  await page.locator('#syncPreparationCacheMiB').fill('64');
+  checks.push('Empty, below-range, above-range and fractional preparation cache values are rejected before settings.save; the saved limit remains unchanged.');
   await page.locator('#baiduRequestRate').fill('0.5');await page.locator('#baiduConcurrency').selectOption('1');
   await page.locator('[data-action="saveSettings"]').click();await page.waitForFunction(()=>window.__state.settings.baiduRequestsPerSecond===0.5);
   await visit('cloud');await visit('settings');

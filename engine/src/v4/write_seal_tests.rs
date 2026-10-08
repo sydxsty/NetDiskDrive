@@ -216,18 +216,26 @@ fn restarted_partial_tail_is_authenticated_before_sealing_and_corruption_fails()
 }
 
 #[test]
-fn tiny_sealed_objects_use_proven_zero_tail_without_full_padding_writes() {
+fn tiny_sealed_objects_use_logical_zero_tail_without_padding_writes() {
     let (_dir, disk) = create();
     let expected = bytes(1, 61);
     disk.write(BASE, &expected).unwrap();
     disk.flush().unwrap();
-    let before = counter(&disk, "seal_padding_write_bytes");
+    let object = page_object(&disk, BASE / PAGE as u64);
+    let first = object.extent * OBJECT + 18 * PAGE as u64;
+    let last = (object.extent + 1) * OBJECT;
+    disk.shared.device.events.lock().unwrap().clear();
+    let before = counter(&disk, "seal_logical_zero_bytes");
     let job = prepare(&disk);
+    let padding_writes: u64 = disk.shared.device.events.lock().unwrap().iter()
+        .filter(|(write, _, _)| *write)
+        .map(|(_, at, length)| (at + *length as u64).min(last).saturating_sub((*at).max(first)))
+        .sum();
     assert_eq!(
-        counter(&disk, "seal_padding_write_bytes"),
-        before,
+        padding_writes, 0,
         "fresh sparse extent was filled with almost 4 MiB of avoidable zero writes"
     );
+    assert!(counter(&disk, "seal_logical_zero_bytes") - before >= OBJECT - 18 * PAGE as u64);
     let objects = export_and_check(&disk, &job);
     let data = objects.iter().find(|o| o["kind"] == "data").unwrap();
     let mut raw = vec![0; OBJECT as usize];

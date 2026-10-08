@@ -1,7 +1,8 @@
 use super::codec::{hash, hex, PageRef};
+use super::prepare_cache::{Cache as PrepareCache, Dependencies};
 use super::tree::{Node, Spec, Storage};
 use super::*;
-use std::collections::{BTreeSet, HashMap};
+use std::collections::BTreeSet;
 pub(super) const PORTABLE: u64 = 1 << 63;
 /// Source writers use 0*, their copies 10*, copies of copies 110*, etc.
 /// Siblings never share an import source identity. Reserving the suffix for
@@ -312,12 +313,14 @@ pub(super) struct ReadRegistry {
     pub active: BTreeMap<u64, usize>,
     pub failure: Option<String>,
     pub transfer: Arc<BTreeMap<u64, String>>,
+    pub receipts: Arc<super::receipts::View>,
     pub volatile_revision: u64,
     pub metrics: BTreeMap<String, u64>,
 }
 pub(super) struct ReadLease {
     pub root: Root,
     pub transfer: Arc<BTreeMap<u64, String>>,
+    pub receipts: Arc<super::receipts::View>,
     pub volatile_revision: u64,
     registry: Arc<Mutex<ReadRegistry>>,
 }
@@ -330,11 +333,13 @@ impl ReadLease {
         let root = r.root.clone();
         *r.active.entry(root.seq).or_default() += 1;
         let transfer = r.transfer.clone();
+        let receipts = r.receipts.clone();
         let volatile_revision = r.volatile_revision;
         drop(r);
         Ok(Self {
             root,
             transfer,
+            receipts,
             volatile_revision,
             registry,
         })
@@ -357,20 +362,29 @@ pub(super) struct Store {
     pub config: Config,
     pub crypto: Arc<Crypto>,
     pub readers: Arc<Mutex<ReadRegistry>>,
-    pub node_cache: HashMap<MetaRef, Vec<u8>>,
+    prepare_cache: PrepareCache,
     pub root: Root,
     free: Free,
     free_chain: Vec<MetaRef>,
     pub failure: Option<String>,
     pub classifier: ntfs::Classifier,
     pub cloud: cloud::Cloud,
+    pub receipts: super::receipts::Log,
     pub snapshots: Vec<cloud::Snapshot>,
     pub diagnostics: BTreeMap<String, u64>,
     pub restore_cache: std::collections::VecDeque<Arc<super::restore::CachedObject>>,
     pub cache_runtime: Option<Arc<super::cache::Runtime>>,
-    zero_tails: BTreeSet<u64>,
 }
 impl Store {
+    pub fn configure_prepare_cache(&mut self, mib: u64) -> Result<()> {
+        self.prepare_cache.configure(mib)
+    }
+    pub fn end_prepare_cache(&mut self) {
+        self.prepare_cache.end();
+    }
+    pub fn prepare_cache_metrics(&self) -> BTreeMap<String, u64> {
+        self.prepare_cache.metrics()
+    }
     pub fn geometry(&self) -> Geometry {
         self.crypto.geometry
     }
@@ -408,6 +422,9 @@ impl Store {
         });
         if let Err(e) = &result {
             {
+                // No cache entry produced by an unpublished transaction may be
+                // used after a failed data write, root write or flush.
+                tx.store.prepare_cache.invalidate();
                 tx.store.failure = Some(e.to_string());
                 if let Ok(mut r) = tx.store.readers.lock() {
                     r.failure = Some(e.to_string());
@@ -455,7 +472,7 @@ impl Store {
                     self.object_size(),
                 )));
             }
-            if o.kind != 1 || p.reference.slot >= o.used as u64 {
+            if o.kind != 1 || o.used as u64 > g.slots || p.reference.slot >= o.used as u64 {
                 return Err(Error::Integrity("page outside object".into()));
             }
             self.device.read(
@@ -517,6 +534,7 @@ impl Store {
             active: BTreeMap::new(),
             failure: None,
             transfer: Arc::new(BTreeMap::new()),
+            receipts: Arc::default(),
             volatile_revision: 0,
             metrics: BTreeMap::new(),
         }));
@@ -528,15 +546,15 @@ impl Store {
             free,
             free_chain,
             readers,
-            node_cache: HashMap::new(),
+            prepare_cache: PrepareCache::default(),
             failure: None,
             classifier,
             cloud,
+            receipts: Default::default(),
             snapshots,
             diagnostics: BTreeMap::new(),
             restore_cache: std::collections::VecDeque::new(),
             cache_runtime: None,
-            zero_tails: BTreeSet::new(),
         };
         if s.root.cache_capable && !s.config.cache_capable {
             return Err(Error::Integrity("cache capability header mismatch".into()));
@@ -545,6 +563,7 @@ impl Store {
         // freed by the newer selected root after an interrupted publication.
         s.mirror()?;
         super::maintenance::validate_statistics(&mut s)?;
+        s.recover_receipts()?;
         if s.config.cache_capable {
             s.promote_cache_capability()?;
         }
@@ -576,6 +595,7 @@ impl Store {
             active: BTreeMap::new(),
             failure: None,
             transfer: Arc::new(BTreeMap::new()),
+            receipts: Arc::default(),
             volatile_revision: 0,
             metrics: BTreeMap::new(),
         }));
@@ -585,17 +605,17 @@ impl Store {
             config,
             crypto: Arc::new(crypto),
             readers,
-            node_cache: HashMap::new(),
+            prepare_cache: PrepareCache::default(),
             free: Free::default(),
             free_chain: Vec::new(),
             failure: None,
             classifier: Default::default(),
             cloud: Default::default(),
+            receipts: Default::default(),
             snapshots: Vec::new(),
             diagnostics: BTreeMap::new(),
             restore_cache: std::collections::VecDeque::new(),
             cache_runtime: None,
-            zero_tails: BTreeSet::new(),
         };
         s.transaction(|_| Ok(()))?;
         Ok(s)
@@ -614,34 +634,17 @@ impl Store {
         Ok(())
     }
     pub fn verify_object(&mut self, o: &Object) -> Result<Vec<u8>> {
-        let g = self.geometry();
-        if o.missing {
-            return Err(Error::Missing(RemoteObject::from_object(
-                o,
-                self.object_size(),
-            )));
-        }
-        if !o.sealed {
-            return Err(Error::Invalid("object is not sealed".into()));
-        }
-        let mut raw = vec![0; g.object_size as usize];
-        self.device.read(o.extent * g.object_size, &mut raw)?;
-        if hash(&raw) != o.sha {
-            return Err(Error::Integrity(format!("sealed object {} checksum", o.id)));
-        }
-        decode_header(&self.crypto, o.oid, &raw)?;
-        *self
-            .diagnostics
-            .entry("export_raw_bytes".into())
-            .or_default() += g.object_size;
+        let raw = super::object_bytes::read_verified(&self.device, &self.crypto, o)?;
+        *self.diagnostics.entry("export_raw_bytes".into()).or_default() += self.object_size();
         Ok(raw)
     }
+
 }
 impl Storage for Store {
     fn read_node(&mut self, r: MetaRef) -> Result<Vec<u8>> {
         let g = self.geometry();
-        if let Some(v) = self.node_cache.get(&r) {
-            return Ok(v.clone());
+        if let Some(v) = self.prepare_cache.node(r, self.root.seq) {
+            return Ok(v);
         }
         let mut b = [0; PAGE];
         if r.offset & PORTABLE != 0 {
@@ -658,11 +661,30 @@ impl Storage for Store {
             return Err(Error::Integrity("index node digest".into()));
         }
         let v = self.crypto.unframe(codec::NODE, r.offset, &b)?;
-        if self.node_cache.len() >= 4096 {
-            self.node_cache.clear();
-        }
-        self.node_cache.insert(r, v.clone());
+        self.prepare_cache.put_node(r, self.root.seq, v.clone());
         Ok(v)
+    }
+    fn read_decoded(&mut self, spec: &Spec, r: MetaRef) -> Result<Node> {
+        if let Some(node) = self.prepare_cache.decoded(r, spec, self.root.seq) {
+            return Ok(node);
+        }
+        let payload = self.read_node(r)?;
+        let node = tree::decode_at(spec, r, &payload)?;
+        self.prepare_cache.put_decoded(r, *spec, self.root.seq, payload, node.clone());
+        Ok(node)
+    }
+    fn prefetch_nodes(&mut self, references: &[MetaRef]) -> Result<()> {
+        let g = self.geometry();
+        let references = unique_cache_misses(&self.prepare_cache, references, self.root.seq);
+        let ids = references.iter().filter(|r| r.offset & PORTABLE != 0)
+            .map(|r| (r.offset & !PORTABLE) / g.object_size).collect::<BTreeSet<_>>();
+        let objects = self.objects_many(&ids.into_iter().collect::<Vec<_>>())?;
+        let mut positions = Vec::with_capacity(references.len());
+        for reference in references {
+            let physical = node_position(reference, &objects, g)?;
+            positions.push((physical, reference));
+        }
+        prefetch_frames(&mut self.prepare_cache, &self.device, &self.crypto, self.root.seq, positions)
     }
     fn write_node(&mut self, _: &[u8]) -> Result<MetaRef> {
         Err(Error::Invalid("read-only tree context".into()))
@@ -687,6 +709,61 @@ pub(super) struct Txn<'a> {
     pub portable: Option<u64>,
     pub cloud_deltas: BTreeMap<u64, i64>,
 }
+
+fn unique_cache_misses(cache: &PrepareCache, references: &[MetaRef], epoch: u64) -> Vec<MetaRef> {
+    let mut seen = BTreeSet::new();
+    references.iter().copied().filter(|r| !r.empty()
+        && !cache.contains_node(*r, epoch) && seen.insert((r.offset, r.hash))).collect()
+}
+
+fn node_position(r: MetaRef, objects: &BTreeMap<u64, Object>, g: Geometry) -> Result<u64> {
+    if r.offset & PORTABLE == 0 { return Ok(r.offset); }
+    let logical = r.offset & !PORTABLE;
+    let object = objects.get(&(logical / g.object_size))
+        .ok_or_else(|| Error::Integrity("prefetch object missing".into()))?;
+    super::portable_validation::validate_node_reference(r, object, g)?;
+    if object.missing {
+        return Err(Error::Missing(RemoteObject::from_object(object, g.object_size)));
+    }
+    Ok(object.extent * g.object_size + logical % g.object_size)
+}
+
+fn prefetch_frames(cache: &mut PrepareCache, device: &Device, crypto: &Crypto,
+    epoch: u64, mut positions: Vec<(u64, MetaRef)>) -> Result<()> {
+    positions.sort_by_key(|(offset, _)| *offset);
+    let mut first = 0;
+    while first < positions.len() {
+        let mut end = first + 1;
+        // Never fill holes: every page in the request is needed by this batch.
+        while end < positions.len() && end - first < 64
+            && positions[end].0 == positions[end - 1].0 + PAGE as u64 { end += 1; }
+        let mut frames = vec![0; (end - first) * PAGE];
+        device.read(positions[first].0, &mut frames)?;
+        cache.count("prepare_index_prefetch_batches", 1);
+        cache.count("prepare_index_prefetch_pages", (end - first) as u64);
+        for ((_, reference), frame) in positions[first..end].iter().zip(frames.chunks_exact(PAGE)) {
+            if hash(frame) != reference.hash { return Err(Error::Integrity("index node digest".into())); }
+            let payload = crypto.unframe(codec::NODE, reference.offset, frame.try_into().unwrap())?;
+            cache.put_node(*reference, epoch, payload);
+        }
+        first = end;
+    }
+    Ok(())
+}
+
+impl Store {
+    fn objects_many(&mut self, ids: &[u64]) -> Result<BTreeMap<u64, Object>> {
+        let ids = ids.iter().copied().collect::<BTreeSet<_>>().into_iter().collect::<Vec<_>>();
+        if ids.is_empty() { return Ok(BTreeMap::new()); }
+        self.prepare_cache.count("prepare_object_lookup_batches", 1);
+        let values = tree::get_many(self, &OBJECTS, self.root.objects, &ids)?;
+        ids.into_iter().zip(values).map(|(id, value)| {
+            let value = value.ok_or_else(|| Error::Integrity(format!("missing object {id}")))?;
+            Ok((id, Object::decode(id, &value)?))
+        }).collect()
+    }
+}
+
 impl Txn<'_> {
     pub fn geometry(&self) -> Geometry {
         self.store.crypto.geometry
@@ -700,6 +777,24 @@ impl Txn<'_> {
         let v = tree::get(self, &OBJECTS, r, oid)?
             .ok_or_else(|| Error::Integrity(format!("missing object {oid}")))?;
         Object::decode(oid, &v)
+    }
+    fn objects_many(&mut self, ids: &[u64]) -> Result<BTreeMap<u64, Object>> {
+        let ids = ids.iter().copied().collect::<BTreeSet<_>>();
+        let mut result = BTreeMap::new();
+        let mut missing = Vec::new();
+        for id in ids {
+            if let Some(object) = self.objects.get(&id) { result.insert(id, object.clone()); }
+            else { missing.push(id); }
+        }
+        if !missing.is_empty() {
+            self.store.prepare_cache.count("prepare_object_lookup_batches", 1);
+            let values = tree::get_many(self, &OBJECTS, self.root.objects, &missing)?;
+            for (id, value) in missing.into_iter().zip(values) {
+                let value = value.ok_or_else(|| Error::Integrity(format!("missing object {id}")))?;
+                result.insert(id, Object::decode(id, &value)?);
+            }
+        }
+        Ok(result)
     }
     pub fn set(
         &mut self,
@@ -723,11 +818,10 @@ impl Txn<'_> {
                         .or_default() += 1;
                 }
             }
+            deltas.retain(|_, delta| *delta != 0);
+            let mut objects = self.objects_many(&deltas.keys().copied().collect::<Vec<_>>())?;
             for (oid, delta) in deltas {
-                if delta == 0 {
-                    continue;
-                }
-                let mut o = self.object(oid)?;
+                let mut o = objects.remove(&oid).unwrap();
                 // Imported immutable subtrees are protected by their source root, not
                 // by a guessed zero reference count before their leaves are visited.
                 if self.root.deferred_index && o.origin_backed { continue; }
@@ -806,7 +900,7 @@ impl Txn<'_> {
                 self.store
                     .crypto
                     .frame(codec::CLOUD_BLOB, self.root.seq + 1, offset, &payload)?;
-            self.store.device.write(offset, &bytes)?;
+            self.buffer_metadata(offset, bytes)?;
             next = MetaRef {
                 offset,
                 hash: hash(&bytes),
@@ -818,10 +912,15 @@ impl Txn<'_> {
         self.retire_blob(old)?;
         self.blob(data)
     }
+    pub fn read_blob(&self, r: MetaRef) -> Result<Vec<u8>> {
+        read_blob_frames(&self.store.crypto, r, |offset, frame| self.read_frame(offset, frame))
+    }
     fn retire_blob(&mut self, mut r: MetaRef) -> Result<()> {
+        let mut visited = BTreeSet::new();
         while !r.empty() {
+            if !visited.insert(r.offset) { return Err(Error::Integrity("blob cycle".into())); }
             let mut b = [0; PAGE];
-            self.store.device.read(r.offset, &mut b)?;
+            self.read_frame(r.offset, &mut b)?;
             if hash(&b) != r.hash {
                 return Err(Error::Integrity("blob hash".into()));
             }
@@ -829,7 +928,7 @@ impl Txn<'_> {
             if p.len() < 40 {
                 return Err(Error::Integrity("blob framing".into()));
             }
-            self.retired.insert(r.offset);
+            self.retire_page(r.offset);
             r = MetaRef::get(&p);
         }
         Ok(())
@@ -884,14 +983,6 @@ impl Txn<'_> {
         self.store.device.grow((extent + 1) * g.object_size)?;
         let oid = self.root.next_oid;
         self.root.next_oid += 1;
-        if self.store.zero_tails.len() < 64
-            && self
-                .store
-                .device
-                .range_is_sparse(extent * g.object_size, g.object_size)
-        {
-            self.store.zero_tails.insert(oid);
-        }
         // Keep the ordinal decodable while distributing cloud directory prefixes.
         // The complete UUID is persisted; old identities are never reconstructed.
         let mut seed = [0; 24];
@@ -990,11 +1081,20 @@ impl Txn<'_> {
         if o.sealed {
             return Ok(o);
         }
+        let used_end = super::object_bytes::payload_end(g, o.kind as u64, o.used as u64)?;
+        if o.external_count as u64 > g.external_limit || (o.kind == 1 && o.external_count != 0) {
+            return Err(Error::Integrity("active object dependency boundary".into()));
+        }
+        if root_descriptor.is_some() && o.kind != 2 {
+            return Err(Error::Invalid("root descriptor requires a metadata object".into()));
+        }
         // Fresh frames are still immutable writer-owned bytes. Do not write them
         // merely to reread/decrypt them here; they join the transaction's one data write.
         let mut raw = vec![0; g.object_size as usize];
         let mut fresh = vec![false; o.used as usize];
-        let mut slot = 0;
+        // Metadata reserves slot zero for an optional root descriptor. It is
+        // initialized explicitly below, never inherited from a recycled extent.
+        let mut slot = usize::from(o.kind == 2);
         while slot < o.used as usize {
             let physical = o.extent * g.object_size + (g.payload_pages + slot as u64) * PAGE as u64;
             if let Some(bytes) = self.pending_data.get(&physical) {
@@ -1003,6 +1103,13 @@ impl Txn<'_> {
                     .copy_from_slice(bytes);
                 fresh[slot] = true;
                 slot += 1;
+            } else if let Some(bytes) = (o.kind == 2).then(||
+                self.store.prepare_cache.cipher(oid, o.extent, slot as u64, self.root.seq + 1)).flatten() {
+                raw[(g.payload_pages as usize + slot) * PAGE
+                    ..(g.payload_pages as usize + 1 + slot) * PAGE].copy_from_slice(&bytes);
+                fresh[slot] = true;
+                self.store.prepare_cache.count("prepare_seal_cached_pages", 1);
+                slot += 1;
             } else {
                 let first = slot;
                 slot += 1;
@@ -1010,6 +1117,8 @@ impl Txn<'_> {
                     && !self.pending_data.contains_key(
                         &(o.extent * g.object_size + (g.payload_pages + slot as u64) * PAGE as u64),
                     )
+                    && !(o.kind == 2 && self.store.prepare_cache.has_cipher(
+                        oid, o.extent, slot as u64, self.root.seq + 1))
                 {
                     slot += 1;
                 }
@@ -1093,8 +1202,8 @@ impl Txn<'_> {
                 }
             }
             for (i, v) in self
-                .external_rows(oid, o.external_count as usize)?
-                .into_iter()
+                .dependencies(oid, o.external_count as usize)?
+                .rows.into_iter()
                 .enumerate()
             {
                 let at = PAGE + i * 48;
@@ -1132,30 +1241,15 @@ impl Txn<'_> {
             &serde_json::to_vec(&head)?,
         )?;
         raw[..PAGE].copy_from_slice(&header);
-        // Payload pages were appended once. Finalization only writes framing and the unused tail.
-        self.store
-            .device
-            .write(o.extent * g.object_size, &raw[..g.header_bytes()])?;
-        if o.kind == 2 && root_descriptor.is_some() {
-            self.store.device.write(
-                o.extent * g.object_size + g.payload_pages * PAGE as u64,
-                &raw[g.header_bytes()..(g.payload_pages as usize + 1) * PAGE],
-            )?;
-        }
-        let used_end = (g.payload_pages as usize + o.used as usize) * PAGE;
-        if used_end < raw.len() && !self.store.zero_tails.contains(&oid) {
-            self.store
-                .device
-                .write(o.extent * g.object_size + used_end as u64, &raw[used_end..])?;
-            *self
-                .store
-                .diagnostics
-                .entry("seal_padding_write_bytes".into())
-                .or_default() += (raw.len() - used_end) as u64;
-        }
+        // Only headers and the reserved root slot change at sealing. The unused
+        // suffix remains logical zeros even if this physical extent holds junk.
+        let header_end = g.header_bytes() + if o.kind == 2 { PAGE } else { 0 };
+        self.store.device.write(o.extent * g.object_size, &raw[..header_end])?;
+        *self.store.diagnostics.entry("seal_logical_zero_bytes".into()).or_default()
+            += (raw.len() - used_end) as u64;
         o.sha = hash(&raw);
         o.sealed = true;
-        self.store.zero_tails.remove(&oid);
+        self.store.prepare_cache.remove_object(oid, o.extent, o.used as u64);
         self.objects.insert(oid, o.clone());
         let slots = self.root.slots;
         self.root.slots =
@@ -1180,11 +1274,11 @@ impl Txn<'_> {
     }
     pub fn free_object(&mut self, oid: u64) -> Result<u64> {
         let g = self.geometry();
-        self.store.zero_tails.remove(&oid);
         let o = self.object(oid)?;
         if o.refs != 0 {
             return Err(Error::Invalid("object still has local references".into()));
         }
+        self.store.prepare_cache.remove_object(oid, o.extent, o.used as u64);
         self.deleted.insert(oid, o.clone());
         self.objects.remove(&oid);
         if o.missing {
@@ -1207,23 +1301,24 @@ impl Txn<'_> {
             let batch = std::mem::take(&mut self.refs);
             let mut local = Vec::new();
             let mut portable = Vec::new();
+            let local_keys = batch.iter().filter(|(offset, (delta, _))| **offset & PORTABLE == 0 && *delta != 0)
+                .map(|(offset, _)| *offset / PAGE as u64).collect::<Vec<_>>();
+            let portable_keys = batch.iter().filter(|(offset, (delta, _))| **offset & PORTABLE != 0 && *delta != 0)
+                .map(|(offset, _)| (*offset & !PORTABLE) / PAGE as u64).collect::<Vec<_>>();
+            let values = tree::get_many(self, &REFS, self.root.refs, &local_keys)?;
+            let mut local_before = local_keys.into_iter().zip(values).collect::<BTreeMap<_, _>>();
+            let values = tree::get_many(self, &PORTREFS, self.root.portable_refs, &portable_keys)?;
+            let mut portable_before = portable_keys.into_iter().zip(values).collect::<BTreeMap<_, _>>();
+            self.store.prepare_cache.count("prepare_reference_lookup_batches",
+                u64::from(!local_before.is_empty()) + u64::from(!portable_before.is_empty()));
             for (offset, (delta, tag)) in batch {
                 if delta == 0 {
                     continue;
                 }
                 let remote = offset & PORTABLE != 0;
-                let (specification, root, key) = if remote {
-                    (
-                        &PORTREFS,
-                        self.root.portable_refs,
-                        (offset & !PORTABLE) / PAGE as u64,
-                    )
-                } else {
-                    (&REFS, self.root.refs, offset / PAGE as u64)
-                };
-                let before = tree::get(self, specification, root, key)?
-                    .map(|b| u64::from_le_bytes(b[..8].try_into().unwrap()))
-                    .unwrap_or(0);
+                let key = (offset & !PORTABLE) / PAGE as u64;
+                let before = if remote { portable_before.remove(&key) } else { local_before.remove(&key) }
+                    .flatten().map(|b| u64::from_le_bytes(b[..8].try_into().unwrap())).unwrap_or(0);
                 let after = before
                     .checked_add_signed(delta)
                     .ok_or_else(|| Error::Integrity("node reference underflow".into()))?;
@@ -1258,10 +1353,15 @@ impl Txn<'_> {
                         }
                         Node::Leaf { values, .. } => {
                             if tag == PAGES.tag {
+                                let mut counts = BTreeMap::<u64, u64>::new();
                                 for (_, v) in values {
                                     let p = Page::decode(&v)?;
-                                    let mut o = self.object(p.reference.object)?;
-                                    o.refs = o.refs.checked_sub(1).ok_or_else(|| {
+                                    *counts.entry(p.reference.object).or_default() += 1;
+                                }
+                                let mut objects = self.objects_many(&counts.keys().copied().collect::<Vec<_>>())?;
+                                for (oid, count) in counts {
+                                    let mut o = objects.remove(&oid).unwrap();
+                                    o.refs = o.refs.checked_sub(count).ok_or_else(|| {
                                         Error::Integrity("data reference underflow".into())
                                     })?;
                                     self.objects.insert(o.oid, o);
@@ -1276,7 +1376,7 @@ impl Txn<'_> {
                         })?;
                         self.objects.insert(object.oid, object);
                     } else {
-                        self.retired.insert(offset);
+                        self.retire_page(offset);
                     }
                     None
                 } else {
@@ -1324,11 +1424,12 @@ impl Txn<'_> {
             let deleted = std::mem::take(&mut self.deleted);
             let mut stats = Vec::new();
             let mut changes = Vec::new();
+            let ids = pending.keys().copied().collect::<Vec<_>>();
+            if !ids.is_empty() { self.store.prepare_cache.count("prepare_object_lookup_batches", 1); }
+            let prior = tree::get_many(self, &OBJECTS, self.root.objects, &ids)?;
+            let mut prior = ids.into_iter().zip(prior).collect::<BTreeMap<_, _>>();
             for (oid, o) in pending {
-                let r = self.root.objects;
-                let before = tree::get(self, &OBJECTS, r, oid)?
-                    .map(|v| Object::decode(oid, &v))
-                    .transpose()?;
+                let before = prior.remove(&oid).flatten().map(|v| Object::decode(oid, &v)).transpose()?;
                 stats.push((before, Some(o.clone())));
                 changes.push((oid, Some(o.encode())));
             }
@@ -1434,7 +1535,7 @@ impl Txn<'_> {
                 self.store
                     .crypto
                     .frame(codec::CLOUD_BLOB, self.root.seq + 1, offset, &payload)?;
-            self.store.device.write(offset, &b)?;
+            self.buffer_metadata(offset, b)?;
             next = MetaRef {
                 offset,
                 hash: hash(&b),
@@ -1487,8 +1588,8 @@ impl Txn<'_> {
 impl Storage for Txn<'_> {
     fn read_node(&mut self, r: MetaRef) -> Result<Vec<u8>> {
         let g = self.geometry();
-        if let Some(v) = self.store.node_cache.get(&r) {
-            return Ok(v.clone());
+        if let Some(v) = self.store.prepare_cache.node(r, self.root.seq + 1) {
+            return Ok(v);
         }
         let mut b = [0; PAGE];
         if r.offset & PORTABLE != 0 {
@@ -1504,11 +1605,33 @@ impl Storage for Txn<'_> {
             return Err(Error::Integrity("index node digest".into()));
         }
         let v = self.store.crypto.unframe(codec::NODE, r.offset, &b)?;
-        if self.store.node_cache.len() >= 4096 {
-            self.store.node_cache.clear();
-        }
-        self.store.node_cache.insert(r, v.clone());
+        self.store.prepare_cache.put_node(r, self.root.seq + 1, v.clone());
         Ok(v)
+    }
+    fn read_decoded(&mut self, spec: &Spec, r: MetaRef) -> Result<Node> {
+        if let Some(node) = self.store.prepare_cache.decoded(r, spec, self.root.seq + 1) {
+            return Ok(node);
+        }
+        let payload = self.read_node(r)?;
+        let node = tree::decode_at(spec, r, &payload)?;
+        self.store.prepare_cache.put_decoded(r, *spec, self.root.seq + 1, payload, node.clone());
+        Ok(node)
+    }
+    fn prefetch_nodes(&mut self, references: &[MetaRef]) -> Result<()> {
+        let g = self.geometry();
+        let references = unique_cache_misses(&self.store.prepare_cache, references, self.root.seq + 1);
+        let ids = references.iter().filter(|r| r.offset & PORTABLE != 0)
+            .map(|r| (r.offset & !PORTABLE) / g.object_size).collect::<BTreeSet<_>>();
+        let objects = self.objects_many(&ids.into_iter().collect::<Vec<_>>())?;
+        let mut positions = Vec::with_capacity(references.len());
+        for reference in references {
+            let physical = node_position(reference, &objects, g)?;
+            if !self.pending_metadata.contains_key(&physical) && !self.pending_data.contains_key(&physical) {
+                positions.push((physical, reference));
+            }
+        }
+        prefetch_frames(&mut self.store.prepare_cache, &self.store.device, &self.store.crypto,
+            self.root.seq + 1, positions)
     }
     fn write_node(&mut self, payload: &[u8]) -> Result<MetaRef> {
         if self.portable.is_some() {
@@ -1524,10 +1647,7 @@ impl Storage for Txn<'_> {
             hash: hash(&b),
         };
         self.cache_fresh_node(reference, payload);
-        self.pending_metadata.insert(offset, b);
-        if self.pending_metadata.len() >= 256 {
-            self.flush_metadata()?;
-        }
+        self.buffer_metadata(offset, b)?;
         Ok(reference)
     }
     fn created(
@@ -1558,10 +1678,16 @@ impl Storage for Txn<'_> {
             self.refdelta(*c, 1, tag)
         }
         if tag == PAGES.tag {
+            let mut counts = BTreeMap::<u64, u64>::new();
             for (_, v) in values {
                 let p = Page::decode(v)?;
-                let mut o = self.object(p.reference.object)?;
-                o.refs += 1;
+                *counts.entry(p.reference.object).or_default() += 1;
+            }
+            let mut objects = self.objects_many(&counts.keys().copied().collect::<Vec<_>>())?;
+            for (oid, count) in counts {
+                let mut o = objects.remove(&oid).unwrap();
+                o.refs = o.refs.checked_add(count)
+                    .ok_or_else(|| Error::Integrity("data reference overflow".into()))?;
                 self.objects.insert(o.oid, o);
             }
         }
@@ -1582,12 +1708,16 @@ impl Storage for Txn<'_> {
                 }
             }
         } else {
-            self.retired.insert(r.offset);
+            self.retire_page(r.offset);
         }
         Ok(())
     }
 }
-pub(super) fn read_blob(device: &Device, crypto: &Crypto, mut r: MetaRef) -> Result<Vec<u8>> {
+pub(super) fn read_blob(device: &Device, crypto: &Crypto, r: MetaRef) -> Result<Vec<u8>> {
+    read_blob_frames(crypto, r, |offset, frame| device.read(offset, frame))
+}
+fn read_blob_frames(crypto: &Crypto, mut r: MetaRef,
+    mut read: impl FnMut(u64, &mut [u8; PAGE]) -> Result<()>) -> Result<Vec<u8>> {
     let mut out = Vec::new();
     let mut visited = BTreeSet::new();
     while !r.empty() {
@@ -1595,7 +1725,7 @@ pub(super) fn read_blob(device: &Device, crypto: &Crypto, mut r: MetaRef) -> Res
             return Err(Error::Integrity("blob cycle".into()));
         }
         let mut b = [0; PAGE];
-        device.read(r.offset, &mut b)?;
+        read(r.offset, &mut b)?;
         if hash(&b) != r.hash {
             return Err(Error::Integrity("blob checksum".into()));
         }
@@ -1611,34 +1741,25 @@ pub(super) fn read_blob(device: &Device, crypto: &Crypto, mut r: MetaRef) -> Res
 pub(super) fn decode_header(crypto: &Crypto, oid: u64, raw: &[u8]) -> Result<serde_json::Value> {
     let g = crypto.geometry;
     if raw.len() != g.object_size as usize {
-        return Err(Error::Invalid(
-            "object length does not match volume geometry".into(),
-        ));
+        return Err(Error::Invalid("object length does not match volume geometry".into()));
     }
-    let h = crypto.unframe(
-        codec::OBJECT_HEADER,
-        PORTABLE | (oid * g.object_size),
-        raw[..PAGE].try_into().unwrap(),
-    )?;
-    let v: serde_json::Value = serde_json::from_slice(&h)?;
-    if v["oid"].as_u64() != Some(oid)
-        || v["body_sha256"].as_str() != Some(&hex(&hash(&raw[PAGE..])))
-    {
-        return Err(Error::Integrity("object body authentication".into()));
+    let header = super::object_bytes::header(crypto, oid, raw[..PAGE].try_into().unwrap())?;
+    let end = super::object_bytes::header_end(g, &header)?;
+    if raw[end..].iter().any(|byte| *byte != 0)
+        || header["body_sha256"].as_str() != Some(&hex(&hash(&raw[PAGE..]))) {
+        return Err(Error::Integrity("object body authentication or padding".into()));
     }
-    Ok(v)
+    Ok(header)
 }
+
 impl Txn<'_> {
     pub fn write_portable(&mut self, payload: &[u8]) -> Result<MetaRef> {
         let g = self.geometry();
         let node = tree::decode(&PORTMAP, payload)?;
-        let dependencies: Vec<u64> = match &node {
-            Node::Branch { children, .. } => children
-                .iter()
-                .map(|(_, r)| (r.offset & !PORTABLE) / g.object_size)
-                .collect(),
-            Node::Leaf { values, .. } => values
-                .iter()
+        let dependencies: BTreeSet<u64> = match &node {
+            Node::Branch { children, .. } => children.iter()
+                .map(|(_, r)| (r.offset & !PORTABLE) / g.object_size).collect(),
+            Node::Leaf { values, .. } => values.iter()
                 .map(|(_, v)| Page::decode(v).map(|p| p.reference.object))
                 .collect::<Result<_>>()?,
         };
@@ -1652,86 +1773,57 @@ impl Txn<'_> {
             }
             Some(oid) => self.object(oid)?,
         };
-        let mut existing = BTreeMap::new();
-        for v in self.external_rows(o.oid, o.external_count as usize)? {
-            existing.insert(u64::from_le_bytes(v[8..16].try_into().unwrap()), v);
-        }
-        let extra = dependencies
-            .iter()
-            .filter(|id| **id != o.oid && !existing.contains_key(id))
-            .copied()
-            .collect::<BTreeSet<_>>();
-        if o.used as u64 >= g.slots || existing.len() + extra.len() > g.external_limit as usize {
+        let mut table = self.dependencies(o.oid, o.external_count as usize)?;
+        let extra = dependencies.iter().filter(|id| **id != o.oid && !table.positions.contains_key(id)).count();
+        if o.used as u64 >= g.slots || table.rows.len() + extra > g.external_limit as usize {
+            self.store.prepare_cache.put_dependencies(o.oid, self.root.seq + 1, table);
             self.seal(o.oid, None)?;
             o = self.allocate_object(2, 0)?;
             o.used = 1;
             self.objects.insert(o.oid, o.clone());
             self.portable = Some(o.oid);
-            existing.clear();
+            table = Dependencies::default();
         }
-        let mut changes = Vec::new();
-        for id in dependencies {
-            if id == o.oid || existing.contains_key(&id) {
-                continue;
-            }
-            let child = self.object(id)?;
+        let missing = dependencies.into_iter().filter(|id| *id != o.oid && !table.positions.contains_key(id)).collect::<Vec<_>>();
+        for (id, child) in self.objects_many(&missing)? {
             if !child.sealed {
-                return Err(Error::Integrity(
-                    "portable dependency must already be sealed".into(),
-                ));
+                return Err(Error::Integrity("portable dependency must already be sealed".into()));
             }
-            let mut row = vec![0; 48];
+            let mut row = [0; 48];
             row[..16].copy_from_slice(child.id.as_bytes());
             row[16..48].copy_from_slice(&child.sha);
-            changes.push((
-                o.oid * g.external_stride + existing.len() as u64,
-                Some(row.clone()),
-            ));
-            existing.insert(id, row);
+            self.pending_externals.insert(o.oid * g.external_stride + table.rows.len() as u64, Some(row.to_vec()));
+            debug_assert!(!table.positions.contains_key(&id));
+            table.push(row)?;
         }
-        self.pending_externals.extend(changes);
-        o.external_count = existing.len() as u16;
+        o.external_count = table.rows.len() as u16;
+        self.store.prepare_cache.put_dependencies(o.oid, self.root.seq + 1, table);
         let local = (g.payload_pages + o.used as u64) * PAGE as u64;
         let offset = PORTABLE | (o.oid * g.object_size + local);
-        let bytes = self
-            .store
-            .crypto
-            .frame(codec::NODE, self.root.seq + 1, offset, payload)?;
-        self.pending_data
-            .insert(o.extent * g.object_size + local, bytes);
+        let bytes = self.store.crypto.frame(codec::NODE, self.root.seq + 1, offset, payload)?;
+        self.pending_data.insert(o.extent * g.object_size + local, bytes);
+        self.store.prepare_cache.put_cipher(o.oid, o.extent, o.used as u64, self.root.seq + 1, bytes);
         o.used += 1;
         self.objects.insert(o.oid, o);
-        let reference = MetaRef {
-            offset,
-            hash: hash(&bytes),
-        };
+        let reference = MetaRef { offset, hash: hash(&bytes) };
         self.cache_fresh_node(reference, payload);
         Ok(reference)
     }
     pub fn apply_cloud_deltas(&mut self, root: MetaRef) -> Result<MetaRef> {
         let mut changes = Vec::new();
         let save = self.portable.take();
-        for (oid, delta) in std::mem::take(&mut self.cloud_deltas) {
-            if delta == 0 {
-                continue;
-            }
-            let before = tree::get(self, &COUNTS, root, oid)?
-                .map(|b| u64::from_le_bytes(b.try_into().unwrap()))
-                .unwrap_or(0);
-            let after = before
-                .checked_add_signed(delta)
+        let deltas = std::mem::take(&mut self.cloud_deltas).into_iter().filter(|(_, delta)| *delta != 0).collect::<Vec<_>>();
+        let ids = deltas.iter().map(|(oid, _)| *oid).collect::<Vec<_>>();
+        let prior = tree::get_many(self, &COUNTS, root, &ids)?;
+        let mut objects = self.objects_many(&ids)?;
+        for ((oid, delta), before) in deltas.into_iter().zip(prior) {
+            let before = before.map(|b| u64::from_le_bytes(b.try_into().unwrap())).unwrap_or(0);
+            let after = before.checked_add_signed(delta)
                 .ok_or_else(|| Error::Integrity("cloud reference underflow".into()))?;
-            let mut object = self.object(oid)?;
+            let mut object = objects.remove(&oid).unwrap();
             object.cloud_refs = after;
             self.objects.insert(oid, object);
-            changes.push((
-                oid,
-                if after == 0 {
-                    None
-                } else {
-                    Some(after.to_le_bytes().to_vec())
-                },
-            ));
+            changes.push((oid, if after == 0 { None } else { Some(after.to_le_bytes().to_vec()) }));
         }
         let next = self.set(&COUNTS, root, &changes)?;
         self.portable = save;
@@ -1740,7 +1832,7 @@ impl Txn<'_> {
     pub fn move_object(&mut self, oid: u64) -> Result<bool> {
         let g = self.geometry();
         let mut o = self.object(oid)?;
-        if o.missing {
+        if o.missing || !o.sealed {
             return Ok(false);
         }
         let min = self
@@ -1764,12 +1856,9 @@ impl Txn<'_> {
         let Some(target) = target else {
             return Ok(false);
         };
-        let mut raw = vec![0; g.object_size as usize];
-        self.store.device.read(o.extent * g.object_size, &mut raw)?;
-        if o.sealed && hash(&raw) != o.sha {
-            return Err(Error::Integrity("compaction source checksum".into()));
-        }
-        self.store.device.write(target * g.object_size, &raw)?;
+        let raw = super::object_bytes::read_verified(&self.store.device, &self.store.crypto, &o)?;
+        let end = super::object_bytes::payload_end(g, o.kind as u64, o.used as u64)?;
+        self.store.device.write(target * g.object_size, &raw[..end])?;
         self.free.extents.remove(&target);
         self.freelog.remove_extents.insert(target);
         self.free.punched.remove(&target);
@@ -1911,31 +2000,24 @@ pub(super) fn external_table(
 impl Txn<'_> {
     pub fn ensure_external(&mut self, oid: u64, child: u64) -> Result<()> {
         let g = self.geometry();
-        if oid == child {
-            return Ok(());
-        }
+        if oid == child { return Ok(()); }
         let mut o = self.object(oid)?;
-        let rows = self.external_rows(oid, o.external_count as usize)?;
-        if rows
-            .iter()
-            .any(|v| u64::from_le_bytes(v[8..16].try_into().unwrap()) == child)
-        {
+        let mut table = self.dependencies(oid, o.external_count as usize)?;
+        if table.positions.contains_key(&child) {
+            self.store.prepare_cache.put_dependencies(oid, self.root.seq + 1, table);
             return Ok(());
         }
         if o.external_count as u64 >= g.external_limit {
             return Err(Error::Invalid("metadata dependency table is full".into()));
         }
         let dependency = self.object(child)?;
-        if !dependency.sealed {
-            return Err(Error::Integrity("unsealed root dependency".into()));
-        }
-        let mut value = vec![0; 48];
+        if !dependency.sealed { return Err(Error::Integrity("unsealed root dependency".into())); }
+        let mut value = [0; 48];
         value[..16].copy_from_slice(dependency.id.as_bytes());
         value[16..].copy_from_slice(&dependency.sha);
-        self.pending_externals.insert(
-            oid * g.external_stride + o.external_count as u64,
-            Some(value),
-        );
+        self.pending_externals.insert(oid * g.external_stride + o.external_count as u64, Some(value.to_vec()));
+        table.push(value)?;
+        self.store.prepare_cache.put_dependencies(oid, self.root.seq + 1, table);
         o.external_count += 1;
         self.objects.insert(oid, o);
         Ok(())
@@ -2049,7 +2131,7 @@ impl Txn<'_> {
         let extent = self.root.next_extent;
         self.root.next_extent += 1;
         self.store.device.grow((extent + 1) * g.object_size)?;
-        self.store.device.write(extent * g.object_size, raw)?;
+        super::object_bytes::write_verified_prefix(&self.store.device, g, extent, raw, header)?;
         o.extent = extent;
         o.missing = false;
         o.kind = header["kind"].as_u64().unwrap() as u8;
@@ -2092,7 +2174,7 @@ impl Txn<'_> {
         self.root.next_extent += 1;
         self.root.next_oid = self.root.next_oid.max(oid + 1);
         self.store.device.grow((extent + 1) * g.object_size)?;
-        self.store.device.write(extent * g.object_size, raw)?;
+        super::object_bytes::write_verified_prefix(&self.store.device, g, extent, raw, &h)?;
         let o = Object {
             oid,
             id,
@@ -2127,11 +2209,19 @@ impl Store {
     }
 }
 impl Txn<'_> {
-    fn cache_fresh_node(&mut self, r: MetaRef, payload: &[u8]) {
-        if self.store.node_cache.len() >= 4096 {
-            self.store.node_cache.clear();
+    fn retire_page(&mut self, offset: u64) {
+        if self.pending_metadata.remove(&offset).is_some() {
+            self.store.prepare_cache.count("prepare_skipped_metadata_write_pages", 1);
         }
-        self.store.node_cache.insert(r, payload.to_vec());
+        self.retired.insert(offset);
+    }
+    fn buffer_metadata(&mut self, offset: u64, frame: [u8; PAGE]) -> Result<()> {
+        self.pending_metadata.insert(offset, frame);
+        if self.pending_metadata.len() >= 256 { self.flush_metadata()?; }
+        Ok(())
+    }
+    fn cache_fresh_node(&mut self, r: MetaRef, payload: &[u8]) {
+        self.store.prepare_cache.put_node(r, self.root.seq + 1, payload.to_vec());
         self.fresh_nodes.insert(r.offset, r);
     }
     fn read_frame(&self, offset: u64, out: &mut [u8; PAGE]) -> Result<()> {
@@ -2337,25 +2427,25 @@ impl Txn<'_> {
 }
 
 impl Txn<'_> {
-    fn external_rows(&mut self, oid: u64, count: usize) -> Result<Vec<Vec<u8>>> {
+    fn dependencies(&mut self, oid: u64, count: usize) -> Result<Dependencies> {
+        if let Some(table) = self.store.prepare_cache.dependencies(oid, count, self.root.seq + 1) {
+            return Ok(table);
+        }
         let g = self.geometry();
-        let missing = (0..count)
-            .map(|slot| oid * g.external_stride + slot as u64)
-            .filter(|key| !self.pending_externals.contains_key(key))
-            .collect::<Vec<_>>();
+        let missing = (0..count).map(|slot| oid * g.external_stride + slot as u64)
+            .filter(|key| !self.pending_externals.contains_key(key)).collect::<Vec<_>>();
+        if !missing.is_empty() { self.store.prepare_cache.count("prepare_dependency_loads", 1); }
         let prior = tree::get_many(self, &EXTERNALS, self.root.externals, &missing)?;
         let mut prior = missing.into_iter().zip(prior).collect::<BTreeMap<_, _>>();
-        (0..count)
-            .map(|slot| {
-                let key = oid * g.external_stride + slot as u64;
-                let value = if let Some(v) = self.pending_externals.get(&key) {
-                    v.clone()
-                } else {
-                    prior.remove(&key).flatten()
-                };
-                value.ok_or_else(|| Error::Integrity("metadata external reference missing".into()))
-            })
-            .collect()
+        let mut table = Dependencies::default();
+        for slot in 0..count {
+            let key = oid * g.external_stride + slot as u64;
+            let value = if let Some(v) = self.pending_externals.get(&key) { v.clone() }
+                else { prior.remove(&key).flatten() };
+            let value = value.ok_or_else(|| Error::Integrity("metadata external reference missing".into()))?;
+            table.push(value.as_slice().try_into().map_err(|_| Error::Integrity("metadata external reference length".into()))?)?;
+        }
+        Ok(table)
     }
 }
 

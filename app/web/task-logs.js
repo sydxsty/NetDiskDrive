@@ -16,6 +16,10 @@
     'preparing.started':'准备同步版本','upload.reused':'复用已有对象','sync.unchanged':'没有新变更',
     'cleanup.deferred':'等待恢复结束','cleanup.deleted':'清理确认','cleanup.pending':'等待继续清理'
   };
+  for (const [stage,label] of Object.entries({freeze:'固定版本',sealing:'对象封口',indexing:'增量索引',root:'版本描述'})) {
+    for (const [event,suffix] of Object.entries({started:'开始',completed:'完成',interrupted:'中断'}))
+      actionLabels[`preparation.${stage}.${event}`]=label+suffix;
+  }
   const kindLabels = {sync:'同步',restore:'云端恢复',replica:'加载云端快照',snapshotRestore:'快照恢复',compact:'整理',download:'按需读取',network:'网盘请求',disk:'磁盘',system:'应用'};
   const objectKinds = {data:'数据块',map:'索引对象',root:'根对象',metadata:'元数据',index:'索引对象',commit:'版本根对象',obsolete:'旧对象'};
   function timestamp(value) {
@@ -29,6 +33,7 @@
   }
   function status(entry) {
     if (String(entry.level).toLowerCase() === 'error' || /\.failed$/.test(entry.action)) return ['失败','red'];
+    if (/\.interrupted$/.test(entry.action)) return ['已中断','amber'];
     if (String(entry.level).toLowerCase() === 'warning') return ['提醒','amber'];
     if (/\.paused$/.test(entry.action)) return ['已暂停','amber'];
     if (/\.cancelled$/.test(entry.action)) return ['已取消',''];

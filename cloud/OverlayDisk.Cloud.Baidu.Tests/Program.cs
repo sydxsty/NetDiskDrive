@@ -34,6 +34,7 @@ internal static partial class Program
     {
         if (args.Length == 2 && args[0] == "--cache-crash-helper") return await CacheCrashChild(args[1]);
         if (args.Length == 2 && args[0] == "--journal-commit-crash-helper") return await JournalCommitCrashChild(args[1]);
+        if (args.Length == 2 && args[0] == "--journal-group-crash-helper") return await JournalGroupCrashChild(args[1]);
         var tests = new (string Name, Func<Task> Run)[]
         {
             ("account and web session cookie scoping", Auth),
@@ -88,7 +89,7 @@ internal static partial class Program
             ,("object-size: invalid part indices checksums and declared sizes reject", ObjectSizeMultipartRejects)
             ,("object-size: 8/16 MiB known downloads preserve exact length without metadata probes", ObjectSizeKnownReads)
         };
-        tests = tests.Concat(ObjectTransportTests).Concat(EncodedObjectTests).Concat(ReplicaReaderBackendTests).ToArray();
+        tests = tests.Concat(ObjectTransportTests).Concat(EncodedObjectTests).Concat(ReplicaReaderBackendTests).Concat(JournalGroupTests).ToArray();
         if (args.Length != 0)
         {
             if (args.Length != 2 || args[0] != "--filter") { Console.Error.WriteLine("Use --filter <test-name> to select a focused test."); return 2; }

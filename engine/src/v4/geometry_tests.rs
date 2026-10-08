@@ -226,9 +226,11 @@ fn large_object_compaction_and_cache_preserve_identity_and_sync_generation() {
             assert_eq!(v.info().unwrap().data_generation, generation);
             assert!(v.control(&json!({"cmd":"cloud.prepare"})).unwrap()["job"].is_null());
             for (id, raw) in &objects {
-                let o = v.shared.store.lock().unwrap().object_id(id).unwrap();
-                let mut actual = vec![0; size as usize];
-                v.shared.device.read(o.extent * size, &mut actual).unwrap();
+                let mut store = v.shared.store.lock().unwrap();
+                let o = store.object_id(id).unwrap();
+                // Physical padding may retain a retired object's bytes. Object
+                // identity is defined over its authenticated canonical export.
+                let actual = store.verify_object(&o).unwrap();
                 assert_eq!(codec::hash(&actual), codec::hash(raw));
             }
         }

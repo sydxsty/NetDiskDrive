@@ -17,16 +17,27 @@ public sealed class ActivityJournal : IDisposable
     private readonly object gate = new();
     private readonly string directory;
     private readonly int segmentEntries, maximumSegments;
+    private readonly int flushBatchEntries;
+    private readonly TimeSpan flushInterval;
+    private readonly ITimer flushTimer;
     private readonly SortedDictionary<long, List<ActivityEntry>> segments = new();
     private StreamWriter? writer;
     private long sequence, currentSegment;
+    private int pendingEntries;
+    private long bufferFlushes;
     private bool disposed;
     public string? Warning { get; private set; }
 
     public ActivityJournal(string directory, int segmentEntries = 4096, int maximumSegments = 16)
+        : this(directory, segmentEntries, maximumSegments, TimeProvider.System, TimeSpan.FromMilliseconds(250), 128) { }
+
+    internal ActivityJournal(string directory, int segmentEntries, int maximumSegments, TimeProvider timeProvider,
+        TimeSpan flushInterval, int flushBatchEntries)
     {
         if (segmentEntries < 2 || maximumSegments < 2) throw new ArgumentOutOfRangeException(nameof(segmentEntries));
+        if (flushInterval <= TimeSpan.Zero || flushBatchEntries < 1) throw new ArgumentOutOfRangeException(nameof(flushInterval));
         this.directory = directory; this.segmentEntries = segmentEntries; this.maximumSegments = maximumSegments;
+        this.flushInterval = flushInterval; this.flushBatchEntries = flushBatchEntries;
         Directory.CreateDirectory(directory);
         foreach (var file in Directory.EnumerateFiles(directory, "activity-*.jsonl").OrderBy(p => p, StringComparer.Ordinal).TakeLast(maximumSegments))
         {
@@ -47,6 +58,8 @@ public sealed class ActivityJournal : IDisposable
             sequence = Math.Max(sequence, first);
             segments[first] = entries;
         }
+        flushTimer = timeProvider.CreateTimer(static state => ((ActivityJournal)state!).FlushOnTimer(), this,
+            Timeout.InfiniteTimeSpan, Timeout.InfiniteTimeSpan);
     }
 
     public ActivityEntry Append(string diskId, string runId, string kind, string action, string message,
@@ -64,7 +77,7 @@ public sealed class ActivityJournal : IDisposable
                 objectId is null ? null : Bound(objectId, 128), objectKind is null ? null : Bound(objectKind, 32), bytes, generation, wireBytes);
             if (writer is null || segments[currentSegment].Count >= segmentEntries)
             {
-                var previousWriter = writer; writer = null; previousWriter?.Dispose();
+                CloseWriter();
                 // Prune before opening another segment. If an old file is locked, pause
                 // logging with an error instead of growing memory/disk without a bound.
                 while (segments.Count >= maximumSegments)
@@ -73,18 +86,24 @@ public sealed class ActivityJournal : IDisposable
                     File.Delete(FileName(oldest)); segments.Remove(oldest);
                 }
                 currentSegment = entry.Sequence;
-                var stream = new FileStream(FileName(currentSegment), FileMode.CreateNew, FileAccess.Write, FileShare.Read, 16384);
-                writer = new StreamWriter(stream, new UTF8Encoding(false)) { AutoFlush = true };
+                var stream = new FileStream(FileName(currentSegment), FileMode.CreateNew, FileAccess.Write, FileShare.Read, 65536);
+                writer = new StreamWriter(stream, new UTF8Encoding(false), 16384) { AutoFlush = false };
                 segments[currentSegment] = new();
             }
-            try { writer.WriteLine(JsonSerializer.Serialize(entry, Json)); }
+            try
+            {
+                writer.WriteLine(JsonSerializer.Serialize(entry, Json));
+                sequence = entry.Sequence; segments[currentSegment].Add(entry);
+                pendingEntries++;
+                if (pendingEntries >= flushBatchEntries) FlushBuffered();
+                else if (pendingEntries == 1) flushTimer.Change(flushInterval, Timeout.InfiniteTimeSpan);
+            }
             catch
             {
-                var failedWriter = writer; writer = null; sequence = Math.Max(sequence, entry.Sequence);
-                try { failedWriter.Dispose(); } catch (IOException) { }
+                sequence = Math.Max(sequence, entry.Sequence);
+                try { CloseWriter(); } catch (IOException) { }
                 throw;
             }
-            sequence = entry.Sequence; segments[currentSegment].Add(entry);
             return entry;
         }
     }
@@ -105,5 +124,44 @@ public sealed class ActivityJournal : IDisposable
         }
     }
     private string FileName(long first) => Path.Combine(directory, $"activity-{first:D20}.jsonl");
-    public void Dispose() { lock (gate) { if (disposed) return; disposed = true; var previous = writer; writer = null; previous?.Dispose(); } }
+    internal (int PendingEntries, long Flushes) BufferDiagnostics()
+    { lock (gate) return (pendingEntries, bufferFlushes); }
+
+    private void FlushBuffered()
+    {
+        if (writer is null || pendingEntries == 0) return;
+        // Activity is diagnostic, not an authoritative receipt. Flush the managed
+        // buffers together; a process crash may lose the final short log window.
+        writer.Flush(); bufferFlushes++; pendingEntries = 0;
+        flushTimer.Change(Timeout.InfiniteTimeSpan, Timeout.InfiniteTimeSpan);
+    }
+    private void CloseWriter()
+    {
+        var previous = writer; writer = null;
+        int pending = pendingEntries; pendingEntries = 0;
+        flushTimer.Change(Timeout.InfiniteTimeSpan, Timeout.InfiniteTimeSpan);
+        previous?.Dispose();
+        if (pending != 0) bufferFlushes++;
+    }
+    private void FlushOnTimer()
+    {
+        lock (gate)
+        {
+            if (disposed) return;
+            try { FlushBuffered(); }
+            catch (Exception error) when (error is IOException or UnauthorizedAccessException)
+            {
+                Warning = "近期活动日志未能写入文件，内存记录仍可查看；同步回执由独立日志保存。";
+                try { CloseWriter(); } catch (Exception close) when (close is IOException or UnauthorizedAccessException) { }
+            }
+        }
+    }
+    public void Dispose()
+    {
+        try
+        {
+            lock (gate) { if (disposed) return; disposed = true; CloseWriter(); }
+        }
+        finally { flushTimer.Dispose(); }
+    }
 }

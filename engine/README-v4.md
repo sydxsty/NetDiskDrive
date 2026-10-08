@@ -1,6 +1,6 @@
 # Current OverlayDisk container format
 
-OverlayDisk 0.7 uses the `.odv4` extension and the `v4::Volume` / `od_v4_*`
+The current engine uses the `.odv4` extension and the `v4::Volume` / `od_v4_*`
 interfaces, with the new **ODV4CFGO** configuration magic. Every configuration
 contains an explicit 4/8/16 MiB `object_size`, included in the password envelope's
 associated data. Other configuration fields are explicit as well. Earlier magic
@@ -26,7 +26,8 @@ object's body hash. Metadata objects reserve their first payload slot for a root
 descriptor when needed; other slots contain authenticated portable index nodes.
 All physical extents, slot keys, dependency keys, portable offsets, bounds and
 statistics use the volume geometry. The entire first control extent is protected
-from sparse deallocation.
+from sparse deallocation. Its configuration mirrors occupy pages 0/3 and its
+commit roots pages 1/2. Upload receipt journal pages start at page 4.
 
 A UUID/ordinal-to-extent directory separates object identity from physical
 location. Object IDs use a persisted allocation nonce. A source and its descendant
@@ -67,19 +68,26 @@ metadata. Classification is advisory: unknown content is always retained.
 
 Seal consumes immutable ciphertext still owned by its transaction directly,
 without first writing and rereading it. Existing tail pages are read and their
-authentication and original digest verified. Framing and required padding are
-written separately; payload reaches its final position once. Only a bounded,
-current-session proof that a newly assigned extent was entirely sparse may omit
-padding. The proof is removed on seal/retirement and discarded on reopen. File
-length and saved allocator records cannot prove an unused tail is zero after an
-interrupted append. Unsupported sparse queries keep the padding write.
+authentication and original digest verified. Framing is written separately;
+payload reaches its final position once. Unused tail bytes are logical zeros:
+their physical locations may retain previous contents after extent reuse or an
+interrupted append. Whole-object reads authenticate the header against the object
+catalogue, read only the used prefix, then synthesize zero padding. Export,
+verification and relocation use the same canonical representation. Incoming
+network objects are verified without normalization and nonzero canonical padding
+is rejected. Imports, hydration and relocation persist only the authenticated
+prefix. The reserved metadata root slot is always explicitly initialized; it is
+inside the used prefix and is not an unused tail. No automatic sparse deallocation
+or TRIM is performed by this optimization.
 
 ## Incremental cloud versions
 
 `cloud.prepare` flushes once to freeze an immutable page root and dirty set.
 New writes enter a later generation. Further preparation consumes only frozen
-changed keys and affected index paths, with at most 4096 keys and 128 leaf groups
-per step. Portable index nodes share metadata objects of the same volume size.
+changed keys and affected index paths, with at most 16,384 keys and 512 leaf groups
+per step. Batches start at 128 leaf groups and adapt within those bounds. The
+preparation cache defaults to 64 MiB per preparing volume and is configurable
+from 16 to 1024 MiB. Portable index nodes share metadata objects of the same volume size.
 The root explicitly records geometry and index depth.
 
 `cloud.list` returns this generation's added objects; `cloud.delta` exposes the
@@ -87,6 +95,24 @@ persistent add/remove sets. Every object, including the root, requires a durable
 canonical receipt before `cloud.commit`. A prior task cannot clear later changes
 to the same page. The last published delta remains available to recover a lost
 external cache checkpoint. Progress overlays do not themselves modify guest data.
+
+An ordinary receipt batch appends one authenticated 4 KiB control page and performs
+one durability flush, without rewriting COW roots or block statistics. Duplicate
+receipts add no writes. Records are bound to the immutable job, checkpoint epoch,
+sequence and previous-frame hash. Their OIDs must belong to that prepared job.
+At most 256 distinct confirmations remain outside the tree checkpoint; before
+exceeding this bound, one normal COW transaction folds them into the receipt and
+status indexes, publishes a new epoch through both roots, and only then reuses
+the journal area. Version commit reuses the complete addition set as the final
+receipt set after validating complete confirmation coverage.
+
+Read leases capture bounded confirmed-receipt overlays along with their root.
+Job/epoch matching prevents double counting across a concurrent checkpoint.
+Reopen replays only the authenticated consecutive journal prefix. An uncertain
+tail cannot confirm objects or permit premature publication; resumption
+checkpoints the valid prefix before reusing that tail. A failed append or flush
+latches the handle. Receipt logging preserves the normal data Flush/FUA protocol.
+These are local control records and are never added to cloud upload objects.
 
 `read_export` returns leased, immutable **canonical raw bytes**. The saved SHA and
 length describe those bytes. The cloud transport verifies that SHA, then wraps

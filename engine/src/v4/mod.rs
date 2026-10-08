@@ -8,7 +8,15 @@ mod io;
 mod lazy;
 mod maintenance;
 mod ntfs;
+mod object_bytes;
+#[cfg(test)]
+mod logical_zero_tests;
 mod portable_validation;
+mod prepare_cache;
+mod preparation;
+mod receipts;
+#[cfg(test)]
+mod receipt_tests;
 #[cfg(test)]
 mod portable_validation_tests;
 mod restore;
@@ -99,3 +107,7 @@ mod write_seal_tests;
 
 #[cfg(test)]
 mod geometry_tests;
+#[cfg(test)]
+mod storage_prepare_tests;
+#[cfg(test)]
+mod preparation_tests;

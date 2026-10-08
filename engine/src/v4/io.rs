@@ -1,6 +1,7 @@
 //! One resident handle. Every physical I/O uses explicit, aligned offsets.
 use super::{Error, Result};
 use fs2::FileExt;
+use std::{cell::RefCell, rc::Rc};
 use std::{
     alloc::{alloc_zeroed, dealloc, Layout},
     fs::{File, OpenOptions},
@@ -8,6 +9,41 @@ use std::{
     ptr::NonNull,
     sync::atomic::{AtomicU64, Ordering},
 };
+
+#[derive(Clone, Copy, Default, Debug, serde::Serialize)]
+pub(super) struct ScopedIoCounts {
+    pub local_read_bytes: u64,
+    pub local_write_bytes: u64,
+    pub read_calls: u64,
+    pub write_calls: u64,
+    pub flush_count: u64,
+}
+impl ScopedIoCounts {
+    pub fn add(&mut self, other: Self) {
+        self.local_read_bytes += other.local_read_bytes;
+        self.local_write_bytes += other.local_write_bytes;
+        self.read_calls += other.read_calls;
+        self.write_calls += other.write_calls;
+        self.flush_count += other.flush_count;
+    }
+}
+type ScopedCounter = (usize, Rc<RefCell<ScopedIoCounts>>);
+thread_local! {
+    static SCOPED_IO: RefCell<Vec<ScopedCounter>> = const { RefCell::new(Vec::new()) };
+}
+/// Synchronous native preparation stays on the calling thread. Attribution is
+/// scoped to that thread AND device, so parallel guest I/O is never included.
+pub(super) struct IoScope {
+    counts: Rc<RefCell<ScopedIoCounts>>,
+}
+impl IoScope {
+    pub fn snapshot(&self) -> ScopedIoCounts { *self.counts.borrow() }
+}
+impl Drop for IoScope {
+    fn drop(&mut self) {
+        SCOPED_IO.with(|scopes| scopes.borrow_mut().retain(|(_, value)| !Rc::ptr_eq(value, &self.counts)));
+    }
+}
 
 pub struct Device {
     file: File,
@@ -68,6 +104,19 @@ impl Drop for Aligned {
     }
 }
 impl Device {
+    pub(super) fn io_scope(&self) -> IoScope {
+        let counts = Rc::new(RefCell::new(ScopedIoCounts::default()));
+        SCOPED_IO.with(|scopes| scopes.borrow_mut().push((self as *const Self as usize, counts.clone())));
+        IoScope { counts }
+    }
+    fn record_scoped(&self, delta: ScopedIoCounts) {
+        let id = self as *const Self as usize;
+        SCOPED_IO.with(|scopes| {
+            for (device, counts) in scopes.borrow().iter() {
+                if *device == id { counts.borrow_mut().add(delta); }
+            }
+        });
+    }
     pub fn open(path: &Path, create: bool) -> Result<Self> {
         let mut options = OpenOptions::new();
         options.read(true).write(true).create_new(create);
@@ -207,37 +256,6 @@ impl Device {
         self.file.set_len(bytes)?;
         Ok(())
     }
-    /// A bounded hint used only before first writing a newly assigned object.
-    /// Unsupported allocation queries return false, never infer zero from file length.
-    pub fn range_is_sparse(&self, offset: u64, length: u64) -> bool {
-        let Some(end) = offset.checked_add(length) else {
-            return false;
-        };
-        if length == 0 || self.len().ok().is_none_or(|len| end > len) {
-            return false;
-        }
-        #[cfg(target_os = "linux")]
-        {
-            use std::os::fd::AsRawFd;
-            unsafe extern "C" {
-                fn lseek(fd: i32, offset: i64, whence: i32) -> i64;
-            }
-            let next = unsafe { lseek(self.file.as_raw_fd(), offset as i64, 3) };
-            if next < 0 {
-                std::io::Error::last_os_error().raw_os_error() == Some(6)
-            } else {
-                next as u64 >= end
-            }
-        }
-        #[cfg(windows)]
-        {
-            windows::range_is_sparse(&self.file, offset, length)
-        }
-        #[cfg(not(any(target_os = "linux", windows)))]
-        {
-            false
-        }
-    }
     pub fn grow(&self, minimum: u64) -> Result<()> {
         if self.len()? < minimum {
             self.resize(minimum.div_ceil(64 * 1024 * 1024) * (64 * 1024 * 1024))?;
@@ -250,6 +268,7 @@ impl Device {
             return Err(std::io::Error::other("injected sync failure").into());
         }
         self.sync_calls.fetch_add(1, Ordering::Relaxed);
+        self.record_scoped(ScopedIoCounts { flush_count: 1, ..Default::default() });
         self.file.sync_all()?;
         Ok(())
     }
@@ -272,6 +291,7 @@ impl Device {
         self.raw_read(start, &mut buffer.bytes_mut()[..(end - start) as usize])?;
         self.read_bytes.fetch_add(end - start, Ordering::Relaxed);
         self.read_calls.fetch_add(1, Ordering::Relaxed);
+        self.record_scoped(ScopedIoCounts { local_read_bytes: end - start, read_calls: 1, ..Default::default() });
         let within = (offset - start) as usize;
         output.copy_from_slice(&buffer.bytes()[within..within + output.len()]);
         Ok(())
@@ -307,6 +327,7 @@ impl Device {
         self.write_bytes
             .fetch_add(input.len() as u64, Ordering::Relaxed);
         self.write_calls.fetch_add(1, Ordering::Relaxed);
+        self.record_scoped(ScopedIoCounts { local_write_bytes: input.len() as u64, write_calls: 1, ..Default::default() });
         Ok(())
     }
     #[cfg(unix)]
@@ -467,54 +488,6 @@ mod windows {
         }
         u64::try_from(info.allocated)
             .map_err(|_| Error::Invalid("negative file allocation size".into()))
-    }
-    pub fn range_is_sparse(file: &File, offset: u64, length: u64) -> bool {
-        #[repr(C)]
-        struct Range {
-            offset: i64,
-            length: i64,
-        }
-        let input = Range {
-            offset: offset as i64,
-            length: length as i64,
-        };
-        let mut output = Range {
-            offset: 0,
-            length: 0,
-        };
-        let event = Event(unsafe { CreateEventW(std::ptr::null(), 1, 0, std::ptr::null()) });
-        if event.0.is_null() {
-            return false;
-        }
-        let mut ov = Overlapped {
-            internal: 0,
-            internal_high: 0,
-            offset: 0,
-            offset_high: 0,
-            event: event.0,
-        };
-        let mut done = 0;
-        let result = unsafe {
-            DeviceIoControl(
-                file.as_raw_handle(),
-                0x0009_40cf,
-                (&input as *const Range).cast(),
-                16,
-                (&mut output as *mut Range).cast(),
-                16,
-                &mut done,
-                &mut ov,
-            )
-        };
-        if result == 0 {
-            if std::io::Error::last_os_error().raw_os_error() != Some(997) {
-                return false;
-            }
-            if unsafe { GetOverlappedResult(file.as_raw_handle(), &mut ov, &mut done, 1) } == 0 {
-                return false;
-            }
-        }
-        done == 0
     }
     pub fn zero_range(file: &File, start: u64, end: u64) -> Result<()> {
         #[repr(C)]

@@ -15,7 +15,7 @@ const diskB={id:'disk-b',name:'已解锁测试盘',containerPath:'C:\\Mock\\jour
 const fixture=Array.from({length:700},(_,i)=>{
   const sequence=700-i;
   return {sequence,timestampUtc:new Date(Date.UTC(2026,9,4,12,0,sequence)).toISOString(),diskId:sequence%2===0?'disk-a':'disk-b',runId:'mock-run',kind:'sync',
-    action:sequence%7===0?'upload.failed':sequence%3===0?'object.reused':'upload.confirmed',level:sequence%7===0?'error':'info',
+    action:sequence===699?'preparation.indexing.completed':sequence===698?'preparation.sealing.interrupted':sequence===697?'preparation.root.started':sequence%7===0?'upload.failed':sequence%3===0?'object.reused':'upload.confirmed',level:sequence%7===0?'error':'info',
     message:sequence===700?'<img src=x onerror="window.__injected=true">':'已校验远端对象，记录本次传输结果。',
     objectId:'block-'+String(sequence).padStart(8,'0')+'-01234567-89ab-cdef-0123-456789abcdef',objectKind:'data',bytes:4194304,wireBytes:1024,generation:9};
 });
@@ -60,7 +60,15 @@ const initialState={connected:true,driverAvailable:true,account:null,disks:[disk
       let data=null;
       if(method==='app.state')data=structuredClone(state);
       if(method==='sync.diagnostics'){
-        data={phase:'uploading',message:'诊断 '+args.id,physical_read_bytes:4194304,api_requests:window.__bridgeRequests.filter(r=>r.method==='sync.diagnostics').length};
+        data={phase:'uploading',message:'诊断 '+args.id,physical_read_bytes:4194304,foreground_read_bytes:2097152,upload_read_bytes:8388608,seal_logical_zero_bytes:4194304,upload_zero_fill_bytes:4194304,seal_padding_write_bytes:99999,
+          receipt_log_bytes:12288,receipt_log_pages:3,receipt_log_flushes:3,receipt_log_objects:128,receipt_checkpoints:1,receipt_recovered_uncertain_tails:1,api_requests:window.__bridgeRequests.filter(r=>r.method==='sync.diagnostics').length,
+          preparation_diagnostics:window.__preparationOverride!==undefined?window.__preparationOverride:{job_id:'mock-run',scope:'process_session',
+            stages:{freeze:{local_read_bytes:4096,local_write_bytes:12288,read_calls:1,write_calls:3,flush_count:1,duration_ms:20,steps:1},
+              sealing:{local_read_bytes:8192,local_write_bytes:8192,read_calls:2,write_calls:2,flush_count:0,duration_ms:30,steps:2},
+              indexing:{local_read_bytes:12288,local_write_bytes:16384,read_calls:3,write_calls:4,flush_count:2,duration_ms:40,steps:3},
+              root:{local_read_bytes:4096,local_write_bytes:4096,read_calls:1,write_calls:1,flush_count:1,duration_ms:10,steps:1}},
+            totals:{local_read_bytes:28672,local_write_bytes:40960,read_calls:7,write_calls:10,flush_count:4,duration_ms:100,steps:7},
+            cache:{prepare_cache_limit_bytes:67108864,prepare_cache_used_bytes:8388608,prepare_cache_hits:23,prepare_cache_misses:4,prepare_cache_evictions:1,prepare_dependency_loads:2,prepare_seal_cached_pages:4,prepare_skipped_metadata_write_pages:7},batch_leaf_groups:256}};
         if(window.__failNextDiagnostic){window.__failNextDiagnostic=false;send({requestId,ok:false,error:'模拟诊断读取失败'});return;}
         if(window.__deferNextDiagnostic){window.__deferNextDiagnostic=false;window.__deferredDiagnostics.push(()=>send({requestId,ok:true,data}));return;}
       }
@@ -94,6 +102,11 @@ const initialState={connected:true,driverAvailable:true,account:null,disks:[disk
     assert.match(await page.locator('.journal-table tbody tr').first().innerText(),/4\.0 MiB/);
     assert.match(await page.locator('.journal-table tbody tr').first().innerText(),/压缩后 1.0 KiB/);
     checks.push('Object logs distinguish original object bytes from compressed wire bytes.');
+    assert.equal(await page.locator('[data-log-sequence="699"] .journal-message strong').innerText(),'增量索引完成');
+    assert.equal(await page.locator('[data-log-sequence="698"] .journal-message strong').innerText(),'对象封口中断');
+    assert.equal(await page.locator('[data-log-sequence="698"] .badge').innerText(),'已中断');
+    assert.equal(await page.locator('[data-log-sequence="697"] .journal-message strong').innerText(),'版本描述开始');
+    checks.push('Preparation stage lifecycle logs have readable labels; an interrupted stage is not shown as successful.');
     assert.equal(await page.locator('.journal-table img').count(),0);
     assert.match(await page.locator('.journal-retention').innerText(),/最多保留 65,536 条/);
     await page.evaluate(async()=>{window.__journalWarning='日志写入暂时失败，已有记录仍可查看。';await taskJournal.poll();});
@@ -134,6 +147,39 @@ const initialState={connected:true,driverAvailable:true,account:null,disks:[disk
     assert.match(await page.locator('.task-diagnostics-feedback').innerText(),/解锁这块磁盘/);assert.equal(await diagnosticCalls(),0);
     await page.locator('.task-diagnostics-disk').selectOption('disk-b');
     await page.waitForFunction(()=>document.querySelector('.task-diagnostics-values').textContent.includes('诊断 disk-b'));
+    const preparation=page.locator('.task-preparation-diagnostics'),cumulative=page.locator('.task-cumulative-diagnostics');
+    assert.match(await preparation.innerText(),/仅本次同步准备的本地读写，按当前进程累计；重启后重新计数/);
+    assert.equal(await preparation.locator('.task-preparation-totals [data-metric="local_read_bytes"] b').innerText(),'28.0 KiB');
+    assert.equal(await preparation.locator('.task-preparation-totals [data-metric="local_write_bytes"] b').innerText(),'40.0 KiB');
+    assert.equal(await preparation.locator('[data-preparation-stage]').count(),4);
+    assert.match(await preparation.locator('[data-preparation-stage="indexing"]').innerText(),/增量索引\s+12\.0 KiB\s+16\.0 KiB\s+3\s+4\s+2\s+40\s+3/);
+    assert.equal(await preparation.locator('[data-metric="prepare_cache_limit_bytes"] b').innerText(),'64.0 MiB');
+    assert.equal(await preparation.locator('[data-metric="prepare_cache_hits"] b').innerText(),'23');
+    assert.equal(await preparation.locator('[data-metric="batch_leaf_groups"] b').innerText(),'256');
+    assert.equal(await cumulative.locator('[data-metric="physical_read_bytes"] b').innerText(),'4.0 MiB');
+    assert.equal(await cumulative.locator('[data-metric="foreground_read_bytes"] b').innerText(),'2.0 MiB');
+    assert.equal(await cumulative.locator('[data-metric="physical_read_bytes"] span').innerText(),'实际磁盘读取');
+    assert.match(await cumulative.locator('[data-metric="upload_read_bytes"]').innerText(),/导出规范字节（含内存补零）\s+8\.0 MiB/);
+    assert.match(await cumulative.locator('[data-metric="seal_logical_zero_bytes"]').innerText(),/逻辑补零\s+4\.0 MiB/);
+    assert.match(await cumulative.locator('[data-metric="upload_zero_fill_bytes"]').innerText(),/上传补零\s+4\.0 MiB/);
+    assert.equal(await page.locator('[data-metric="seal_padding_write_bytes"]').count(),0);
+    assert.match(await cumulative.locator('[data-metric="receipt_log_bytes"]').innerText(),/回执日志写入\s+12\.0 KiB/);
+    assert.match(await cumulative.locator('[data-metric="receipt_log_pages"]').innerText(),/回执日志页数\s+3/);
+    assert.match(await cumulative.locator('[data-metric="receipt_log_flushes"]').innerText(),/回执日志刷盘次数\s+3/);
+    assert.match(await cumulative.locator('[data-metric="receipt_log_objects"]').innerText(),/回执确认对象数\s+128/);
+    assert.match(await cumulative.locator('[data-metric="receipt_checkpoints"]').innerText(),/回执检查点次数\s+1/);
+    assert.match(await cumulative.locator('[data-metric="receipt_recovered_uncertain_tails"]').innerText(),/回执异常尾恢复次数\s+1/);
+    checks.push('Export bytes include memory zero-fill without claiming extra physical reads or writes; receipt journal bytes, pages, flushes, confirmed objects, checkpoints and recovered tails are separate labeled counters.');
+    assert.equal(await preparation.locator('[data-metric="physical_read_bytes"],[data-metric="foreground_read_bytes"]').count(),0);
+    assert.equal(await cumulative.locator('[data-metric="local_read_bytes"]').count(),0);
+    checks.push('Preparation totals, four stages and cache usage are labeled with process-session scope; their task I/O is separate from larger disk and foreground counters.');
+    for(const value of [null,{}]){
+      await page.evaluate(async value=>{window.__preparationOverride=value;await taskMonitor.refresh();},value);
+      assert.equal(await preparation.count(),0);assert.match(await cumulative.innerText(),/诊断 disk-b/);
+    }
+    await page.evaluate(async()=>{delete window.__preparationOverride;await taskMonitor.refresh();});
+    assert.equal(await preparation.count(),1);
+    checks.push('Absent or empty preparation diagnostics preserve ordinary disk diagnostics without inventing zero-valued preparation work.');
     assert.equal(await page.evaluate(()=>localStorage.getItem('blockAutoRefresh')), 'false');
     const diagnosticRows=await page.locator('.journal-table tbody tr').evaluateAll(rows=>rows.map(row=>row.dataset.logSequence));
     await page.locator('.journal-scroll').evaluate(node=>node.scrollTop=140);

@@ -45,6 +45,14 @@ impl Spec {
 pub trait Storage {
     /// Must verify the referenced node's authenticated hash before returning.
     fn read_node(&mut self, reference: MetaRef) -> Result<Vec<u8>>;
+    /// Prefetch only the requested authenticated nodes; implementations may
+    /// combine adjacent physical reads without visiting additional subtrees.
+    fn prefetch_nodes(&mut self, _references: &[MetaRef]) -> Result<()> {
+        Ok(())
+    }
+    fn read_decoded(&mut self, spec: &Spec, reference: MetaRef) -> Result<Node> {
+        decode_at(spec, reference, &self.read_node(reference)?)
+    }
     fn write_node(&mut self, payload: &[u8]) -> Result<MetaRef>;
     /// Every new node is reported once, after its bytes have been written.
     fn created(
@@ -224,7 +232,7 @@ pub fn visit_node<S: Storage>(store: &mut S, spec: &Spec, reference: MetaRef) ->
     if reference.empty() {
         return Err(invalid("cannot visit an empty tree"));
     }
-    decode_at(spec, reference, &store.read_node(reference)?)
+    store.read_decoded(spec, reference)
 }
 
 fn load<S: Storage>(
@@ -299,6 +307,12 @@ fn get_many_at<S: Storage>(
         }
         Node::Branch { children, .. } => {
             let width = span(spec, level - 1);
+            let requested = children.iter().filter_map(|(slot, reference)| {
+                let child_base = base + *slot as u64 * width;
+                let first = keys.partition_point(|key| *key < child_base);
+                (first < keys.len() && keys[first] < child_base + width).then_some(*reference)
+            }).collect::<Vec<_>>();
+            store.prefetch_nodes(&requested)?;
             let mut start = 0;
             while start < keys.len() {
                 let slot = ((keys[start] - base) / width) as u8;
@@ -626,6 +640,71 @@ pub fn scan_after<S: Storage>(
         }
     }
     Ok(output)
+}
+
+/// Bound traversal at the leaves themselves. Unlike reading Limit rows and
+/// truncating afterwards, this never visits the discarded remainder of a batch.
+pub fn scan_after_leaves<S: Storage>(
+    store: &mut S,
+    spec: &Spec,
+    root: MetaRef,
+    start: u64,
+    limit: usize,
+    max_leaves: usize,
+) -> Result<Vec<(u64, Vec<u8>)>> {
+    let capacity = spec.capacity()?;
+    check_reference(root)?;
+    let mut output = Vec::new();
+    let mut remaining = max_leaves;
+    if limit != 0 && remaining != 0 && start < capacity && !root.empty() {
+        let depth = root_level(store, spec, root)?;
+        if start < span(spec, depth) {
+            scan_leaves(store, spec, root, depth, 0, start, limit, &mut remaining, &mut output)?;
+        }
+    }
+    Ok(output)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn scan_leaves<S: Storage>(
+    store: &mut S,
+    spec: &Spec,
+    root: MetaRef,
+    level: u8,
+    base: u64,
+    start: u64,
+    limit: usize,
+    remaining: &mut usize,
+    output: &mut Vec<(u64, Vec<u8>)>,
+) -> Result<()> {
+    if *remaining == 0 || output.len() == limit {
+        return Ok(());
+    }
+    match load(store, spec, root, level, base)? {
+        Node::Leaf { values, .. } => {
+            if !values.iter().any(|(slot, _)| base + *slot as u64 >= start) {
+                return Ok(());
+            }
+            *remaining -= 1;
+            for (slot, value) in values {
+                let key = base + slot as u64;
+                if key >= start {
+                    output.push((key, value));
+                    if output.len() == limit { break; }
+                }
+            }
+        }
+        Node::Branch { children, .. } => {
+            let width = span(spec, level - 1);
+            for (slot, child) in children {
+                let child_base = base + slot as u64 * width;
+                if child_base + width <= start { continue; }
+                scan_leaves(store, spec, child, level - 1, child_base, start, limit, remaining, output)?;
+                if *remaining == 0 || output.len() == limit { break; }
+            }
+        }
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1005,6 +1084,69 @@ mod tests {
     }
     fn value(number: u64) -> Vec<u8> {
         number.to_le_bytes().to_vec()
+    }
+    #[test]
+    fn leaf_budget_stops_before_unconsumed_changes_and_resumes_exactly() {
+        let mut store = Memory::default();
+        let specification = spec(5, false);
+        let changes = (0..4096).map(|n| (n * 32, Some(value(n)))).collect::<Vec<_>>();
+        let root = set_many(&mut store, &specification, MetaRef::default(), &changes).unwrap();
+        store.reads = 0;
+        let all = scan_after(&mut store, &specification, root, 0, 4096).unwrap();
+        let overread = store.reads;
+        store.reads = 0;
+        let first = scan_after_leaves(&mut store, &specification, root, 0, 4096, 128).unwrap();
+        assert_eq!(first.len(), 128);
+        assert!(store.reads < overread / 16, "leaf budget still reads the discarded tail");
+        let mut actual = first;
+        loop {
+            let cursor = actual.last().map_or(0, |(key, _)| key + 1);
+            let next = scan_after_leaves(&mut store, &specification, root, cursor, 4096, 128).unwrap();
+            if next.is_empty() { break; }
+            actual.extend(next);
+        }
+        assert_eq!(actual, all);
+        // A cursor inside an exhausted leaf must not spend the only leaf budget
+        // and mistakenly report end-of-tree before the following leaf.
+        let one = scan_after_leaves(&mut store, &specification, root, 1, 4096, 1).unwrap();
+        assert_eq!(one, vec![(32, value(1))]);
+        assert!(scan_after_leaves(&mut store, &specification, root, 0, 4096, 0).unwrap().is_empty());
+    }
+    #[test]
+    fn dense_leaf_page_limits_resume_without_missing_or_repeating_rows() {
+        let mut store = Memory::default();
+        let specification = spec(5, false);
+        let capacity = specification.capacity().unwrap();
+        // Dense leaves, a gap followed by a branch boundary, and the final key
+        // exercise both partial-leaf batches and an exhausted key space.
+        let expected = (0..129)
+            .chain(2045..2082)
+            .chain(capacity - 35..capacity)
+            .map(|key| (key, value(key * 17)))
+            .collect::<Vec<_>>();
+        let changes = expected.iter().map(|(key, row)| (*key, Some(row.clone()))).collect::<Vec<_>>();
+        let root = set_many(&mut store, &specification, MetaRef::default(), &changes).unwrap();
+        for max_pages in [1, 31, 33] {
+            for max_leaves in [1, 2, 128] {
+                for start in [0, 1, 31, 32, 33, 128, 129, 2047, 2048, capacity - 33, capacity - 1, capacity] {
+                    let wanted = expected.iter().filter(|(key, _)| *key >= start).cloned().collect::<Vec<_>>();
+                    let mut actual = Vec::new();
+                    let mut cursor = start;
+                    loop {
+                        let batch = scan_after_leaves(&mut store, &specification, root, cursor, max_pages, max_leaves).unwrap();
+                        if batch.is_empty() { break; }
+                        assert!(batch.len() <= max_pages);
+                        assert!(batch.iter().map(|(key, _)| key >> specification.leaf_bits).collect::<BTreeSet<_>>().len() <= max_leaves);
+                        assert!(batch.first().unwrap().0 >= cursor);
+                        assert!(batch.windows(2).all(|rows| rows[0].0 < rows[1].0));
+                        cursor = batch.last().unwrap().0 + 1;
+                        actual.extend(batch);
+                        assert!(actual.len() <= wanted.len(), "scan repeated rows: pages={max_pages}, leaves={max_leaves}, start={start}");
+                    }
+                    assert_eq!(actual, wanted, "scan lost or changed rows: pages={max_pages}, leaves={max_leaves}, start={start}");
+                }
+            }
+        }
     }
     fn random(seed: &mut u64) -> u64 {
         *seed ^= *seed << 13;

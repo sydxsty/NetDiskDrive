@@ -10,8 +10,10 @@ public sealed class SyncCoordinator(CloudRepository repository)
         => sink?.Report(new(DateTimeOffset.UtcNow, action, message, level, item?.Id, item?.Kind, item?.Length, generation) { WireBytes = wireBytes });
 
     public async Task<SyncResult> RunAsync(ICloudVolume volume, CloudBinding binding, string name, ulong capacity, bool encrypted,
-        int concurrency, IProgress<TransferProgress>? progress, CancellationToken ct, IProgress<SyncLogEntry>? log = null)
+        int concurrency, IProgress<TransferProgress>? progress, CancellationToken ct, IProgress<SyncLogEntry>? log = null,
+        int prepareCacheMiB = SyncPreparationLimits.DefaultCacheMiB)
     {
+        SyncPreparationLimits.ValidateCacheMiB(prepareCacheMiB);
         int objectSize = VolumeObjectSize(volume);
         var scope = repository.Scope(binding, volume.Id);
         await using var lease = await repository.Cache.AcquireAsync(scope, ct);
@@ -27,26 +29,41 @@ public sealed class SyncCoordinator(CloudRepository repository)
         if (NoJob(initial) && !Dirty(initial) && GetLong(initial, "data_generation") == GetLong(initial, "published_generation") && cache.Latest is not null)
             return await UnchangedAsync(volume, binding, cache, progress, log, ct);
 
-        JsonElement job = NoJob(initial)
-            ? Unwrap(await volume.ControlAsync(new { cmd = "cloud.prepare" }, ct), "job")
-            : initial.GetProperty("job").Clone();
-        if (job.ValueKind == JsonValueKind.Null)
+        var preparationLog = new PreparationLogTracker(log);
+        JsonElement job;
+        string jobId;
+        try
         {
-            var current = Unwrap(await volume.ControlAsync(new { cmd = "cloud.status" }, ct), "status");
-            await ReconcileAsync(volume, binding, cache, current, log, ct);
-            return await UnchangedAsync(volume, binding, cache, progress, log, ct);
-        }
-        string jobId = job.GetProperty("id").GetString()!;
-        ValidateNativeGeometry(job, objectSize);
-        Log(log, "preparing.started", "固定本次版本，处理变更对象和增量索引；不扫描未变化的数据页");
-        while (GetText(job, "phase") == "preparing")
-        {
-            ct.ThrowIfCancellationRequested();
-            progress?.Report(PreparationProgress(job));
-            job = Unwrap(await volume.ControlAsync(new { cmd = "cloud.prepare", job_id = jobId, max_pages = 4096, max_objects = 2 }, ct), "job");
+            if (NoJob(initial))
+            {
+                preparationLog.BeginFreeze();
+                job = Unwrap(await volume.ControlAsync(new { cmd = "cloud.prepare", prepare_cache_mib = prepareCacheMiB,
+                    max_pages = 16384, max_leaf_groups = 512, max_objects = 2 }, ct), "job");
+            }
+            else job = initial.GetProperty("job").Clone();
+            if (job.ValueKind == JsonValueKind.Null)
+            {
+                preparationLog.NoChanges();
+                var current = Unwrap(await volume.ControlAsync(new { cmd = "cloud.status" }, ct), "status");
+                await ReconcileAsync(volume, binding, cache, current, log, ct);
+                return await UnchangedAsync(volume, binding, cache, progress, log, ct);
+            }
             ValidateNativeGeometry(job, objectSize);
-            await Task.Yield();
+            jobId = job.GetProperty("id").GetString()!;
+            Log(log, "preparing.started", $"固定本次版本，处理变更对象和增量索引；当前磁盘整理缓存上限 {prepareCacheMiB} MiB，不扫描未变化的数据页");
+            preparationLog.Observe(job);
+            while (GetText(job, "phase") == "preparing")
+            {
+                ct.ThrowIfCancellationRequested();
+                progress?.Report(PreparationProgress(job));
+                job = Unwrap(await volume.ControlAsync(new { cmd = "cloud.prepare", job_id = jobId,
+                    prepare_cache_mib = prepareCacheMiB, max_pages = 16384, max_leaf_groups = 512, max_objects = 2 }, ct), "job");
+                ValidateNativeGeometry(job, objectSize);
+                preparationLog.Observe(job);
+                await Task.Yield();
+            }
         }
+        catch (Exception error) { preparationLog.Interrupt(error); throw; }
         string rootId = job.GetProperty("root_object_id").GetString() ?? throw new IOException("导出根对象尚未准备完成。");
         string rootHash = job.GetProperty("root_sha256").GetString()!;
         ulong generation = job.GetProperty("generation").GetUInt64();

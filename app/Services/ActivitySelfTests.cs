@@ -9,6 +9,7 @@ internal static class ActivitySelfTests
         if (Directory.Exists(output)) throw new IOException("请使用新的日志测试目录。");
         Directory.CreateDirectory(output);
         var checks = new List<string>();
+        CheckBufferedFlushes(output, checks);
         string path = Path.Combine(output, "journal");
         using (var journal = new ActivityJournal(path, 16, 4))
         {
@@ -60,6 +61,78 @@ internal static class ActivitySelfTests
         }
         File.WriteAllText(Path.Combine(output, "result.json"), JsonSerializer.Serialize(new { passed = true, checks }));
         Console.WriteLine("ACTIVITY_SMOKE_OK"); return 0;
+    }
+    private static void CheckBufferedFlushes(string output, List<string> checks)
+    {
+        string folder = Path.Combine(output, "buffered");
+        var clock = new JournalClock();
+        var journal = new ActivityJournal(folder, 64, 4, clock, TimeSpan.FromMilliseconds(250), 16);
+        try
+        {
+            for (int i = 0; i < 15; i++) journal.Append("disk", "run", "sync", "upload.confirmed", "已确认 " + i);
+            Check(journal.Read().Items.Count == 15 && journal.BufferDiagnostics() == (15, 0L), "缓冲期间界面不可见或每条活动都执行了flush");
+            clock.Advance(TimeSpan.FromMilliseconds(249));
+            Check(journal.BufferDiagnostics().Flushes == 0, "活动日志在时间/数量边界前刷写");
+            journal.Append("disk", "run", "sync", "upload.confirmed", "批次边界");
+            string file = Directory.GetFiles(folder).Single();
+            Check(journal.BufferDiagnostics() == (0, 1L) && ReadOpenLogLines(file) == 16, "同批活动没有合并为一次flush");
+            journal.Append("disk", "run", "sync", "upload.confirmed", "时间窗口开始");
+            clock.Advance(TimeSpan.FromMilliseconds(100));
+            journal.Append("disk", "run", "sync", "upload.confirmed", "后续记录不推迟截止时间");
+            clock.Advance(TimeSpan.FromMilliseconds(150));
+            Check(journal.BufferDiagnostics() == (0, 2L) && ReadOpenLogLines(file) == 18, "定时flush被后续日志无限推迟或重复执行");
+            journal.Append("disk", "run", "sync", "commit.confirmed", "退出前缓冲");
+            Check(journal.Read().Items.Count == 19 && journal.BufferDiagnostics() == (1, 2L), "退出前记录未立即显示");
+            journal.Dispose();
+            Check(journal.BufferDiagnostics() == (0, 3L), "Dispose未合并写出最后的缓冲记录");
+            clock.Advance(TimeSpan.FromSeconds(1));
+            Check(journal.BufferDiagnostics().Flushes == 3, "Dispose后仍运行定时写入");
+            using var reopened = new ActivityJournal(folder, 64, 4);
+            Check(reopened.Read().Items.Count == 19, "时间/批次/退出刷写后重开丢失完整日志");
+            checks.Add("activity is immediately visible in memory; 19 records use three explicit buffer flushes at batch, fixed timer deadline and Dispose, with complete restart recovery");
+        }
+        finally { journal.Dispose(); }
+    }
+
+    private static int ReadOpenLogLines(string path)
+    {
+        using var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
+        using var reader = new StreamReader(stream);
+        int count = 0; while (reader.ReadLine() is not null) count++;
+        return count;
+    }
+
+    private sealed class JournalClock : TimeProvider
+    {
+        private long ticks;
+        private readonly List<JournalTimer> timers = [];
+        public override ITimer CreateTimer(TimerCallback callback, object? state, TimeSpan dueTime, TimeSpan period)
+        {
+            var timer = new JournalTimer(this, callback, state); timers.Add(timer); timer.Change(dueTime, period); return timer;
+        }
+        internal void Advance(TimeSpan elapsed)
+        {
+            ticks += elapsed.Ticks;
+            foreach (var timer in timers.ToArray()) timer.Fire(ticks);
+        }
+        private sealed class JournalTimer(JournalClock clock, TimerCallback callback, object? state) : ITimer
+        {
+            private long? due;
+            private bool disposed;
+            public bool Change(TimeSpan dueTime, TimeSpan period)
+            {
+                Check(period == Timeout.InfiniteTimeSpan, "活动日志测试要求一次性截止时间");
+                if (disposed) return false;
+                due = dueTime == Timeout.InfiniteTimeSpan ? null : clock.ticks + dueTime.Ticks; return true;
+            }
+            internal void Fire(long now)
+            {
+                if (disposed || due is not { } deadline || now < deadline) return;
+                due = null; callback(state);
+            }
+            public void Dispose() { disposed = true; due = null; }
+            public ValueTask DisposeAsync() { Dispose(); return ValueTask.CompletedTask; }
+        }
     }
     private static void Check(bool condition, string message) { if (!condition) throw new IOException(message); }
 }
