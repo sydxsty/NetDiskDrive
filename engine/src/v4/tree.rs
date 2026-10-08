@@ -630,13 +630,28 @@ pub fn scan_after<S: Storage>(
     start: u64,
     limit: usize,
 ) -> Result<Vec<(u64, Vec<u8>)>> {
+    scan_range(store, spec, root, start, u64::MAX, limit)
+}
+
+/// Like scan_after, but never opens a branch outside [start, end). In a lazy
+/// tree even discovering the first row beyond the window could download an
+/// otherwise unrelated metadata object.
+pub fn scan_range<S: Storage>(
+    store: &mut S,
+    spec: &Spec,
+    root: MetaRef,
+    start: u64,
+    end: u64,
+    limit: usize,
+) -> Result<Vec<(u64, Vec<u8>)>> {
     let capacity = spec.capacity()?;
     check_reference(root)?;
     let mut output = Vec::new();
-    if limit != 0 && start < capacity && !root.empty() {
+    let end = end.min(capacity);
+    if limit != 0 && start < end && !root.empty() {
         let depth = root_level(store, spec, root)?;
         if start < span(spec, depth) {
-            scan(store, spec, root, depth, 0, start, limit, &mut output)?;
+            scan(store, spec, root, depth, 0, start, end, limit, &mut output)?;
         }
     }
     Ok(output)
@@ -715,6 +730,7 @@ fn scan<S: Storage>(
     level: u8,
     base: u64,
     start: u64,
+    end: u64,
     limit: usize,
     output: &mut Vec<(u64, Vec<u8>)>,
 ) -> Result<()> {
@@ -722,7 +738,7 @@ fn scan<S: Storage>(
         Node::Leaf { values, .. } => {
             for (slot, value) in values {
                 let key = base + slot as u64;
-                if key >= start {
+                if key >= start && key < end {
                     output.push((key, value));
                     if output.len() == limit {
                         break;
@@ -734,6 +750,7 @@ fn scan<S: Storage>(
             let width = span(spec, level - 1);
             for (slot, child) in children {
                 let child_base = base + slot as u64 * width;
+                if child_base >= end { break; }
                 if child_base + width <= start {
                     continue;
                 }
@@ -744,6 +761,7 @@ fn scan<S: Storage>(
                     level - 1,
                     child_base,
                     start,
+                    end,
                     limit,
                     output,
                 )?;

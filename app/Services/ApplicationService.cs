@@ -521,8 +521,16 @@ public sealed partial class ApplicationService : IApplicationService
                     var source = Element(await worker.InvokeAsync("cache.source", Element(new { id = request.DiskId, object_id = request.ObjectId }), linked.Token));
                     string remoteRoot = CacheSourcePolicy.ValidateRequest(source, request, client is null ? null : account?.AccountId);
                     var repository = Repository();
-                    Log(request.DiskId, "", "download", request.Prefetch ? "prefetch.started" : "demand.started",
-                        request.Prefetch ? "预取即将访问的云端块" : "等待网盘下载当前读写所需的块", objectId: request.ObjectId, bytes: request.Length);
+                    string purpose = request.Prefetch ? "顺序预取" : request.Reason switch
+                    {
+                        "sync" => "同步修改路径", "copy_publish" => "首次发布独立副本", "write" => "前台写入",
+                        "reclaim" => "手动回收", "replica" => "加载云端快照", _ => "前台读取"
+                    };
+                    string type = request.ObjectKind switch { "metadata" => "容器索引", "data" => "数据对象", _ => "云端对象" };
+                    string downloadRunId = request.Reason is "sync" or "copy_publish"
+                        ? runs.Values.FirstOrDefault(r => r.DiskId == request.DiskId && r.Kind == "sync" && r.Task is { IsCompleted: false })?.Id ?? "" : "";
+                    Log(request.DiskId, downloadRunId, "download", request.Prefetch ? "prefetch.started" : "demand.started",
+                        $"{purpose}：等待下载{type}", objectId: request.ObjectId, objectKind: request.ObjectKind, bytes: request.Length);
                     try
                     {
                         var downloaded = await repository.ReadObjectForReplicaAsync(remoteRoot, request.ObjectId, request.Sha256, request.Length, linked.Token);
@@ -534,14 +542,15 @@ public sealed partial class ApplicationService : IApplicationService
                             var restoring = runs.Values.FirstOrDefault(r => r.Kind == "restore" && r.DiskId == request.DiskId && r.Task is { IsCompleted: false });
                             if (restoring != null) Interlocked.Add(ref restoring.DownloadedBytes, downloaded.WireBytes);
                         }
-                        Log(request.DiskId, "", "download", request.Prefetch ? "prefetch.verified" : "demand.verified",
-                            "云端块已通过长度和摘要校验，正在交给磁盘缓存", objectId: request.ObjectId, bytes: bytes.Length, wireBytes: downloaded.WireBytes);
+                        Log(request.DiskId, downloadRunId, "download", request.Prefetch ? "prefetch.verified" : "demand.verified",
+                            $"{purpose}：{type}已通过长度和摘要校验，正在交给磁盘缓存", objectId: request.ObjectId, objectKind: request.ObjectKind, bytes: bytes.Length, wireBytes: downloaded.WireBytes);
                         return bytes;
                     }
                     catch (OperationCanceledException) { throw; }
                     catch (Exception error)
                     {
-                        Log(request.DiskId, "", "download", "download.failed", Friendly(error), "error", request.ObjectId);
+                        Log(request.DiskId, downloadRunId, "download", "download.failed", $"{purpose}：{type}下载失败；{Friendly(error)}",
+                            "error", request.ObjectId, objectKind: request.ObjectKind);
                         throw;
                     }
                 }

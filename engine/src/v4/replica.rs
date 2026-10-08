@@ -7,6 +7,42 @@ use super::tree::{self, Node};
 use super::*;
 use serde_json::{json, Value};
 
+/// Boolean values are the existing local catalog states. The explicit anchor
+/// marker deliberately cannot be opened by older writers: they would otherwise
+/// replace our partial publication counts with the original source's counts.
+/// This only changes local control metadata, never a cloud object or index.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum CountCoverage {
+    Deferred,
+    Complete,
+    SourceAnchor,
+}
+impl CountCoverage {
+    pub fn is_complete(self) -> bool { self == Self::Complete }
+}
+impl Serialize for CountCoverage {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
+        match self {
+            Self::Deferred => serializer.serialize_bool(false),
+            Self::Complete => serializer.serialize_bool(true),
+            Self::SourceAnchor => serializer.serialize_str("source_anchor_v1"),
+        }
+    }
+}
+impl<'de> Deserialize<'de> for CountCoverage {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum State { Complete(bool), Mode(String) }
+        match State::deserialize(deserializer)? {
+            State::Complete(false) => Ok(Self::Deferred),
+            State::Complete(true) => Ok(Self::Complete),
+            State::Mode(mode) if mode == "source_anchor_v1" => Ok(Self::SourceAnchor),
+            _ => Err(serde::de::Error::custom("unsupported source reference accounting")),
+        }
+    }
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 pub(super) struct IdentityRegion {
     pub offset: u64,
@@ -35,7 +71,7 @@ pub(super) struct Replica {
     pub root_sha256: String,
     pub generation: u64,
     pub local_baseline_generation: u64,
-    pub counts_complete: bool,
+    pub counts_complete: CountCoverage,
     pub pins: Vec<Value>,
     pub identity: Vec<IdentityRegion>,
     pub identity_ready: bool,
@@ -302,7 +338,7 @@ impl Volume {
             json!({"enabled":true,"mode":r.mode,"source_volume_id":r.source_volume_id,"root_object_id":r.root_object_id,
             "root_sha256":r.root_sha256,"generation":r.generation,"local_revision":reader.root.data_generation,
             "local_changes":reader.root.data_generation != r.local_baseline_generation || self.has_local_dirty(),
-            "index_complete":r.counts_complete,"verification":"on_access","mount_ready":!reader.root.restore_required,
+            "index_complete":r.counts_complete.is_complete(),"reference_accounting":if r.counts_complete == CountCoverage::SourceAnchor {"source_anchor"} else if r.counts_complete.is_complete() {"complete"} else {"deferred"},"verification":"on_access","mount_ready":!reader.root.restore_required,
             "identity_ready":r.mode!="copy" || r.identity_ready,
             "backing":c.lazy_backing,"candidate":r.candidate,"commit":r.commit,"retained_sources":r.pins.len()}),
         )
@@ -332,7 +368,7 @@ impl Volume {
             root_sha256: r.root_sha256.clone(),
             generation: r.generation,
             local_baseline_generation: r.generation.max(u64::from(r.mode == "copy")),
-            counts_complete: r.phase == "complete",
+            counts_complete: if r.phase == "complete" { CountCoverage::Complete } else { CountCoverage::Deferred },
             pins: c.lazy_backing.iter().cloned().collect(),
             identity: vec![],
             identity_ready: false,
@@ -591,7 +627,7 @@ impl Volume {
             s.cloud = c;
             (index, depth, token)
         };
-        let count = self.with_hydration(|| {
+        let count = self.with_hydration_reason("replica", || {
             let (_lease, mut reader) = self.read_context()?;
             if !index.empty() && tree::root_level(&mut reader, &PORTMAP, index)? as u64 != depth {
                 return Err(integrity("replica root index depth"));
@@ -680,7 +716,7 @@ impl Volume {
         } else {
             new_generation
         };
-        r.counts_complete = false;
+        r.counts_complete = CountCoverage::Deferred;
         r.candidate = None;
         r.commit = Some(candidate.commit.clone());
         r.identity.clear();
@@ -738,14 +774,15 @@ impl Volume {
         Ok(())
     }
 
-    /// Optional existing upload is the only consumer requiring the complete
-    /// baseline catalog. Ordinary import/read/pull never calls this traversal.
-    pub(super) fn materialize_replica_counts(&self) -> Result<()> {
+    /// An original writer reuses its pinned cloud objects without enumerating
+    /// them. Only explicitly publishing a copy into a different repository
+    /// requires discovering the full set of objects that must be copied there.
+    pub(super) fn prepare_replica_counts(&self) -> Result<()> {
         let replica = {
             let s = self.shared.store.lock().map_err(|_| Error::Poisoned)?;
             match &s.cloud.replica {
                 Some(r)
-                    if !r.counts_complete
+                    if !r.counts_complete.is_complete()
                         && (s.root.changed_pages != 0 || s.cloud.base_root != 0) =>
                 {
                     r.clone()
@@ -753,7 +790,29 @@ impl Volume {
                 _ => return Ok(()),
             }
         };
-        let depth = self.with_hydration(|| {
+        if replica.mode == "original" {
+            let mut s = self.shared.store.lock().map_err(|_| Error::Poisoned)?;
+            let mut c = s.cloud.clone();
+            let backing = c.lazy_backing.as_ref().ok_or_else(|| invalid("source anchor missing"))?;
+            let binding = c.binding.as_ref().ok_or_else(|| invalid("source writer missing"))?;
+            if backing["provider_id"] != binding["backend_id"]
+                || backing["account_id"] != binding["account_id"]
+                || backing["remote_root"] != binding["remote_root"]
+                || backing["source_volume_id"] != s.config.id.to_string()
+                || backing["reader_pin"].as_str().is_none_or(str::is_empty)
+                || !replica.pins.iter().any(|pin| pin == backing)
+            {
+                return Err(invalid("inherited objects require the original pinned cloud repository"));
+            }
+            let r = c.replica.as_mut().ok_or_else(|| invalid("replica changed"))?;
+            if r.counts_complete != CountCoverage::SourceAnchor {
+                r.counts_complete = CountCoverage::SourceAnchor;
+                s.transaction(|tx| tx.save_cloud(&c))?;
+                s.cloud = c;
+            }
+            return Ok(());
+        }
+        let depth = self.with_hydration_reason("copy_publish", || {
             let (_lease, mut reader) = self.read_context()?;
             tree::root_level(&mut reader, &PORTMAP, replica.source_index)
         })?;
@@ -766,7 +825,7 @@ impl Volume {
             if reference.empty() {
                 continue;
             }
-            let node = self.with_hydration(|| {
+            let node = self.with_hydration_reason("copy_publish", || {
                 let (_lease, mut reader) = self.read_context()?;
                 tree::visit_node(&mut reader, &PORTMAP, reference)
             })?;
@@ -823,8 +882,7 @@ impl Volume {
         if r.root_object_id != replica.root_object_id {
             return Err(invalid("replica changed during catalog validation"));
         }
-        r.counts_complete = true;
-        let original = r.mode == "original";
+        r.counts_complete = CountCoverage::Complete;
         s.transaction(|tx| {
             let mut root = MetaRef::default();
             let rows = counts
@@ -834,13 +892,8 @@ impl Volume {
             for batch in rows.chunks(256) {
                 root = tx.set(&COUNTS, root, batch)?;
             }
-            if original {
-                tx.replace(&COUNTS, c.published_counts, MetaRef::default());
-                c.published_counts = root;
-            } else {
-                tx.replace(&COUNTS, c.base_counts, MetaRef::default());
-                c.base_counts = root;
-            }
+            tx.replace(&COUNTS, c.base_counts, MetaRef::default());
+            c.base_counts = root;
             tx.save_cloud(&c)
         })?;
         s.cloud = c;

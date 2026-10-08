@@ -36,9 +36,10 @@ function renderLazyCache(d){
  const haveCounts=lazy.cached_objects!=null||lazy.missing_objects!=null||cache.missing_objects!=null;
  const summary=!d.unlocked&&!haveCounts?'解锁后查看缓存数量；文件内容按需加载':lazy.enabled||cache.source_ready||d.lazySource?`已缓存 ${cached} 块 · ${incomplete?'已知待下载 '+missing+' 块，未展开部分按需加载':'待按需下载 '+missing+' 块'}`:'解锁后查看缓存状态';
  const active=job.activeRequests||job.pendingRequests?` · ${Number(job.activeRequests||0)} 个读取中 / ${Number(job.pendingRequests||0)} 个等待中`:'';
+ const downloaded=job.metadataDownloadedBytes||job.dataDownloadedBytes?`<div class="description">本次打开已下载（解压后）：容器索引 ${bytes(job.metadataDownloadedBytes||0)} · 数据 ${bytes(job.dataDownloadedBytes||0)}</div>`:'';
  const limit=Number(config.limitBytes||0),used=cache.allocated_bytes;
  const quota=limit?`<div class="facts"><span>本地占用 ${used==null?'解锁后查看':bytes(used)} / 上限 ${bytes(limit)}</span><span>${esc(cachePolicies[config.policy]||cachePolicies.lru)}</span></div>${used==null?'':progress(used,limit)}<div class="description">${Number(cache.over_limit_bytes||0)>0?'暂超上限 '+bytes(cache.over_limit_bytes)+'；未同步内容、索引和当前使用中的数据会保留。':'超过上限时自动移除已有云端副本的缓存，访问时再下载。'}${!cache.source_ready&&!cache.origin_ready?' 等待同步完成并确认云端读取来源。':''}</div>`:'';
- return `<div class="lazy-cache-status"><div class="facts"><span>${esc(summary+active)}</span>${badge(limit?'按上限缓存':'按需加载','blue')}</div>${quota}${job.prefetching?'<div class="description">正在预取附近内容</div>':''}${job.lastError?`<div class="error-text">${esc(job.lastError)}</div>`:''}${d.cacheError?`<div class="error-text">${esc(d.cacheError)}</div>`:''}</div>`;
+ return `<div class="lazy-cache-status"><div class="facts"><span>${esc(summary+active)}</span>${badge(limit?'按上限缓存':'按需加载','blue')}</div>${quota}${downloaded}${job.prefetching?'<div class="description">正在预取附近内容</div>':''}${job.lastError?`<div class="error-text">${esc(job.lastError)}</div>`:''}${d.cacheError?`<div class="error-text">${esc(d.cacheError)}</div>`:''}</div>`;
 }
 function replicaBusy(d){return replicaRequests.has(d?.id)||['checking','preparing','downloading','ready','applying','switching'].includes(d?.replica?.state);}
 function renderReplicaStatus(d){

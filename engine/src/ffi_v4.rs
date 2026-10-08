@@ -176,6 +176,7 @@ pub type ODObjectProvider = unsafe extern "C" fn(
     context: *mut c_void,
     object_id: *const c_char,
     sha256: *const c_char,
+    request_context: *const c_char,
     output: *mut u8,
     length: u32,
     error: *mut c_char,
@@ -183,7 +184,7 @@ pub type ODObjectProvider = unsafe extern "C" fn(
 ) -> i32;
 
 #[no_mangle]
-pub unsafe extern "C" fn od_v4_set_object_provider(
+pub unsafe extern "C" fn od_v4_set_object_provider_with_context(
     h: *mut c_void,
     callback: Option<ODObjectProvider>,
     context: *mut c_void,
@@ -200,12 +201,15 @@ pub unsafe extern "C" fn od_v4_set_object_provider(
                     .map_err(|_| crate::v4::Error::Invalid("provider object id".into()))?;
                 let sha = CString::new(object.sha256.as_str())
                     .map_err(|_| crate::v4::Error::Invalid("provider object hash".into()))?;
+                let request_context = CString::new(serde_json::json!({"kind":object.kind,"reason":object.reason}).to_string())
+                    .map_err(|_| crate::v4::Error::Invalid("provider request context".into()))?;
                 let mut error = [0u8; 1024];
                 let status = unsafe {
                     callback(
                         address as *mut c_void,
                         id.as_ptr(),
                         sha.as_ptr(),
+                        request_context.as_ptr(),
                         output.as_mut_ptr(),
                         output.len() as u32,
                         error.as_mut_ptr().cast(),
@@ -927,6 +931,7 @@ mod tests {
             context: *mut c_void,
             _: *const c_char,
             _: *const c_char,
+            _: *const c_char,
             _: *mut u8,
             _: u32,
             _: *mut c_char,
@@ -942,7 +947,7 @@ mod tests {
             success(od_v4_create(path.as_ptr(), 64 << 20, ptr::null()));
             let disk = Disk(od_v4_open(path.as_ptr(), ptr::null()));
             let calls = std::sync::atomic::AtomicUsize::new(0);
-            success(od_v4_set_object_provider(
+            success(od_v4_set_object_provider_with_context(
                 disk.0,
                 Some(unexpected_provider),
                 &calls as *const _ as *mut c_void,
@@ -956,10 +961,10 @@ mod tests {
             ));
             assert_eq!(bytes, [0; 512]);
             assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
-            success(od_v4_set_object_provider(disk.0, None, ptr::null_mut()));
-            assert!(od_v4_set_object_provider(ptr::null_mut(), None, ptr::null_mut()) < 0);
+            success(od_v4_set_object_provider_with_context(disk.0, None, ptr::null_mut()));
+            assert!(od_v4_set_object_provider_with_context(ptr::null_mut(), None, ptr::null_mut()) < 0);
             // Close also unregisters a provider, even without an explicit final NULL call.
-            success(od_v4_set_object_provider(
+            success(od_v4_set_object_provider_with_context(
                 disk.0,
                 Some(unexpected_provider),
                 &calls as *const _ as *mut c_void,

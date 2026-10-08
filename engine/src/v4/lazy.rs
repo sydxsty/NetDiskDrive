@@ -9,6 +9,8 @@ pub struct RemoteObject {
     pub id: String,
     pub sha256: String,
     pub length: u64,
+    pub kind: &'static str,
+    pub reason: &'static str,
 }
 impl RemoteObject {
     pub(super) fn from_object(o: &Object, object_size: u64) -> Self {
@@ -16,7 +18,15 @@ impl RemoteObject {
             id: o.id.to_string(),
             sha256: codec::hex(&o.sha),
             length: object_size,
+            kind: match o.kind { 1 => "data", 2 => "metadata", _ => "unknown" },
+            reason: "read",
         }
+    }
+    pub(super) fn index(o: &Object, object_size: u64) -> Self {
+        Self { kind: "metadata", ..Self::from_object(o, object_size) }
+    }
+    pub(super) fn data(o: &Object, object_size: u64) -> Self {
+        Self { kind: "data", ..Self::from_object(o, object_size) }
     }
 }
 pub type ObjectProvider = dyn Fn(&RemoteObject, &mut [u8]) -> Result<()> + Send + Sync;
@@ -162,13 +172,17 @@ impl Volume {
         import(&self.shared, object, bytes)
     }
     pub(super) fn with_hydration<T>(&self, mut run: impl FnMut() -> Result<T>) -> Result<T> {
+        self.with_hydration_reason("read", &mut run)
+    }
+    pub(super) fn with_hydration_reason<T>(&self, reason: &'static str, mut run: impl FnMut() -> Result<T>) -> Result<T> {
         let mut pins = Vec::new();
         loop {
             // Keep the old logical view protected until its missing object has a runtime pin.
             // Otherwise GC could delete the remote source between Missing and callback dispatch.
             let handoff = store::ReadLease::acquire(self.shared.readers.clone())?;
             match run() {
-                Err(Error::Missing(object)) => {
+                Err(Error::Missing(mut object)) => {
+                    object.reason = reason;
                     let id = Uuid::parse_str(&object.id)
                         .map_err(|_| Error::Invalid("object id".into()))?;
                     let oid = u64::from_le_bytes(id.as_bytes()[8..].try_into().unwrap());
@@ -190,7 +204,7 @@ impl Volume {
         };
         match r["cmd"].as_str().unwrap_or("") {
             "lazy.status" => Ok(
-                json!({"object_size":g.object_size,"enabled":cloud.lazy_backing.is_some()||cloud.cache.backing.is_some(),"index_complete":cloud.replica.as_ref().is_none_or(|r|r.counts_complete),"total_objects":reader.root.lazy_total_objects,"data_objects":reader.root.lazy_total_objects,"cached_objects":reader.root.lazy_cached_objects,"cached_bytes":reader.root.lazy_cached_objects*g.object_size,"missing_objects":reader.root.lazy_missing_objects,"missing_bytes":reader.root.lazy_missing_objects*g.object_size,"backing":cloud.lazy_backing}),
+                json!({"object_size":g.object_size,"enabled":cloud.lazy_backing.is_some()||cloud.cache.backing.is_some(),"index_complete":cloud.replica.as_ref().is_none_or(|r|r.counts_complete.is_complete()),"total_objects":reader.root.lazy_total_objects,"data_objects":reader.root.lazy_total_objects,"cached_objects":reader.root.lazy_cached_objects,"cached_bytes":reader.root.lazy_cached_objects*g.object_size,"missing_objects":reader.root.lazy_missing_objects,"missing_bytes":reader.root.lazy_missing_objects*g.object_size,"backing":cloud.lazy_backing}),
             ),
             "lazy.needs" => {
                 let offset = r["offset"]
@@ -212,8 +226,19 @@ impl Volume {
                 let root = reader.root.index;
                 let mut cursor = first;
                 let mut scanned = 0;
+                let mut waiting_for_index = false;
                 while cursor < last && scanned < 4096 && items.len() < limit {
-                    let rows = tree::scan_after(&mut reader, &PAGES, root, cursor, 128)?;
+                    let rows = match tree::scan_range(&mut reader, &PAGES, root, cursor, last, 128) {
+                        Ok(rows) => rows,
+                        Err(Error::Missing(object)) => {
+                            let id = Uuid::parse_str(&object.id).map_err(|_| Error::Invalid("missing index ID".into()))?;
+                            let oid = u64::from_le_bytes(id.as_bytes()[8..].try_into().unwrap());
+                            items.insert(oid, json!({"id":object.id,"sha256":object.sha256,"length":g.object_size,"kind":"metadata"}));
+                            waiting_for_index = true;
+                            break;
+                        }
+                        Err(error) => return Err(error),
+                    };
                     if rows.is_empty() {
                         cursor = last;
                         break;
@@ -242,7 +267,7 @@ impl Volume {
                     }
                 }
                 Ok(
-                    json!({"items":items.into_values().collect::<Vec<_>>(),"next_offset":if cursor<last{Some(cursor*PAGE as u64)}else{None}}),
+                    json!({"items":items.into_values().collect::<Vec<_>>(),"waiting_for_index":waiting_for_index,"next_offset":if cursor<last{Some(cursor*PAGE as u64)}else{None}}),
                 )
             }
             _ => Err(Error::Invalid("unknown lazy command".into())),

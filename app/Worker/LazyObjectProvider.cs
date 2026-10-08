@@ -7,11 +7,15 @@ namespace OverlayDisk.Worker;
 
 public sealed record LazyObjectRequest(string DiskId, string ObjectId, string Sha256, int Length = 4 * 1024 * 1024, bool Prefetch = false)
 {
+    public string ObjectKind { get; init; } = "unknown";
+    public string Reason { get; init; } = "read";
     internal TimeSpan TransferTimeout => TimeSpan.FromSeconds((Prefetch ? 25 : 50) * (Length / CloudObjectGeometry.DefaultSize));
     internal void Validate()
     {
         if (!Guid.TryParse(DiskId, out _) || !Guid.TryParse(ObjectId, out _) || !CloudObjectGeometry.IsSupported(Length)
-            || Sha256.Length != 64 || Sha256.Any(c => !Uri.IsHexDigit(c)))
+            || Sha256.Length != 64 || Sha256.Any(c => !Uri.IsHexDigit(c))
+            || ObjectKind is not ("unknown" or "data" or "metadata")
+            || Reason is not ("read" or "write" or "sync" or "prefetch" or "reclaim" or "replica" or "copy_publish"))
             throw new InvalidDataException("云端对象读取身份或长度无效。");
     }
 }

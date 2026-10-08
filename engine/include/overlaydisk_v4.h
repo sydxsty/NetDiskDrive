@@ -14,11 +14,12 @@ void *od_v4_open(const char *path_utf8, const char *password_or_null);
 /* Provider runs outside native store/view/provider locks, while the original
  * ordered I/O remains outstanding. Fill exactly length bytes (this volume's 4, 8 or 16 MiB) and return 0;
  * on failure write a bounded UTF-8 error and return -1. Buffers are borrowed only
- * during the callback. Do not call ordered I/O from inside it. NULL unregisters
+ * during the callback. request_context_json is {kind,reason}, valid only
+ * during the callback; the matching registration symbol rejects older DLLs. Do not call ordered I/O from inside it. NULL unregisters
  * and waits for in-flight callbacks; cancel/join downloads before unregistering. */
 typedef int32_t (*ODV4ObjectProvider)(void *context, const char *object_id,
-    const char *sha256, uint8_t *output, uint32_t length, char *error, uint32_t error_length);
-int32_t od_v4_set_object_provider(void *, ODV4ObjectProvider, void *context);
+    const char *sha256, const char *request_context_json, uint8_t *output, uint32_t length, char *error, uint32_t error_length);
+int32_t od_v4_set_object_provider_with_context(void *, ODV4ObjectProvider, void *context);
 /* options: {mode:"copy"|"original",lazy,source_volume_id?,backing?,publication?}.
  * Original mode requires a confirmed commit+binding; identity is checked before creating a file. */
 void *od_v4_restore_begin_options(const char *path_utf8, const uint8_t *root_object,

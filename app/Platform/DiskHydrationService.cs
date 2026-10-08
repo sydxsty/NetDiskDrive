@@ -28,10 +28,11 @@ internal sealed class DiskHydrationService : IDisposable
     private long planRevision;
     private bool hasRead, stopped;
     private int active, prefetching;
+    private long metadataDownloadedBytes, dataDownloadedBytes;
     private string? lastError;
     private sealed class Flight(LazyObjectRequest request)
     {
-        internal readonly LazyObjectRequest Request = request;
+        internal LazyObjectRequest Request = request;
         internal bool Prefetch = request.Prefetch, Started, Finished, CancelRequested;
         internal bool Demanded = !request.Prefetch;
         internal CancellationTokenSource? DownloadCancellation;
@@ -97,9 +98,11 @@ internal sealed class DiskHydrationService : IDisposable
     }
     private static void Cancel(IEnumerable<CancellationTokenSource> sources)
     { foreach (var source in sources) try { source.Cancel(); } catch (ObjectDisposedException) { } }
-    internal Task<byte[]> GetAsync(string objectId, string sha256, bool prefetch = false, long? expectedPlan = null)
+    internal Task<byte[]> GetAsync(string objectId, string sha256, bool prefetch = false, long? expectedPlan = null,
+        string objectKind = "unknown", string reason = "read")
     {
-        var request = new LazyObjectRequest(diskId, objectId, sha256, objectSize, prefetch); request.Validate();
+        var request = new LazyObjectRequest(diskId, objectId, sha256, objectSize, prefetch)
+            { ObjectKind = objectKind, Reason = prefetch ? "prefetch" : reason }; request.Validate();
         CancellationTokenSource[] cancel; Task<byte[]> result;
         lock (gate)
         {
@@ -111,7 +114,7 @@ internal sealed class DiskHydrationService : IDisposable
                 if (!existing.Request.Sha256.Equals(sha256, StringComparison.OrdinalIgnoreCase)) throw new InvalidDataException("同一云端对象的校验信息不一致。");
                 if (!prefetch) existing.Demanded = true;
                 if (!prefetch && existing.Prefetch && !existing.Started)
-                { existing.Prefetch = false; foreground.Enqueue(existing); wake.Release(); }
+                { existing.Prefetch = false; existing.Request = request; foreground.Enqueue(existing); wake.Release(); }
                 return existing.Completion.Task;
             }
             if (prefetch && settings.Strategy == "disabled") return Task.FromException<byte[]>(new IOException("预取已关闭。"));
@@ -157,6 +160,11 @@ internal sealed class DiskHydrationService : IDisposable
                     byte[] bytes = await provider(flight.Request with { Prefetch = flight.Prefetch }, timeout.Token).WaitAsync(timeout.Token).ConfigureAwait(false);
                     if (bytes.Length != objectSize || !Convert.ToHexString(SHA256.HashData(bytes)).Equals(flight.Request.Sha256, StringComparison.OrdinalIgnoreCase))
                         throw new InvalidDataException("按需读取对象校验失败。");
+                    lock (gate)
+                    {
+                        if (flight.Request.ObjectKind == "metadata") metadataDownloadedBytes += bytes.Length;
+                        else if (flight.Request.ObjectKind == "data") dataDownloadedBytes += bytes.Length;
+                    }
                     if (flight.Prefetch)
                     {
                         timeout.Token.ThrowIfCancellationRequested();
@@ -256,9 +264,12 @@ internal sealed class DiskHydrationService : IDisposable
                     if (item.TryGetProperty("length", out var size) && size.GetInt64() != objectSize) throw new InvalidDataException("预取对象大小与磁盘不一致。");
                     string id = item.GetProperty("id").GetString()!;
                     if (!seen.Add(id)) continue;
-                    await GetAsync(id, item.GetProperty("sha256").GetString()!, true, revision).WaitAsync(ct).ConfigureAwait(false);
+                    await GetAsync(id, item.GetProperty("sha256").GetString()!, true, revision,
+                        item.TryGetProperty("kind", out var kind) ? kind.GetString()! : "unknown").WaitAsync(ct).ConfigureAwait(false);
                 }
-                if (!result.TryGetProperty("next_offset", out var next) || next.ValueKind != JsonValueKind.Number || !next.TryGetUInt64(out var value) || value <= cursor || value >= end) break;
+                bool waitingForIndex = result.TryGetProperty("waiting_for_index", out var waiting) && waiting.ValueKind == JsonValueKind.True;
+                if (!result.TryGetProperty("next_offset", out var next) || next.ValueKind != JsonValueKind.Number || !next.TryGetUInt64(out var value)
+                    || value < cursor || value == cursor && (!waitingForIndex || items.GetArrayLength() == 0) || value >= end) break;
                 cursor = value;
             }
         }
@@ -267,7 +278,7 @@ internal sealed class DiskHydrationService : IDisposable
     internal object GetState()
     {
         lock (gate) return new { activeRequests = active, pendingRequests = flights.Values.Count(v => !v.Started && !v.Finished),
-            prefetching, lastError, planning = planning is { IsCompleted: false }, prefetchStrategy = settings.Strategy, prefetchObjects = settings.ObjectCount, objectSizeBytes = objectSize };
+            prefetching, lastError, metadataDownloadedBytes, dataDownloadedBytes, planning = planning is { IsCompleted: false }, prefetchStrategy = settings.Strategy, prefetchObjects = settings.ObjectCount, objectSizeBytes = objectSize };
     }
     public void Dispose()
     {

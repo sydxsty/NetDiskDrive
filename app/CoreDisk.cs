@@ -331,7 +331,7 @@ public sealed class CoreDisk : IDisposable
             hydration = new DiskHydrationService(Id.ToString(), provider,
                 (offset, length, limit) => Control(new { cmd = "lazy.needs", offset, length, operation = "read", limit }), ImportLazyObject, ObjectSizeBytes, prefetchSettings);
             objectProviderCallback = FetchObject;
-            try { WithHandle(h => Check(Native.od_v4_set_object_provider(h, objectProviderCallback, IntPtr.Zero))); }
+            try { WithHandle(h => Check(Native.od_v4_set_object_provider_with_context(h, objectProviderCallback, IntPtr.Zero))); }
             catch { hydration.Dispose(); hydration = null; objectProviderCallback = null; throw; }
         }
     }
@@ -341,15 +341,17 @@ public sealed class CoreDisk : IDisposable
         WithHandle(h => Check(Native.od_v4_lazy_import(h, objectId, bytes, (uint)bytes.Length)));
     }
     [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
-    private delegate int ObjectProviderCallback(IntPtr context, IntPtr objectId, IntPtr sha256, IntPtr output, uint length, IntPtr error, uint errorLength);
-    private int FetchObject(IntPtr context, IntPtr objectId, IntPtr sha256, IntPtr output, uint length, IntPtr error, uint errorLength)
+    private delegate int ObjectProviderCallback(IntPtr context, IntPtr objectId, IntPtr sha256, IntPtr requestContext, IntPtr output, uint length, IntPtr error, uint errorLength);
+    private int FetchObject(IntPtr context, IntPtr objectId, IntPtr sha256, IntPtr requestContext, IntPtr output, uint length, IntPtr error, uint errorLength)
     {
         try
         {
             if (length != ObjectSizeBytes || output == IntPtr.Zero) throw new IOException("内核按需读取缓冲区无效。");
             string id = Marshal.PtrToStringUTF8(objectId) ?? throw new IOException("缺少对象标识。");
             string hash = Marshal.PtrToStringUTF8(sha256) ?? throw new IOException("缺少对象校验信息。");
-            byte[] bytes = (hydration ?? throw new IOException("未配置云端对象读取服务。")).GetAsync(id, hash).GetAwaiter().GetResult();
+            using var details = JsonDocument.Parse(Marshal.PtrToStringUTF8(requestContext) ?? throw new IOException("缺少下载原因。"));
+            byte[] bytes = (hydration ?? throw new IOException("未配置云端对象读取服务。")).GetAsync(id, hash,
+                objectKind: details.RootElement.GetProperty("kind").GetString()!, reason: details.RootElement.GetProperty("reason").GetString()!).GetAwaiter().GetResult();
             if (bytes.Length != length) throw new IOException("按需下载的对象长度与磁盘格式不符。");
             Marshal.Copy(bytes, 0, output, bytes.Length); return 0;
         }
@@ -409,7 +411,7 @@ public sealed class CoreDisk : IDisposable
             try
             {
                 if (handle == IntPtr.Zero) return;
-                if (objectProviderCallback is not null) Check(Native.od_v4_set_object_provider(handle, null, IntPtr.Zero));
+                if (objectProviderCallback is not null) Check(Native.od_v4_set_object_provider_with_context(handle, null, IntPtr.Zero));
                 Native.od_v4_close(handle);
                 handle = IntPtr.Zero;
                 objectProviderCallback = null; hydration = null; lazyReads.Clear();
@@ -427,7 +429,7 @@ public sealed class CoreDisk : IDisposable
         [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)] internal static extern int od_v4_create_sized([MarshalAs(UnmanagedType.LPUTF8Str)] string path, ulong capacity, [MarshalAs(UnmanagedType.LPUTF8Str)] string? password, uint objectSizeBytes);
         [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)] internal static extern int od_v4_set_read_only(IntPtr handle, uint enabled);
         [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)] internal static extern IntPtr od_v4_restore_begin_options([MarshalAs(UnmanagedType.LPUTF8Str)] string path, byte[] root, uint length, [MarshalAs(UnmanagedType.LPUTF8Str)] string? password, [MarshalAs(UnmanagedType.LPUTF8Str)] string optionsJson);
-        [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)] internal static extern int od_v4_set_object_provider(IntPtr handle, ObjectProviderCallback? callback, IntPtr context);
+        [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)] internal static extern int od_v4_set_object_provider_with_context(IntPtr handle, ObjectProviderCallback? callback, IntPtr context);
         [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)] internal static extern IntPtr od_v4_lazy_begin([MarshalAs(UnmanagedType.LPUTF8Str)] string path, byte[] root, uint length, [MarshalAs(UnmanagedType.LPUTF8Str)] string? password, [MarshalAs(UnmanagedType.LPUTF8Str)] string backingJson);
         [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)] internal static extern int od_v4_lazy_import(IntPtr handle, [MarshalAs(UnmanagedType.LPUTF8Str)] string objectId, byte[] data, uint length);
         [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)] internal static extern int od_v4_replica_stage(IntPtr handle, byte[] root, uint length, [MarshalAs(UnmanagedType.LPUTF8Str)] string optionsJson);

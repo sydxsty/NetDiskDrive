@@ -52,6 +52,8 @@ powershell -ExecutionPolicy Bypass -File scripts/test-local.ps1 -IncludeMount
 
 GPT 恢复回归可单独运行 `dotnet OverlayDisk.dll --replica-gpt-smoke C:\Temp\ReplicaGptCheck`。它在新的空目录中创建 4 TiB 虚拟容量的稀疏测试容器，通过真实应用服务与原生接口检查分区表、恢复重试及快照更新；只写入少量测试数据，无需管理员权限或真实挂载，云对象来自内存模拟后端。
 
+按需索引的定向原生回归：`cargo test --manifest-path engine/Cargo.toml --release --lib v4::on_demand_tests`。它检查跨对象索引、原盘增量发布、断流／损坏重试、并行读写、范围预取及旧来源清理保护，只用少量稀疏测试数据，不运行吞吐基准。预取调度和二进制通道可用编译目录中的 `dotnet OverlayDisk.dll --platform-smoke C:\Temp\OnDemandPlatformCheck` 复测。
+
 界面交互可以单独用 Node.js、Playwright 和 Microsoft Edge 验证。以下示例中的 Playwright 路径按本机安装位置填写，结果保存在指定临时目录：
 
 ```powershell

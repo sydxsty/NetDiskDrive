@@ -75,6 +75,8 @@ internal static class HydrationTransportSelfTests
         var networkCancelled = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         using var server = new LazyObjectServer(hydrateServer, token, async (request, ct) =>
         {
+            Check(request.ObjectKind == "metadata" && request.Reason == (request.ObjectId == one ? "prefetch" : "sync"),
+                "download context was lost across the reverse binary channel");
             if (request.ObjectId == one)
             { networkStarted.TrySetResult(); try { await Task.Delay(Timeout.Infinite, ct); } finally { networkCancelled.TrySetResult(); } }
             return payload.ToArray();
@@ -82,14 +84,14 @@ internal static class HydrationTransportSelfTests
         using var rpc = new WorkerConnection(controlServer, token, false);
         using var binary = new WorkerConnection(bulkServer, token, true);
         using var objects = new WorkerConnection(hydrateClient, token, true);
-        var request = new LazyObjectRequest(disk, one, hash, payload.Length, true);
+        var request = new LazyObjectRequest(disk, one, hash, payload.Length, true) { ObjectKind = "metadata", Reason = "prefetch" };
         Task<WorkerReply> slow = objects.CallAsync("hydrate.read", JsonSerializer.SerializeToElement(request, WorkerProtocol.JsonOptions), ReadOnlyMemory<byte>.Empty, timeout.Token);
         await networkStarted.Task.WaitAsync(timeout.Token);
         var state = await rpc.CallAsync("state", default, ReadOnlyMemory<byte>.Empty, timeout.Token).WaitAsync(TimeSpan.FromSeconds(2));
         Check(state.Header.GetProperty("data").GetProperty("available").GetBoolean() && !slow.IsCompleted, "download blocked control query");
         await objects.CallAsync("hydrate.cancel", JsonSerializer.SerializeToElement(new { diskId = disk, objectId = one }), ReadOnlyMemory<byte>.Empty, timeout.Token);
         await networkCancelled.Task.WaitAsync(timeout.Token); await RejectAsync(slow);
-        var good = await objects.CallAsync("hydrate.read", JsonSerializer.SerializeToElement(request with { ObjectId = two, Prefetch = false }, WorkerProtocol.JsonOptions), ReadOnlyMemory<byte>.Empty, timeout.Token);
+        var good = await objects.CallAsync("hydrate.read", JsonSerializer.SerializeToElement(request with { ObjectId = two, Prefetch = false, Reason = "sync" }, WorkerProtocol.JsonOptions), ReadOnlyMemory<byte>.Empty, timeout.Token);
         Check(good.Bytes.AsSpan().SequenceEqual(payload), "reverse channel corrupted 4 MiB object");
         await rpc.CallAsync("$shutdown", default, ReadOnlyMemory<byte>.Empty, timeout.Token); await serving.WaitAsync(timeout.Token);
         Check(dispatcher.Stopped, "control shutdown did not finish");

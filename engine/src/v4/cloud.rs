@@ -406,6 +406,9 @@ impl Volume {
         Ok(result)
     }
     fn prepare_control(&self, request: &Value) -> Result<Value> {
+        self.with_hydration_reason("sync", || self.prepare_control_step(request))
+    }
+    fn prepare_control_step(&self, request: &Value) -> Result<Value> {
         let cache_mib = match request.get("prepare_cache_mib") {
             None => 64,
             Some(value) => value.as_u64().filter(|n| (16..=1024).contains(n))
@@ -434,7 +437,7 @@ impl Volume {
             if initial_job.is_none() { self.flush()?; }
             // A freshly imported original may have its first changes only in the
             // frontend cache. Flush makes them visible to baseline setup.
-            self.materialize_replica_counts()
+            self.prepare_replica_counts()
         })();
         if let Err(error) = prerequisites {
             if let Ok(mut store) = self.shared.store.lock() { store.end_prepare_cache(); }
@@ -477,7 +480,7 @@ impl Volume {
         result
     }
     pub fn read_export(&self, job: &str, object: &str, offset: u64, out: &mut [u8]) -> Result<()> {
-        self.with_hydration(|| self.read_export_inner(job, object, offset, out))
+        self.with_hydration_reason("sync", || self.read_export_inner(job, object, offset, out))
     }
     fn read_export_inner(
         &self,
@@ -756,6 +759,10 @@ fn cloud_prepare(s: &mut Store, r: &Value) -> Result<Value> {
     if !rows.is_empty() {
         let keys = rows.iter().map(|(key, _)| *key).collect::<Vec<_>>();
         let values = tree::get_many(s, &PAGES, j.snapshot, &keys)?;
+        // Resolve just this batch's old paths before starting a transaction.
+        // Missing source nodes are hydrated by prepare_control outside all
+        // store/transaction locks; a failed fetch must not poison the disk.
+        tree::get_many(s, &PORTMAP, j.index, &keys)?;
         let changes = keys.into_iter().zip(values).collect::<Vec<_>>();
         *s.diagnostics
             .entry("cloud_index_lookup_batches".into())
@@ -779,8 +786,9 @@ fn cloud_prepare(s: &mut Store, r: &Value) -> Result<Value> {
         s.cloud = c;
         return Ok(json!({"job":job_public(s,&j)?}));
     }
+    let index_depth = tree::root_level(s, &PORTMAP, j.index)?;
     s.transaction(|tx|{let mut object=if j.meta_tail==0{let mut o=tx.allocate_object(2,0)?;o.used=1;tx.objects.insert(o.oid,o.clone());o}else{tx.object(j.meta_tail)?};let child=if j.index.empty(){None}else{Some((j.index.offset&!PORTABLE)/g.object_size)};if object.external_count as u64>=g.external_limit&&child.is_some_and(|v|v!=object.oid){tx.seal(object.oid,None)?;object=tx.allocate_object(2,0)?;object.used=1;tx.objects.insert(object.oid,object.clone());}
-if let Some(child)=child{tx.ensure_external(object.oid,child)?;}let descriptor=json!({"format_version":4,"container_id":tx.store.config.id,"crypto_id":tx.store.crypto.id,"capacity_bytes":tx.store.config.capacity_bytes,"generation":j.generation,"index":j.index,"index_depth":tree::root_level(tx,&PORTMAP,j.index)?,"page_size":PAGE,"object_size":g.object_size});let object=tx.seal(object.oid,Some(&serde_json::to_vec(&descriptor)?))?;j.root_oid=object.oid;j.root_sha256=hex(&object.sha);j.meta_tail=0;tx.cloud_deltas.insert(object.oid,1);j.counts=tx.apply_cloud_deltas(j.counts)?;reconcile_delta(tx,&mut j,c.published_counts,[object.oid])?;j.phase="ready".into();c.job=Some(j.clone());tx.save_cloud(&c)})?;
+if let Some(child)=child{tx.ensure_external(object.oid,child)?;}let descriptor=json!({"format_version":4,"container_id":tx.store.config.id,"crypto_id":tx.store.crypto.id,"capacity_bytes":tx.store.config.capacity_bytes,"generation":j.generation,"index":j.index,"index_depth":index_depth,"page_size":PAGE,"object_size":g.object_size});let object=tx.seal(object.oid,Some(&serde_json::to_vec(&descriptor)?))?;j.root_oid=object.oid;j.root_sha256=hex(&object.sha);j.meta_tail=0;tx.cloud_deltas.insert(object.oid,1);j.counts=tx.apply_cloud_deltas(j.counts)?;reconcile_delta(tx,&mut j,c.published_counts,[object.oid])?;j.phase="ready".into();c.job=Some(j.clone());tx.save_cloud(&c)})?;
     s.cloud = c;
     Ok(json!({"job":job_public(s,&j)?}))
 }

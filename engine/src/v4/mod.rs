@@ -23,6 +23,8 @@ mod restore;
 mod replica;
 #[cfg(test)]
 mod replica_tests;
+#[cfg(test)]
+mod on_demand_tests;
 mod store;
 mod tree;
 mod volume;

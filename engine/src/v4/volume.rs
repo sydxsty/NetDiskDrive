@@ -105,7 +105,7 @@ impl Reader {
         if let Some(p) = self.page(index)? {
             let object = self.object(p.reference.object)?;
             if object.missing {
-                return Err(Error::Missing(RemoteObject::from_object(
+                return Err(Error::Missing(RemoteObject::data(
                     &object,
                     self.object_size(),
                 )));
@@ -157,7 +157,7 @@ impl Storage for Reader {
             let object = self.object(address / self.object_size())?;
             super::portable_validation::validate_node_reference(reference, &object, self.crypto.geometry)?;
             if object.missing {
-                return Err(Error::Missing(RemoteObject::from_object(
+                return Err(Error::Missing(RemoteObject::index(
                     &object,
                     self.object_size(),
                 )));
@@ -394,7 +394,7 @@ impl Volume {
                 } else if let Some(reference) = reader.page(index)? {
                     let object = reader.object(reference.reference.object)?;
                     if object.missing {
-                        return Err(Error::Missing(RemoteObject::from_object(
+                        return Err(Error::Missing(RemoteObject::data(
                             &object,
                             self.object_size(),
                         )));
@@ -456,7 +456,7 @@ impl Volume {
         Ok(())
     }
     pub fn write(&self, offset: u64, input: &[u8]) -> Result<()> {
-        self.with_hydration(|| self.write_impl(offset, input))
+        self.with_hydration_reason("write", || self.write_impl(offset, input))
     }
     fn write_impl(&self, offset: u64, input: &[u8]) -> Result<()> {
         if self.shared.read_only.load(Ordering::Acquire) {
@@ -478,7 +478,7 @@ impl Volume {
         Ok(())
     }
     pub fn trim(&self, offset: u64, length: u64) -> Result<()> {
-        self.with_hydration(|| self.trim_impl(offset, length))
+        self.with_hydration_reason("reclaim", || self.trim_impl(offset, length))
     }
     fn trim_impl(&self, offset: u64, length: u64) -> Result<()> {
         if self.shared.read_only.load(Ordering::Acquire) {
@@ -511,7 +511,7 @@ impl Volume {
         // Enumerate allocated and cached pages, never each page of a large unallocated range.
         while cursor < last_full {
             let root = reader.root.index;
-            let mut keys = tree::scan_after(&mut reader, &PAGES, root, cursor, 256)?
+            let mut keys = tree::scan_range(&mut reader, &PAGES, root, cursor, last_full, 256)?
                 .into_iter()
                 .map(|(p, _)| p)
                 .take_while(|p| *p < last_full)

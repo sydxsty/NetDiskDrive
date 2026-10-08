@@ -48,6 +48,38 @@ internal static class PrefetchSelfTests
         }
         checks.Add("Configured sequential prefetch follows exactly three logical object descriptors; disabling stops mapping lookups and downloads.");
 
+        foreach (int budget in new[] { 1, 2 })
+        {
+            int metadataImports = 0, dataImports = 0, queries = 0;
+            var descriptors = new ConcurrentQueue<Worker.LazyObjectRequest>();
+            using var service = new DiskHydrationService(disk, (request, _) =>
+            {
+                Check(request.Prefetch && request.Reason == "prefetch", "prefetch lost its download reason");
+                descriptors.Enqueue(request); return Task.FromResult(payload.ToArray());
+            }, (offset, length, limit) =>
+            {
+                Check(offset == 131072 && length == budget * payload.Length, "metadata retry moved outside its logical window");
+                Interlocked.Increment(ref queries);
+                bool index = Volatile.Read(ref metadataImports) == 0;
+                Check(limit == (index ? budget : budget - 1), "metadata did not consume the shared prefetch budget");
+                return JsonSerializer.SerializeToElement(new
+                {
+                    items = new[] { new { id = ids[index ? 0 : 1], sha256 = digest, length = payload.Length, kind = index ? "metadata" : "data" } },
+                    waiting_for_index = index, next_offset = index ? (ulong?)offset : null
+                });
+            }, (id, _) => { if (id == ids[0]) Interlocked.Increment(ref metadataImports); else Interlocked.Increment(ref dataImports); },
+            settings: new("sequential", budget));
+            service.AfterRead(0, 65536, 64UL << 20); service.AfterRead(65536, 65536, 64UL << 20);
+            await IdleAsync(service, timeout.Token);
+            Check(queries == budget && descriptors.Count == budget && metadataImports == 1 && dataImports == budget - 1,
+                "cold-index retry either stopped early or exceeded the combined object budget");
+            Check(descriptors.First().ObjectKind == "metadata" && (budget == 1 || descriptors.Last().ObjectKind == "data"), "index/data classification lost");
+            var state = JsonSerializer.SerializeToElement(service.GetState());
+            Check(state.GetProperty("metadataDownloadedBytes").GetInt64() == payload.Length
+                && state.GetProperty("dataDownloadedBytes").GetInt64() == (budget - 1L) * payload.Length, "separate canonical download counters disagree");
+        }
+        checks.Add("Cold metadata is prefetched and imported before retrying the same logical range; metadata and data share a strict object budget and distinct counters.");
+
         var limits = new ConcurrentQueue<int>();
         using (var service = new DiskHydrationService(disk, (_, _) => throw new IOException("empty hints must not download"),
         (_, length, limit) => { Check(length == (uint)limit * payload.Length, "adaptive window disagrees with object count"); limits.Enqueue(limit); return Empty(0, 0, 0); },

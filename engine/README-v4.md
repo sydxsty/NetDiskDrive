@@ -171,15 +171,28 @@ is reported separately and retried before mounting.
 
 `index_complete` describes whether the source reference catalog has been expanded,
 not whether every data object has been read. Until then, lazy-object totals and
-block statistics are explicitly known-object counts. First publication of an
-imported source may need to build that catalog; ordinary import, reads and manual
-latest-version loading do not perform that traversal.
+block statistics are explicitly known-object counts. An original writer retains
+its source reader pin and counts newly created objects exactly; inherited objects
+with unknown counts remain protected, rather than being treated as unreferenced.
+Preparation and retries update only changed index paths. The durable local
+`source_anchor_v1` accounting marker rejects older writers that would replace the
+incremental counts with a full source baseline; cloud object bytes are unchanged.
+Explicitly publishing an independent copy to another repository still discovers
+and transfers its complete required object graph. Ordinary import, read/write,
+same-repository sync and manual latest-version loading do not require this walk.
 
 `lazy.needs` traverses a bounded logical range, at most 4096 mapped pages and 16
-missing objects per call, and returns a continuation offset. Full-page overwrites
+missing objects per call, and returns a continuation offset. A missing index is
+returned as a metadata descriptor with `waiting_for_index`; after importing it,
+the caller retries the same offset. Traversal never opens a subtree beyond the
+exclusive range end. Metadata and data share the configured prefetch object budget.
+Full-page overwrites
 need no old payload; partial writes fetch only required source objects. Managed
 prefetch limits both object count and planning calls, prioritizes demanded reads,
 and cancels obsolete speculation without cancelling replacement foreground work.
+Provider callbacks carry object kind and request reason through the binary channel
+for activity logs; registration uses `od_v4_set_object_provider_with_context` so a
+mismatched older native library fails registration rather than invoking the wrong ABI.
 
 Snapshots pin immutable roots and missing-object references. Explicit snapshot
 inspection can enumerate its objects; routine sync does not use that path.

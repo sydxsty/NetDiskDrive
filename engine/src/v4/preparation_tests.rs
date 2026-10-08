@@ -115,7 +115,7 @@ fn original_lazy_preparation_flushes_buffered_changes_before_baseline_counts() {
     {
         let store = volume.shared.store.lock().unwrap();
         assert_eq!(store.root.changed_pages, 0);
-        assert!(!store.cloud.replica.as_ref().unwrap().counts_complete);
+        assert!(!store.cloud.replica.as_ref().unwrap().counts_complete.is_complete());
     }
     let mut job = volume.control(&json!({"cmd":"cloud.prepare","prepare_cache_mib":16})).unwrap()["job"].clone();
     for _ in 0..16 {

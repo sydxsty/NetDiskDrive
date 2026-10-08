@@ -651,7 +651,7 @@ impl Storage for Store {
             let p = r.offset & !PORTABLE;
             let o = self.object(p / g.object_size)?;
             super::portable_validation::validate_node_reference(r, &o, g)?;
-            if o.missing { return Err(Error::Missing(super::RemoteObject::from_object(&o, g.object_size))); }
+            if o.missing { return Err(Error::Missing(super::RemoteObject::index(&o, g.object_size))); }
             self.device
                 .read(o.extent * g.object_size + p % g.object_size, &mut b)?;
         } else {
@@ -723,7 +723,7 @@ fn node_position(r: MetaRef, objects: &BTreeMap<u64, Object>, g: Geometry) -> Re
         .ok_or_else(|| Error::Integrity("prefetch object missing".into()))?;
     super::portable_validation::validate_node_reference(r, object, g)?;
     if object.missing {
-        return Err(Error::Missing(RemoteObject::from_object(object, g.object_size)));
+        return Err(Error::Missing(RemoteObject::index(object, g.object_size)));
     }
     Ok(object.extent * g.object_size + logical % g.object_size)
 }
@@ -1596,7 +1596,7 @@ impl Storage for Txn<'_> {
             let p = r.offset & !PORTABLE;
             let o = self.object(p / g.object_size)?;
             super::portable_validation::validate_node_reference(r, &o, g)?;
-            if o.missing { return Err(Error::Missing(super::RemoteObject::from_object(&o, g.object_size))); }
+            if o.missing { return Err(Error::Missing(super::RemoteObject::index(&o, g.object_size))); }
             self.read_frame(o.extent * g.object_size + p % g.object_size, &mut b)?;
         } else {
             self.read_frame(r.offset, &mut b)?;
@@ -1817,6 +1817,17 @@ impl Txn<'_> {
         let prior = tree::get_many(self, &COUNTS, root, &ids)?;
         let mut objects = self.objects_many(&ids)?;
         for ((oid, delta), before) in deltas.into_iter().zip(prior) {
+            // An imported source is protected by its durable reader pin. Its
+            // unvisited references are unknown, not zero. Track only objects
+            // created locally since that source was installed; those counts
+            // remain exact across publications, restarts and snapshot reuse.
+            if self.store.cloud.replica.as_ref().is_some_and(|r|
+                r.counts_complete == super::replica::CountCoverage::SourceAnchor)
+                && objects.get(&oid).is_some_and(|object| object.origin_backed)
+                && before.is_none()
+            {
+                continue;
+            }
             let before = before.map(|b| u64::from_le_bytes(b.try_into().unwrap())).unwrap_or(0);
             let after = before.checked_add_signed(delta)
                 .ok_or_else(|| Error::Integrity("cloud reference underflow".into()))?;

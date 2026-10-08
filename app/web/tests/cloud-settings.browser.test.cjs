@@ -168,6 +168,11 @@ const out=path.resolve(process.argv[2]),web=path.resolve(__dirname,'..');fs.mkdi
   assert.match(await page.locator('.lazy-cache-status').innerText(),/<missing> 重试后可继续/);
   assert.equal(await page.locator('.lazy-cache-status missing').count(),0);
   checks.push('Disk card shows native cache and queue counts and escapes download errors.');
+  await page.evaluate(async()=>{
+   Object.assign(window.__state.disks[0].hydration,{metadataDownloadedBytes:8388608,dataDownloadedBytes:16777216});await refresh();
+  });
+  assert.match(await page.locator('.lazy-cache-status').innerText(),/本次打开已下载（解压后）：容器索引 8\.0 MiB · 数据 16\.0 MiB/);
+  checks.push('Lazy cache displays separate index and data download totals and explicitly labels canonical decompressed bytes.');
   await page.screenshot({path:path.join(out,'lazy-cache.png'),fullPage:true});
   assert.deepEqual(errors,[]);
   fs.writeFileSync(path.join(out,'result.json'),JSON.stringify({passed:true,checks},null,2));console.log('PASS cloud settings UI: '+checks.length+' groups');
