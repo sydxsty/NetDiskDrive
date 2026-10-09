@@ -98,7 +98,7 @@ fn normal(v: &Volume) {
 fn normal_published_local_and_direct_base_keep_upload_set_and_payload_untouched() {
     let d = tempfile::tempdir().unwrap();
     let p = d.path().join("local.odv4");
-    let v = fresh(&p, 64 << 20, Some("secret"));
+    let v = fresh(&p, 64 << 20, None);
     bind(&v);
     v.write(0, &[17; PAGE]).unwrap();
     publish(&v);
@@ -114,11 +114,11 @@ fn normal_published_local_and_direct_base_keep_upload_set_and_payload_untouched(
             .len(),
         1
     );
-    let f = lazy_tests::fixture(Some("password"));
+    let f = lazy_tests::fixture(None);
     for mode in ["original", "copy"] {
         let target = f._dir.path().join(format!("reclaim-{mode}.odv4"));
         let opt = base_tests::options(&f, mode, true);
-        let t = Volume::restore_begin_options(&target, &f.root, Some("password"), opt).unwrap();
+        let t = Volume::restore_begin_options(&target, &f.root, None, opt).unwrap();
         base_tests::finish(&t, &f, 8);
         t.set_object_provider(Some(lazy_tests::provider(
             f.objects.clone(),
@@ -161,7 +161,7 @@ fn cancel_deep_plan_preserves_completed_changes_and_allows_normal_in_read_only()
 fn eight_tib_sparse_last_page_survives_cloud_base_snapshot_trim_and_reopen() {
     let d = tempfile::tempdir().unwrap();
     let p = d.path().join("wide.odv4");
-    let v = fresh(&p, MAX_CAPACITY, Some("wide-pass"));
+    let v = fresh(&p, MAX_CAPACITY, None);
     bind(&v);
     let last = MAX_CAPACITY - PAGE as u64;
     v.write(0, &[7; PAGE]).unwrap();
@@ -188,10 +188,10 @@ fn eight_tib_sparse_last_page_survives_cloud_base_snapshot_trim_and_reopen() {
         .unwrap()
         .is_empty());
     drop(v);
-    let v = Volume::open(&p, Some("wide-pass")).unwrap();
+    let v = Volume::open(&p, None).unwrap();
     v.read(last, &mut out).unwrap();
     assert!(out[512..].iter().all(|b| *b == 91));
-    let t = Volume::restore_begin_v4(d.path().join("wide-copy.odv4"), &root, Some("wide-pass"))
+    let t = Volume::restore_begin_v4(d.path().join("wide-copy.odv4"), &root, None)
         .unwrap();
     let mut done = false;
     for _ in 0..256 {
@@ -292,7 +292,7 @@ fn cache_capability_and_eviction_process_kills_reopen_with_remote_proof() {
         "cache_after_eviction",
     ] {
         let path = d.path().join(format!("{stage}.odv4"));
-        let v = fresh(&path, 64 << 20, Some("crash-password"));
+        let v = fresh(&path, 64 << 20, None);
         v.write(0, &[123; PAGE]).unwrap();
         v.flush().unwrap();
         let mut remote = HashMap::new();
@@ -343,12 +343,12 @@ fn cache_capability_and_eviction_process_kills_reopen_with_remote_proof() {
         }
         child.kill().unwrap();
         child.wait().unwrap();
-        let v = Volume::open(&path, Some("crash-password")).unwrap();
+        let v = Volume::open(&path, None).unwrap();
         assert_eq!(v.info().unwrap().data_generation, before);
         for offset in [0, 3 * PAGE as u64] {
             let mut header = [0; PAGE];
             v.shared.device.read(offset, &mut header).unwrap();
-            assert_eq!(&header[..8], b"ODV4CFGO");
+            assert_eq!(&header[..8], b"ODV4PLN1");
             assert!(Config::decode(&header).unwrap().cache_capable);
         }
         if stage == "cache_after_eviction" {
@@ -375,7 +375,7 @@ fn cache_capability_and_eviction_process_kills_reopen_with_remote_proof() {
 #[ignore]
 fn cache_crash_child() {
     let p = std::env::var("OVERLAYDISK_V4_CRASH_PATH").unwrap();
-    let v = Volume::open(p, Some("crash-password")).unwrap();
+    let v = Volume::open(p, None).unwrap();
     if std::env::var("OVERLAYDISK_V4_CRASH_STAGE").unwrap() == "cache_after_eviction" {
         v.set_object_provider(Some(Arc::new(|_, _| {
             Err(Error::Invalid("unexpected test download".into()))

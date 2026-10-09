@@ -134,7 +134,7 @@ impl Fixture {
 fn original_incremental_sync_keeps_unvisited_indexes_remote_across_reopen() {
     for (size, password) in [
         (4 << 20, None),
-        (8 << 20, Some("encrypted-source")),
+        (8 << 20, None),
         (16 << 20, None),
     ] {
         let mut f = Fixture::new(size, password);
@@ -254,7 +254,7 @@ fn source_anchor_marker_rejects_old_boolean_only_writers() {
 
 #[test]
 fn prefetch_discovers_only_the_requested_index_path_and_trim_does_not_walk_past_it() {
-    let mut f = Fixture::new(8 << 20, Some("encrypted-source"));
+    let mut f = Fixture::new(8 << 20, None);
     let calls = Arc::new(Mutex::new(Vec::new()));
     let v = f.open(&calls);
     let mut metadata = HashSet::new();

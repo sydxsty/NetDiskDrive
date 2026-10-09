@@ -11,7 +11,7 @@ namespace OverlayDisk;
 /// <summary>Isolated reader fixtures; all remote objects are in memory and no cloud account is used.</summary>
 internal static class ReplicaSelfTests
 {
-    private const string Password = "replica-isolated-fixture-password";
+    private const string? Password = null;
     private const ulong MiB = 1024 * 1024;
     private static readonly JsonSerializerOptions Json = new(JsonSerializerDefaults.Web);
     private static JsonElement E(object? value) => value is JsonElement e ? e : JsonSerializer.SerializeToElement(value, Json);
@@ -107,7 +107,7 @@ internal static class ReplicaSelfTests
             mbr.CopyTo(primary, 0); Header(1, lastLba, 2).CopyTo(primary, 512); entries.CopyTo(primary, 1024);
             entries.CopyTo(backup, 0); Header(lastLba, 1, lastLba - 32).CopyTo(backup, 16384); return (primary, backup, entries);
         }
-        Progress("Create actual encrypted 4 TiB virtual container with bounded GPT and data writes");
+        Progress("Create actual plaintext 4 TiB virtual container with bounded GPT and data writes");
         CoreDisk.Create(sourcePath, capacity, Password, 8U << 20);
         using (var source = new CoreDisk(sourcePath, Password))
         {
@@ -181,7 +181,7 @@ internal static class ReplicaSelfTests
             Verify(resumedPath, continuedId, before, firstEntries);
             Progress("All GPT copy and recovery checks passed without mounting or cloud access");
             File.WriteAllText(Path.Combine(output, "result.json"), JsonSerializer.Serialize(new { passed = true, virtualCapacityBytes = capacity, objectSizeBytes = 8U << 20,
-                networkUsed = false, mountedWindowsVolumes = false, fetched, checks = new[] { "Actual encrypted 4 TiB virtual container and complete 34304-byte GPT identity overlay",
+                networkUsed = false, mountedWindowsVolumes = false, fetched, checks = new[] { "Actual plaintext 4 TiB virtual container and complete 34304-byte GPT identity overlay",
                     "Worker finish, unlock, close and reopen preserve both header/array CRCs, distinct disk/partition GUIDs and data bytes",
                     "Latest cloud root switches changed GPT layout and data while preserving snapshot and disabled upload",
                     "Identity failure after durable native finish resumes the same container without reporting an incomplete overlay ready" } }, Json));
@@ -353,8 +353,8 @@ internal static class ReplicaSelfTests
         byte[] oldBytes = Pattern(1301, 2 * (int)MiB), newBytes = Pattern(1302, 2 * (int)MiB), unchanged = Pattern(1303, (int)MiB);
         try
         {
-            Progress("Create isolated encrypted 256 MiB NTFS source");
-            await source.CreateAsync(new("Replica source", Path.Combine(output, "source.odv4"), 256 * MiB, letter, true), Password);
+            Progress("Create isolated plaintext 256 MiB NTFS source");
+            await source.CreateAsync(new("Replica source", Path.Combine(output, "source.odv4"), 256 * MiB, letter, false), Password);
             var entry = source.Disks.Single();
             await File.WriteAllBytesAsync(Path.Combine(mount, "video.mp4"), oldBytes); await File.WriteAllBytesAsync(Path.Combine(mount, "unchanged.bin"), unchanged);
             await source.FlushFileSystemAsync(entry); var first = Export(source.TryGetCore(entry.Id)!, objects);

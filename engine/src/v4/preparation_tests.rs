@@ -51,8 +51,8 @@ fn cache_setting_rejects_bad_input_without_flush_or_disk_mutation() {
 fn preparation_resume_keeps_snapshot_new_changes_and_scoped_progress() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("resume.odv4");
-    Volume::create(&path, 128 << 20, Some("prepare-fixture")).unwrap();
-    let volume = Volume::open(&path, Some("prepare-fixture")).unwrap();
+    Volume::create(&path, 128 << 20, None).unwrap();
+    let volume = Volume::open(&path, None).unwrap();
     // More than one leaf-budget batch without allocating a large payload.
     for n in 0..260u64 {
         volume.write((4096 + n * 32) * PAGE as u64, &[23; PAGE]).unwrap();
@@ -73,7 +73,7 @@ fn preparation_resume_keeps_snapshot_new_changes_and_scoped_progress() {
     assert_eq!(volume.shared.device.diagnostics(), before_query, "diagnostics must not read a cloud blob");
     assert_eq!(diagnostics["preparation_diagnostics"]["job_id"], job["id"]);
     drop(volume);
-    let volume = Volume::open(&path, Some("prepare-fixture")).unwrap();
+    let volume = Volume::open(&path, None).unwrap();
     assert!(volume.control(&json!({"cmd":"sync.diagnostics"})).unwrap()["preparation_diagnostics"].is_null());
     for _ in 0..16 {
         if job["phase"] == "ready" { break; }

@@ -100,7 +100,7 @@ pub(super) fn provider(
 }
 #[test]
 fn metadata_only_reopen_hydrate_and_retry_preserve_generation() {
-    let f = fixture(Some("password"));
+    let f = fixture(None);
     let target = f.target;
     let before = target.info().unwrap();
     let mut out = [0; PAGE];
@@ -136,7 +136,7 @@ fn metadata_only_reopen_hydrate_and_retry_preserve_generation() {
         1
     );
     drop(target);
-    let target = Volume::open(&f.path, Some("password")).unwrap();
+    let target = Volume::open(&f.path, None).unwrap();
     target.read(0, &mut out).unwrap();
     assert_eq!(out, [11; PAGE]);
     assert!(target.read(PAGE as u64, &mut out).is_err());
@@ -148,13 +148,13 @@ fn metadata_only_reopen_hydrate_and_retry_preserve_generation() {
     // Windows mandatory byte-range locks require the owning device handle here.
     let mut config_page = [0; PAGE];
     target.shared.device.read(0, &mut config_page).unwrap();
-    assert_eq!(&config_page[..8], b"ODV4CFGO");
+    assert_eq!(&config_page[..8], b"ODV4PLN1");
     let mut bad_backing = f.backing;
     bad_backing["root_sha256"] = json!("00".repeat(32));
     assert!(Volume::lazy_begin(
         f._dir.path().join("bad.odv4"),
         &f.root,
-        Some("password"),
+        None,
         bad_backing
     )
     .is_err());
@@ -246,7 +246,7 @@ fn provider_wait_does_not_lock_frontend_and_unregister_drains() {
 }
 #[test]
 fn lazy_snapshot_publish_full_restore_and_compaction_are_complete() {
-    let f = fixture(Some("password"));
+    let f = fixture(None);
     let v = &f.target;
     let calls = Arc::new(AtomicUsize::new(0));
     v.set_object_provider(Some(provider(f.objects.clone(), calls.clone())))
@@ -274,7 +274,7 @@ fn lazy_snapshot_publish_full_restore_and_compaction_are_complete() {
     let copy = Volume::restore_begin_v4(
         f._dir.path().join("full-copy.odv4"),
         &uploaded[j["root_object_id"].as_str().unwrap()],
-        Some("password"),
+        None,
     )
     .unwrap();
     for _ in 0..128 {
@@ -323,7 +323,7 @@ fn lazy_local_snapshot_restore_materializes_but_physical_compaction_does_not_fet
         v,
         &snapshot,
         f._dir.path().join("local-copy.odv4"),
-        Some("new password"),
+        None,
     )
     .unwrap();
     for _ in 0..128 {

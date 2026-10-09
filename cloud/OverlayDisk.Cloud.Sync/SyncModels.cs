@@ -15,6 +15,8 @@ public sealed record RemoteCommit(int FormatVersion, string VolumeId, string Wri
     string Name, ulong CapacityBytes, bool Encrypted, string RootObjectId, string RootSha256, DateTimeOffset UpdatedUtc)
 {
     public int RootSlot { get; init; } = 0;
+    public CloudEncryptionSettings? Encryption { get; init; }
+    public string? Authentication { get; init; }
     [JsonRequired] public int ObjectSizeBytes { get; init; } = CloudObjectGeometry.DefaultSize;
     [JsonRequired] public string TransportCodec { get; init; } = ObjectTransport.Codec;
 }

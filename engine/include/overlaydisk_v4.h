@@ -6,7 +6,11 @@ extern "C" {
 #endif
 /* All entrypoints use the C calling convention. Never close concurrently with
  * any handle call. Stop admissions, drain and flush while replies are still
- * being consumed, release completions, then close. Close itself does NOT flush. */
+ * being consumed, release completions, then close. Close itself does NOT flush.
+ * Local storage is plaintext-v1 only. All password_or_null arguments must be
+ * NULL (or empty); nonempty passwords are rejected. Cloud transport encryption
+ * and its password derivation are the managed caller's responsibility. Old
+ * local containers/canonical objects are intentionally unsupported. */
 int32_t od_v4_create(const char *path_utf8, uint64_t capacity, const char *password_or_null); /* Default: 4 MiB. */
 /* Creation only: one immutable object per 4, 8 or 16 MiB; internal pages remain 4 KiB. */
 int32_t od_v4_create_sized(const char *path_utf8, uint64_t capacity, const char *password_or_null, uint32_t object_size_bytes);

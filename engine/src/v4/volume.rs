@@ -10,7 +10,7 @@ use zeroize::Zeroizing;
 const DIRTY_LIMIT: usize = 64 * 1024 * 1024;
 const DIRTY_TRIGGER: usize = 16 * 1024 * 1024;
 const CACHE_NODES: usize = 4096;
-type Bytes = Arc<super::crypto_work::PlainPage>;
+type Bytes = Arc<super::page_work::PlainPage>;
 type Changes = BTreeMap<u64, Option<Bytes>>;
 
 #[derive(Default)]
@@ -50,7 +50,7 @@ pub(super) struct Shared {
     pub read_only: AtomicBool,
     pub identity: Mutex<Vec<super::replica::IdentityRegion>>,
     pub device: Arc<Device>,
-    pub crypto: Arc<Crypto>,
+    pub crypto: Arc<PageCodec>,
     pub readers: Arc<Mutex<ReadRegistry>>,
     views: Mutex<Views>,
     cache: Arc<Mutex<ReadCache>>,
@@ -71,7 +71,7 @@ pub struct Volume {
 
 pub(super) struct Reader {
     pub device: Arc<Device>,
-    pub crypto: Arc<Crypto>,
+    pub crypto: Arc<PageCodec>,
     pub root: Root,
     cache: Arc<Mutex<ReadCache>>,
     pub cache_runtime: Arc<super::cache::Runtime>,
@@ -252,7 +252,7 @@ impl Volume {
         }
         let c = config.ok_or_else(|| {
             Error::Invalid(
-                "not a format-4 container; open old volumes with the previous release".into(),
+                "not a plaintext-v1 container; open old volumes with their original release".into(),
             )
         })?;
         Ok(Info {
@@ -627,7 +627,7 @@ impl Volume {
                         if zero {
                             None
                         } else {
-                            Some(Arc::new(super::crypto_work::PlainPage::verified(
+                            Some(Arc::new(super::page_work::PlainPage::verified(
                                 page,
                                 digest.unwrap(),
                             )))
@@ -810,27 +810,27 @@ impl Shared {
                     .iter()
                     .filter_map(|(index, value, _)| value.as_ref().map(|v| (*index, v.clone())))
                     .collect::<Vec<_>>();
-                let encoded = super::crypto_work::encode_batch(
+                let encoded = super::page_work::encode_batch(
                     store.crypto.clone(),
                     store.root.seq + 1,
                     &plain,
                 )?;
-                *store.diagnostics.entry("crypto_pages".into()).or_default() +=
+                *store.diagnostics.entry("page_encoded_pages".into()).or_default() +=
                     encoded.pages.len() as u64;
                 if encoded.parallel {
                     *store
                         .diagnostics
-                        .entry("crypto_parallel_pages".into())
+                        .entry("page_parallel_pages".into())
                         .or_default() += encoded.pages.len() as u64;
                 }
-                *store.diagnostics.entry("crypto_tasks".into()).or_default() += encoded.tasks;
+                *store.diagnostics.entry("page_encode_tasks".into()).or_default() += encoded.tasks;
                 *store
                     .diagnostics
-                    .entry("crypto_nonce_batches".into())
+                    .entry("page_encode_batches".into())
                     .or_default() += encoded.tasks;
                 store
                     .diagnostics
-                    .insert("crypto_worker_limit".into(), encoded.workers);
+                    .insert("page_worker_limit".into(), encoded.workers);
                 let mut encoded = encoded.pages.into_iter();
                 store.transaction(|tx| {
                     let mut pages = Vec::new();
@@ -946,7 +946,7 @@ fn read_config(device: &Device) -> Result<Config> {
             }
         }
     }
-    Err(Error::Invalid("not a format-4 container".into()))
+    Err(Error::Invalid("not a plaintext-v1 container; old volumes require their original release".into()))
 }
 impl Drop for Volume {
     fn drop(&mut self) {

@@ -130,7 +130,10 @@ public sealed partial class ApplicationService
             // placeholders when the user disables the quota or signs out.
             string sourceField = Flag(cache, "source_ready") ? "backing" : "origin_backing";
             string sourceAccount = cache.TryGetProperty(sourceField, out var source) ? Text(source, "account_id") : "";
-            bool available = (Flag(cache, "source_ready") || Flag(cache, "origin_ready")) && sourceAccount == account?.AccountId && client is not null && cloudReadsOpen && !exiting;
+            bool available = (Flag(cache, "source_ready") || Flag(cache, "origin_ready")) && sourceAccount == account?.AccountId && client is not null && cloudReadsOpen && !exiting
+                && CanReadCloudRoot(sourceAccount, Text(source, "remote_root"))
+                && (!cache.TryGetProperty("origin_backing", out var originSource) || originSource.ValueKind != JsonValueKind.Object
+                    || CanReadCloudRoot(Text(originSource, "account_id"), Text(originSource, "remote_root")));
             if (Flag(cache, "online") != available)
                 await worker.InvokeAsync("cache.online", Element(new { id, available }), ct);
         }

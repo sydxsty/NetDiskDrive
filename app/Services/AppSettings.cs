@@ -26,7 +26,11 @@ public sealed class AppSettings
     public Dictionary<string, LocalCacheSettings> LocalCaches { get; set; } = new();
     public Dictionary<string, CacheSourceRecord> CacheSources { get; set; } = new();
     public Dictionary<string, ReplicaCandidateRecord> ReplicaCandidates { get; set; } = new();
+    // Public per-volume parameters plus a key protected for the current Windows user.
+    // Passwords and plaintext keys never enter settings or the privileged worker.
+    public Dictionary<string, CloudKeyRecord> CloudKeys { get; set; } = new();
 }
+public sealed record CloudKeyRecord(string AccountId, string RemoteRoot, CloudEncryptionSettings? Encryption, string? ProtectedKey);
 public sealed class ReplicaCandidateRecord
 {
     public string Token { get; set; } = "";

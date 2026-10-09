@@ -7,6 +7,7 @@ internal static partial class Program
     private static readonly (string Name, Func<Task> Run)[] EncodedObjectTests =
     [
         ("encoded-object: canonical receipts survive restart and skip payload and cloud probes", EncodedReceipts),
+        ("encoded-object: encrypted receipts retain disk key identity and reject plaintext or alternate-key reuse", EncryptedReceipts),
         ("encoded-object: incompressible wire uses five exact parts and retries only its failed part", EncodedMultipart),
         ("encoded-object: bounded downloads use locate and transfer only and reject short extra or oversized data", EncodedDownloads),
         ("encoded-object: uncertain completion and failed mutations never invent canonical receipts", EncodedRecovery)
@@ -51,6 +52,35 @@ internal static partial class Program
             server.AccountId = 999; server.Calls.Clear();
             await using (var different = Cached(server, folder))
                 Assert(await different.TryGetEncodedReceiptAsync(descriptor) is null && server.Calls.Count == 1 && Calls(server, "account") == 1, "Encoded receipt crossed account identity");
+        }
+        finally { if (Directory.Exists(folder)) Directory.Delete(folder, true); }
+    }
+    private static async Task EncryptedReceipts()
+    {
+        string folder = CacheFolder(); using var server = new FakeBaidu { OpaqueMd5 = true };
+        using var encryption = CloudEncryptionContext.Create(Guid.NewGuid().ToString(), "password");
+        using var wrongKey = CloudEncryptionContext.Create(encryption.Settings.VolumeId, "password");
+        byte[] raw = new byte[8 << 20]; raw[4096] = 51;
+        var descriptor = new CanonicalObjectDescriptor("/encoded/encrypted.obj", raw.Length, Sha(raw), ObjectTransport.EncryptedCodec, encryption.Settings.Id);
+        try
+        {
+            await using (var client = Cached(server, folder))
+            {
+                await client.CreateDirectoryAsync("/encoded");
+                using var upload = await PreparedObjectUpload.CreateAsync(descriptor, new MemoryStream(raw), encryption);
+                var receipt = await client.PutEncodedAsync(upload);
+                Assert(receipt.Length < 8192 && server.Downloads == 0, "Encrypted zero tail was not compressed or success triggered a verification download");
+                server.Calls.Clear();
+                Assert(await client.TryGetEncodedReceiptAsync(descriptor) is { ReusedExisting: true } && server.Calls.Count == 0, "Encrypted receipt was not local");
+                await Error(async () => _ = await client.TryGetEncodedReceiptAsync(descriptor with { Codec = ObjectTransport.Codec, EncryptionId = null }), "ObjectConflict");
+                await Error(async () => _ = await client.TryGetEncodedReceiptAsync(descriptor with { EncryptionId = wrongKey.Settings.Id }), "ObjectConflict");
+            }
+            server.Calls.Clear();
+            await using (var restarted = Cached(server, folder))
+            {
+                Assert(await restarted.TryGetEncodedReceiptAsync(descriptor) is { ReusedExisting: true } && server.Calls.Count == 1 && Calls(server, "account") == 1,
+                    "Encrypted key identity did not survive receipt journal restart");
+            }
         }
         finally { if (Directory.Exists(folder)) Directory.Delete(folder, true); }
     }

@@ -1,6 +1,6 @@
 //! Validate the graph inside one downloaded metadata object. This never opens
 //! another object: later reads authenticate each missing child on demand.
-use super::codec::{self, hash, Crypto, MetaRef};
+use super::codec::{self, hash, PageCodec, MetaRef};
 use super::store::{self, Object, Page, PORTABLE, PORTMAP};
 use super::tree::{self, Node};
 use super::{Error, Geometry, Result, MAX_CAPACITY, PAGE};
@@ -86,10 +86,10 @@ fn shape(node: &Node) -> (u8, u64, u64) {
     }
 }
 
-/// The caller has authenticated the object header/body and decrypted its table.
+/// The caller has verified the object header/body and checked its plaintext table.
 /// Validate every contained node once, while those bytes are already in memory.
 pub(super) fn validate_object(
-    crypto: &Crypto,
+    crypto: &PageCodec,
     oid: u64,
     raw: &[u8],
     header: &Value,
@@ -116,8 +116,8 @@ pub(super) fn validate_object(
     let namespace_end = store::allocation_range(&config)?.end;
     if header["config"] != serde_json::to_value(&config)?
         || config.format_version != 4 || oid >= namespace_end
-        || config.crypto_id.unwrap_or(config.id) != crypto.id
-        || config.encrypted != crypto.key.is_some()
+        || config.integrity_id.unwrap_or(config.id) != crypto.id
+        || config.validate_plaintext().is_err()
         || config.capacity_bytes < 64 << 20
         || config.capacity_bytes > MAX_CAPACITY
         || !config.capacity_bytes.is_multiple_of(512)
@@ -188,7 +188,7 @@ pub(super) fn validate_object(
             .ok_or_else(|| integrity("portable root index depth"))?;
         if root["format_version"] != 4
             || root["container_id"] != config.id.to_string()
-            || root["crypto_id"] != crypto.id.to_string()
+            || root["integrity_id"] != crypto.id.to_string()
             || root["capacity_bytes"].as_u64() != Some(config.capacity_bytes)
             || root["page_size"] != PAGE
             || root["object_size"] != g.object_size

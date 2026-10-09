@@ -74,7 +74,7 @@ fn validate_publication(
             .as_str()
             .is_some_and(|v| v.eq_ignore_ascii_case(sha))
         || c["capacityBytes"].as_u64() != Some(source.capacity_bytes)
-        || c["encrypted"].as_bool() != Some(source.encrypted)
+        || !c["encrypted"].is_boolean()
         || c["objectSizeBytes"].as_u64() != Some(source.object_size)
         || c["rootSlot"].as_u64() != Some(0)
         || Uuid::parse_str(writer).is_err()
@@ -497,7 +497,7 @@ impl Volume {
         )?;
         if descriptor["format_version"] != 4
             || descriptor["container_id"] != source.id.to_string()
-            || descriptor["crypto_id"] != crypto.id.to_string()
+            || descriptor["integrity_id"] != crypto.id.to_string()
             || descriptor["capacity_bytes"].as_u64() != Some(source.capacity_bytes)
             || descriptor["page_size"] != PAGE
             || descriptor["object_size"] != g.object_size
@@ -1370,18 +1370,18 @@ mod tests {
         }
     }
     #[test]
-    fn cloud_restore_verifies_objects_reopens_each_step_and_preserves_crypto_identity() {
+    fn cloud_restore_verifies_objects_reopens_each_step_and_preserves_integrity_identity() {
         let dir = tempfile::tempdir().unwrap();
-        let (source, pages) = source(&dir, Some("cloud-password"));
+        let (source, pages) = source(&dir, None);
         let (job, root) = cloud_job(&source);
         let path = dir.path().join("restored.odv4");
         assert!(Volume::restore_begin_v4(&path, &root, Some("wrong")).is_err());
         assert!(!path.exists());
         let mut broken_root = root.clone();
         broken_root[17 * PAGE - 1000] ^= 1;
-        assert!(Volume::restore_begin_v4(&path, &broken_root, Some("cloud-password")).is_err());
+        assert!(Volume::restore_begin_v4(&path, &broken_root, None).is_err());
         assert!(!path.exists());
-        let mut target = Volume::restore_begin_v4(&path, &root, Some("cloud-password")).unwrap();
+        let mut target = Volume::restore_begin_v4(&path, &root, None).unwrap();
         let target_id = target.info().unwrap().id;
         assert_ne!(target_id, source.info().unwrap().id);
         let mut page = vec![0; PAGE];
@@ -1417,7 +1417,7 @@ mod tests {
                 }
             }
             drop(target);
-            target = Volume::open(&path, Some("cloud-password")).unwrap();
+            target = Volume::open(&path, None).unwrap();
             assert_eq!(target.info().unwrap().id, target_id);
             assert!(target.info().unwrap().restore_incomplete);
         }
@@ -1427,9 +1427,9 @@ mod tests {
         assert!(!target.info().unwrap().restore_incomplete);
         readback(&target, &pages);
         drop(target);
-        let target = Volume::open(&path, Some("cloud-password")).unwrap();
+        let target = Volume::open(&path, None).unwrap();
         readback(&target, &pages);
-        assert!(Volume::restore_begin_v4(&path, &root, Some("cloud-password")).is_err());
+        assert!(Volume::restore_begin_v4(&path, &root, None).is_err());
         readback(&target, &pages);
     }
     #[test]
@@ -1459,13 +1459,13 @@ mod tests {
         );
     }
     #[test]
-    fn local_restore_reopens_with_an_independent_key_and_retries_source_pin_cleanup() {
+    fn local_restore_reopens_with_independent_identity_and_retries_source_pin_cleanup() {
         let dir = tempfile::tempdir().unwrap();
-        let (source, pages) = source(&dir, Some("source-password"));
+        let (source, pages) = source(&dir, None);
         let snapshot = source.snapshot_create().unwrap();
         let path = dir.path().join("local.odv4");
         let mut target =
-            Volume::restore_snapshot_begin_v4(&source, &snapshot, &path, Some("target-password"))
+            Volume::restore_snapshot_begin_v4(&source, &snapshot, &path, None)
                 .unwrap();
         let id = target.info().unwrap().id;
         target
@@ -1473,7 +1473,7 @@ mod tests {
             .unwrap();
         drop(target);
         source.snapshot_release(&snapshot).unwrap();
-        target = Volume::open(&path, Some("target-password")).unwrap();
+        target = Volume::open(&path, None).unwrap();
         assert_eq!(
             target.control(&json!({"cmd":"restore.status"})).unwrap()["phase"],
             "needs_source"
@@ -1507,7 +1507,7 @@ mod tests {
             s.cloud = c;
         }
         drop(target);
-        target = Volume::open(&path, Some("target-password")).unwrap();
+        target = Volume::open(&path, None).unwrap();
         assert_eq!(target.info().unwrap().id, id);
         assert!(target.control(&json!({"cmd":"restore.status"})).unwrap()
             ["source_pin_cleanup_pending"]
@@ -1529,9 +1529,9 @@ mod tests {
             .all(|s| s.pin != "restore"));
         readback(&target, &pages);
         drop(target);
-        assert!(Volume::open(&path, Some("source-password")).is_err());
+        assert!(Volume::open(&path, Some("unsupported-local-password")).is_err());
         readback(
-            &Volume::open(&path, Some("target-password")).unwrap(),
+            &Volume::open(&path, None).unwrap(),
             &pages,
         );
     }

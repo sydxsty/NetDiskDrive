@@ -360,7 +360,7 @@ impl Drop for ReadLease {
 pub(super) struct Store {
     pub device: Arc<Device>,
     pub config: Config,
-    pub crypto: Arc<Crypto>,
+    pub crypto: Arc<PageCodec>,
     pub readers: Arc<Mutex<ReadRegistry>>,
     prepare_cache: PrepareCache,
     pub root: Root,
@@ -494,7 +494,7 @@ impl Store {
             .map(|v| u64::from_le_bytes(v.try_into().unwrap()))
             .unwrap_or(0))
     }
-    pub fn open(device: Device, config: Config, crypto: Crypto) -> Result<Self> {
+    pub fn open(device: Device, config: Config, crypto: PageCodec) -> Result<Self> {
         device.set_control_region(crypto.geometry.object_size)?;
         let mut choices = Vec::new();
         for i in [1, 2] {
@@ -579,7 +579,7 @@ impl Store {
         }
         Ok(s)
     }
-    pub fn create(device: Device, config: Config, crypto: Crypto) -> Result<Self> {
+    pub fn create(device: Device, config: Config, crypto: PageCodec) -> Result<Self> {
         let g = crypto.geometry;
         device.set_control_region(g.object_size)?;
         device.grow(g.object_size)?;
@@ -728,7 +728,7 @@ fn node_position(r: MetaRef, objects: &BTreeMap<u64, Object>, g: Geometry) -> Re
     Ok(object.extent * g.object_size + logical % g.object_size)
 }
 
-fn prefetch_frames(cache: &mut PrepareCache, device: &Device, crypto: &Crypto,
+fn prefetch_frames(cache: &mut PrepareCache, device: &Device, crypto: &PageCodec,
     epoch: u64, mut positions: Vec<(u64, MetaRef)>) -> Result<()> {
     positions.sort_by_key(|(offset, _)| *offset);
     let mut first = 0;
@@ -1024,22 +1024,22 @@ impl Txn<'_> {
     }
     pub fn append_page(&mut self, index: u64, bytes: &[u8; PAGE], pool: usize) -> Result<Page> {
         let encoded =
-            super::crypto_work::encode_one(&self.store.crypto, index, self.root.seq + 1, bytes)?;
+            super::page_work::encode_one(&self.store.crypto, index, self.root.seq + 1, bytes)?;
         *self
             .store
             .diagnostics
-            .entry("crypto_pages".into())
+            .entry("page_encoded_pages".into())
             .or_default() += 1;
         *self
             .store
             .diagnostics
-            .entry("crypto_nonce_batches".into())
+            .entry("page_encode_batches".into())
             .or_default() += 1;
         self.append_encoded(encoded, pool)
     }
     pub fn append_encoded(
         &mut self,
-        mut encoded: super::crypto_work::EncodedPage,
+        mut encoded: super::page_work::EncodedPage,
         pool: usize,
     ) -> Result<Page> {
         let g = self.geometry();
@@ -1713,10 +1713,10 @@ impl Storage for Txn<'_> {
         Ok(())
     }
 }
-pub(super) fn read_blob(device: &Device, crypto: &Crypto, r: MetaRef) -> Result<Vec<u8>> {
+pub(super) fn read_blob(device: &Device, crypto: &PageCodec, r: MetaRef) -> Result<Vec<u8>> {
     read_blob_frames(crypto, r, |offset, frame| device.read(offset, frame))
 }
-fn read_blob_frames(crypto: &Crypto, mut r: MetaRef,
+fn read_blob_frames(crypto: &PageCodec, mut r: MetaRef,
     mut read: impl FnMut(u64, &mut [u8; PAGE]) -> Result<()>) -> Result<Vec<u8>> {
     let mut out = Vec::new();
     let mut visited = BTreeSet::new();
@@ -1738,7 +1738,7 @@ fn read_blob_frames(crypto: &Crypto, mut r: MetaRef,
     }
     Ok(out)
 }
-pub(super) fn decode_header(crypto: &Crypto, oid: u64, raw: &[u8]) -> Result<serde_json::Value> {
+pub(super) fn decode_header(crypto: &PageCodec, oid: u64, raw: &[u8]) -> Result<serde_json::Value> {
     let g = crypto.geometry;
     if raw.len() != g.object_size as usize {
         return Err(Error::Invalid("object length does not match volume geometry".into()));
@@ -1943,6 +1943,7 @@ pub(super) fn public_config(raw: &[u8]) -> Result<Config> {
         return Err(Error::Integrity("portable configuration checksum".into()));
     }
     let config: Config = serde_json::from_slice(&raw[start + 12..start + 12 + length])?;
+    config.validate_plaintext()?;
     if config.object_size != g.object_size {
         return Err(Error::Integrity(
             "public configuration object size mismatch".into(),
@@ -1968,7 +1969,7 @@ pub(super) fn parse_hex<const N: usize>(v: &str) -> Result<[u8; N]> {
     Ok(out)
 }
 pub(super) fn external_table(
-    crypto: &Crypto,
+    crypto: &PageCodec,
     oid: u64,
     raw: &[u8],
 ) -> Result<BTreeMap<u64, (Uuid, [u8; 32])>> {
@@ -2306,7 +2307,7 @@ impl Txn<'_> {
 }
 fn load_free(
     device: &Device,
-    crypto: &Crypto,
+    crypto: &PageCodec,
     mut reference: MetaRef,
 ) -> Result<(Free, Vec<MetaRef>)> {
     let mut logs = Vec::new();

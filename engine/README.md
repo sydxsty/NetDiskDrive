@@ -1,6 +1,6 @@
 # OverlayDisk storage engine
 
-The current engine uses one local container, authenticated copy-on-write storage,
+The current engine uses one local container, plaintext copy-on-write storage with integrity checks,
 and lazy immutable cloud objects. See [the current format and durability guide](README-v4.md)
 for its geometry, APIs, persistence guarantees, and verification boundaries.
 

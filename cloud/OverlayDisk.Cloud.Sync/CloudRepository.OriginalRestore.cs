@@ -25,7 +25,7 @@ public sealed partial class CloudRepository
     {
         ArgumentNullException.ThrowIfNull(expectedCommit);
         string root = RootPath(volumeId), expectedPath = CommitPath(root, expectedCommit);
-        ValidateCommit(root, expectedPath, expectedCommit);
+        AuthenticateCommit(root, expectedCommit);
         if (expectedCommit.VolumeId != volumeId) throw new IOException("恢复目标身份与原云盘不一致。");
 
         var account = await Store.ValidateAsync(ct);

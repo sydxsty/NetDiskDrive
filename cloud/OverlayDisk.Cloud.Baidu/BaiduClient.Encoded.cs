@@ -14,7 +14,7 @@ public sealed partial class BaiduClient
             if (cache is null) return null;
             var proof = await cache.LookupAsync(path, cancellationToken).ConfigureAwait(false);
             if (proof.Item?.Canonical is not { } saved) return null;
-            if (saved.Path != descriptor.Path || saved.Length != descriptor.Length || saved.Codec != descriptor.Codec ||
+            if (saved.Path != descriptor.Path || saved.Length != descriptor.Length || saved.Codec != descriptor.Codec || saved.EncryptionId != descriptor.EncryptionId ||
                 !saved.Sha256.Equals(descriptor.Sha256, StringComparison.OrdinalIgnoreCase) || proof.Item.Info.IsDirectory)
                 throw new CloudObjectConflictException(path);
             return proof.Item.Info with { ReusedExisting = true };

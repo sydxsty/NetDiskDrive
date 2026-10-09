@@ -1,11 +1,21 @@
 # Current OverlayDisk container format
 
 The current engine uses the `.odv4` extension and the `v4::Volume` / `od_v4_*`
-interfaces, with the new **ODV4CFGO** configuration magic. Every configuration
-contains an explicit 4/8/16 MiB `object_size`, included in the password envelope's
-associated data. Other configuration fields are explicit as well. Earlier magic
-values, omitted geometry and old schema recovery paths are rejected; there is no
-conversion or migration. Historical source and release artifacts are not inputs
+interfaces, with **ODV4PLN1** configuration magic and mandatory
+`local_storage: "plaintext-v1"`. Metadata frames use **ODV4METP**. Local containers
+and canonical objects are always plaintext; `encrypted` is always false. Local
+configuration contains no password salt, key envelope or encryption key. Its
+`integrity_id` binds checksums across original disks and independent copies.
+Cloud compression and encryption are handled by the managed transport layer,
+after native export and before upload; downloads are decrypted/decompressed
+before native import. A cloud commit's `encrypted` flag describes that transport,
+not the local container.
+
+Every configuration contains an explicit 4/8/16 MiB `object_size`. Earlier
+configuration magic, omitted plaintext marker, encryption fields and old schema
+recovery paths are rejected. There is no conversion or migration. Existing ABI
+password parameters accept only null/empty values; nonempty passwords fail before
+creating a local file. Historical source and release artifacts are not inputs
 to the current application.
 
 ## Geometry
@@ -21,7 +31,7 @@ addresses; an object is not a fixed logical-address stripe.
 | 16 MiB | 65 | 4031 | 4096 |
 
 Each object has one header page followed by the descriptor table. The last 1 KiB
-of the table contains the public KDF/configuration record, authenticated by the
+of the table contains the public plaintext configuration record, covered by the
 object's body hash. Metadata objects reserve their first payload slot for a root
 descriptor when needed; other slots contain authenticated portable index nodes.
 All physical extents, slot keys, dependency keys, portable offsets, bounds and
@@ -43,9 +53,11 @@ Normal writes acknowledge a bounded in-memory version visible to following
 reads. Background persistence limits dirty memory. Flush and FUA wait for the
 ordered prefix to reach stable storage; Close alone does not imply Flush.
 
-Pages have independent authentication and authenticated plaintext digests.
+Pages have independent position/version-bound checksums and SHA-256 content digests.
+These detect corruption; local plaintext storage does not protect against malicious
+local editing. Cloud AEAD is responsible for remote adversarial authentication.
 Identical writes do not create new versions. Dirty pages retain their digest so
-commit and encoding do not repeatedly hash the same plaintext. Encrypted batches
+commit and encoding do not repeatedly hash the same plaintext. Page encoding batches
 of at least 128 pages can use at most four persistent CPU workers, 64 pages per
 task and eight queued tasks. Small batches run directly; publication remains an
 ordered transaction.
@@ -66,7 +78,7 @@ cut rotates the active pools and later prepares only the frozen version. Five
 pools isolate ordinary/unclassified data, MFT, NTFS log, USN and other recognized
 metadata. Classification is advisory: unknown content is always retained.
 
-Seal consumes immutable ciphertext still owned by its transaction directly,
+Seal consumes immutable plaintext still owned by its transaction directly,
 without first writing and rereading it. Existing tail pages are read and their
 authentication and original digest verified. Framing is written separately;
 payload reaches its final position once. Unused tail bytes are logical zeros:
@@ -116,7 +128,10 @@ These are local control records and are never added to cloud upload objects.
 
 `read_export` returns leased, immutable **canonical raw bytes**. The saved SHA and
 length describe those bytes. The cloud transport verifies that SHA, then wraps
-zstd-compressed bytes in the fixed `zstd-v1` envelope. Wire SHA/length/part MD5 are
+zstd-compressed bytes in the `zstd-v2` envelope, or encrypts the compressed
+bytes with AES-256-GCM in `zstd-aes256gcm-v2`. Per-disk salt and key derivation
+are managed transport concerns; the native store receives no cloud password.
+Wire SHA/length/part MD5 are
 separate from canonical SHA/length. Confirmed compressed upload receipts still
 become canonical native receipts. The native library contains no cloud protocol,
 credentials or zstd transform. See `docs/ZSTD-PROVENANCE.md` for the wire profile.

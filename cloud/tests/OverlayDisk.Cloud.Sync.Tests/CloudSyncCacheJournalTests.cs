@@ -26,7 +26,7 @@ internal static class CloudSyncCacheJournalTests
     ];
     private static void Assert(bool condition, string reason) { if (!condition) throw new Exception(reason); }
     private static RemoteCommit Commit(ulong generation = 1, string rootId = "root-current") =>
-        new(4, VolumeId, WriterId, generation, "Cache test", 64UL << 20, true, rootId, new string('a', 64), DateTimeOffset.UnixEpoch);
+        new(4, VolumeId, WriterId, generation, "Cache test", 64UL << 20, false, rootId, new string('a', 64), DateTimeOffset.UnixEpoch);
     private static CloudSyncCacheState State(int pending = 0)
     {
         var commit = Commit();

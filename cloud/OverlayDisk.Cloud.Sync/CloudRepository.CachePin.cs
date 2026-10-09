@@ -29,6 +29,7 @@ public sealed partial class CloudRepository
         if (!state.OwnerConfirmed || !state.LatestKnown || state.Latest is not { } commit || state.Publication is not null ||
             state.ClosureGeneration != commit.Generation || state.PublishedCommitPath != state.LatestPath || commit.WriterId != binding.DeviceId)
             throw new IOException("请先完成并确认一次云同步，再启用已同步数据的本地缓存回收。");
+        AuthenticateCommit(binding.RemoteRoot, commit);
         await EnsureWriterAsync(binding, volumeId, state, ct);
         await EnsureFolderAsync(state, binding.RemoteRoot + "/readers", ct);
         string path = CachePinPath(binding.RemoteRoot, volumeId);

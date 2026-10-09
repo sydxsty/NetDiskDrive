@@ -4,7 +4,6 @@ use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::sync::atomic::AtomicUsize;
 
-const PASSWORD: &str = "geometry-isolated-fixture";
 const CAPACITY: u64 = 96 << 20;
 const START: u64 = 8 << 20;
 fn data(length: usize) -> Vec<u8> {
@@ -93,7 +92,8 @@ fn provider(
 #[test]
 fn all_object_sizes_preserve_cross_object_writes_snapshots_and_reopen() {
     for size in [4 << 20, 8 << 20, 16 << 20] {
-        for password in [None, Some(PASSWORD)] {
+        {
+            let password: Option<&str> = None;
             let directory = tempfile::tempdir().unwrap();
             let path = directory.path().join("source.odv4");
             Volume::create_sized(&path, CAPACITY, password, size).unwrap();
@@ -142,8 +142,8 @@ fn large_cloud_objects_roundtrip_full_and_lazy_original_restore() {
     for size in [4 << 20, 8 << 20, 16 << 20] {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("source.odv4");
-        Volume::create_sized(&path, CAPACITY, Some(PASSWORD), size).unwrap();
-        let v = Volume::open(&path, Some(PASSWORD)).unwrap();
+        Volume::create_sized(&path, CAPACITY, None, size).unwrap();
+        let v = Volume::open(&path, None).unwrap();
         let binding = bind(&v);
         let expected = data((Geometry::new(size).unwrap().slots as usize + 3) * PAGE);
         v.write(START, &expected).unwrap();
@@ -152,7 +152,7 @@ fn large_cloud_objects_roundtrip_full_and_lazy_original_restore() {
         let root_id = job["root_object_id"].as_str().unwrap();
         let raw = &objects[root_id];
         let full =
-            Volume::restore_begin_v4(directory.path().join("full.odv4"), raw, Some(PASSWORD))
+            Volume::restore_begin_v4(directory.path().join("full.odv4"), raw, None)
                 .unwrap();
         restore(&full, &objects);
         assert_eq!(full.object_size(), size);
@@ -168,7 +168,7 @@ fn large_cloud_objects_roundtrip_full_and_lazy_original_restore() {
         let options = json!({"mode":"original","lazy":true,"source_volume_id":source,"backing":backing,"publication":{"binding":binding,"commit":commit}});
         let target_path = directory.path().join("original.odv4");
         let lazy =
-            Volume::restore_begin_options(&target_path, raw, Some(PASSWORD), options).unwrap();
+            Volume::restore_begin_options(&target_path, raw, None, options).unwrap();
         restore(&lazy, &objects);
         assert_eq!(lazy.info().unwrap().id, source);
         assert!(lazy.control(&json!({"cmd":"cloud.prepare"})).unwrap()["job"].is_null());
@@ -186,7 +186,7 @@ fn large_cloud_objects_roundtrip_full_and_lazy_original_restore() {
         assert!(calls.load(Ordering::SeqCst) > 0);
         assert!(lazy.control(&json!({"cmd":"cloud.prepare"})).unwrap()["job"].is_null());
         drop(lazy);
-        let lazy = Volume::open(&target_path, Some(PASSWORD)).unwrap();
+        let lazy = Volume::open(&target_path, None).unwrap();
         lazy.read(START, &mut actual).unwrap();
         assert_eq!(actual, expected);
     }
@@ -197,8 +197,8 @@ fn large_object_compaction_and_cache_preserve_identity_and_sync_generation() {
     for size in [8 << 20, 16 << 20] {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("source.odv4");
-        Volume::create_sized(&path, CAPACITY, Some(PASSWORD), size).unwrap();
-        let v = Volume::open(&path, Some(PASSWORD)).unwrap();
+        Volume::create_sized(&path, CAPACITY, None, size).unwrap();
+        let v = Volume::open(&path, None).unwrap();
         v.write(START, &[12; PAGE]).unwrap();
         let temporary = v.snapshot_create().unwrap();
         v.snapshot_manifest(&temporary).unwrap();
@@ -270,8 +270,8 @@ fn large_object_compaction_and_cache_preserve_identity_and_sync_generation() {
 }
 
 #[test]
-fn geometry_configuration_requires_size_and_authenticates_it() {
-    let (current, _) = Config::create(CAPACITY, Some(PASSWORD)).unwrap();
+fn geometry_configuration_requires_size_and_checksum_protects_it() {
+    let (current, _) = Config::create(CAPACITY, None).unwrap();
     let json = serde_json::to_value(&current).unwrap();
     assert_eq!(json["object_size"], OBJECT);
     let mut missing = json.clone();
@@ -279,14 +279,14 @@ fn geometry_configuration_requires_size_and_authenticates_it() {
     assert!(serde_json::from_value::<Config>(missing).is_err());
     let decoded: Config = serde_json::from_value(json).unwrap();
     assert_eq!(decoded.object_size, OBJECT);
-    decoded.unlock(Some(PASSWORD)).unwrap();
-    assert_eq!(&current.encode().unwrap()[..8], b"ODV4CFGO");
+    decoded.unlock(None).unwrap();
+    assert_eq!(&current.encode().unwrap()[..8], b"ODV4PLN1");
     for size in [8 << 20, 16 << 20] {
-        let (c, _) = Config::create_sized(CAPACITY, Some(PASSWORD), size).unwrap();
-        assert_eq!(&c.encode().unwrap()[..8], b"ODV4CFGO");
-        let mut swapped = c.clone();
-        swapped.object_size = if size == 8 << 20 { 16 << 20 } else { 8 << 20 };
-        assert!(swapped.unlock(Some(PASSWORD)).is_err());
+        let (c, _) = Config::create_sized(CAPACITY, None, size).unwrap();
+        assert_eq!(&c.encode().unwrap()[..8], b"ODV4PLN1");
+        let mut corrupt = c.encode().unwrap();
+        corrupt[20] ^= 1;
+        assert!(Config::decode(&corrupt).is_err());
     }
     for invalid in [0, 2 << 20, 12 << 20, 32 << 20] {
         assert!(Geometry::new(invalid).is_err());

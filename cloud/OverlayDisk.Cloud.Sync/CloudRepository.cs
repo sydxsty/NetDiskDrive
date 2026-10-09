@@ -129,14 +129,14 @@ public sealed partial class CloudRepository(ICloudObjectStore store, ICloudSyncC
     {
         ValidateRoot(root);
         CloudObjectGeometry.Validate(objectSizeBytes);
-        var descriptor = new CanonicalObjectDescriptor(ObjectPath(root, id), objectSizeBytes, expectedHash);
+        var descriptor = ObjectDescriptor(root, id, objectSizeBytes, expectedHash);
         ObjectTransport.ValidateDescriptor(descriptor);
         int maximum = ObjectTransport.MaxWireLength(objectSizeBytes);
         await using var stream = store is ICloudBoundedObjectReader bounded
             ? await bounded.OpenReadBoundedAsync(descriptor.Path, maximum, ct)
             : await store.OpenReadAsync(descriptor.Path, null, ct);
         var wire = await ReadBoundedAsync(stream, maximum, ct);
-        return ObjectTransport.Decode(wire, descriptor);
+        return ObjectTransport.Decode(wire, descriptor, EncryptionContext(root));
     }
     internal static (ulong Generation, string RootId) ValidateCommitPath(string root, string path)
     {
@@ -150,8 +150,9 @@ public sealed partial class CloudRepository(ICloudObjectStore store, ICloudSyncC
     {
         ValidateRoot(root); ValidateCommitPath(root, path);
         if (commit is null) throw new IOException("云端提交描述无效。");
-        if (commit.FormatVersion != 4 || commit.RootSlot != 0 || commit.TransportCodec != ObjectTransport.Codec || !CloudObjectGeometry.IsSupported(commit.ObjectSizeBytes) || commit.CapacityBytes < 64UL * 1024 * 1024 || commit.CapacityBytes > MaximumCapacityBytes || commit.CapacityBytes % 512 != 0
+        if (commit.FormatVersion != 4 || commit.RootSlot != 0 || !ObjectTransport.IsSupportedCodec(commit.TransportCodec) || !CloudObjectGeometry.IsSupported(commit.ObjectSizeBytes) || commit.CapacityBytes < 64UL * 1024 * 1024 || commit.CapacityBytes > MaximumCapacityBytes || commit.CapacityBytes % 512 != 0
             || commit.RootSha256 is not { Length: 64 } || !commit.RootSha256.All(Uri.IsHexDigit) || !Guid.TryParse(commit.VolumeId, out _) || !Guid.TryParse(commit.WriterId, out _)) throw new IOException("云端提交描述不受支持。");
+        ValidateCommitEncryption(commit);
         Component(commit.RootObjectId);
         if (!IsRootForVolume(root, commit.VolumeId) || CommitPath(root, commit) != path) throw new IOException("云端版本路径与身份不一致。");
     }
@@ -163,7 +164,7 @@ public sealed partial class CloudRepository(ICloudObjectStore store, ICloudSyncC
         if (!document.RootElement.TryGetProperty("objectSizeBytes", out _) || !document.RootElement.TryGetProperty("transportCodec", out var codec))
             throw new UnsupportedCloudFormatException();
         if (codec.ValueKind != JsonValueKind.String) throw new IOException("云端提交描述的压缩格式字段损坏。");
-        if (codec.GetString() != ObjectTransport.Codec) throw new UnsupportedCloudFormatException();
+        if (!ObjectTransport.IsSupportedCodec(codec.GetString())) throw new UnsupportedCloudFormatException();
         var commit = JsonSerializer.Deserialize<RemoteCommit>(bytes, Json) ?? throw new IOException("云端提交描述无效。");
         ValidateCommit(root, path, commit); return commit;
     }
@@ -187,7 +188,7 @@ public sealed partial class CloudRepository(ICloudObjectStore store, ICloudSyncC
     }
     public async Task<IReadOnlyList<RemoteDisk>> ListDisksAsync(CancellationToken ct)
     {
-        var disks = new List<RemoteDisk>(); if (await store.HeadAsync(BasePath, ct) is null) return disks;
+        var disks = new List<RemoteDisk>(); if (await store.HeadAsync(BasePath, ct) is null) { await store.CreateDirectoryAsync(BasePath, ct); return disks; }
         await foreach (var directory in store.ListAsync(BasePath, ct))
         {
             if (!directory.IsDirectory || !IsRootForVolume(directory.Path, directory.Path[(directory.Path.LastIndexOf('/') + 1)..])) continue;
@@ -208,7 +209,7 @@ public sealed partial class CloudRepository(ICloudObjectStore store, ICloudSyncC
     }
     public async Task<string> PinReaderAsync(string root, RemoteCommit commit, string readerId, CancellationToken ct)
     {
-        ValidateCommit(root, CommitPath(root, commit), commit);
+        AuthenticateCommit(root, commit);
         if (!IsRootForVolume(root, commit.VolumeId) || commit.RootSha256 is not { Length: 64 } || !commit.RootSha256.All(Uri.IsHexDigit)) throw new IOException("恢复引用与目录身份不一致。");
         Component(commit.RootObjectId);
         string path = root + "/readers/" + Component(readerId) + ".json";
@@ -222,4 +223,4 @@ public sealed partial class CloudRepository(ICloudObjectStore store, ICloudSyncC
     }
 }
 
-public sealed class UnsupportedCloudFormatException() : IOException("云端版本不是当前 zstd-v1 对象格式；本版本不读取或迁移旧格式。");
+public sealed class UnsupportedCloudFormatException() : IOException("云端版本不是当前云端对象格式；本版本不读取或迁移旧格式。");

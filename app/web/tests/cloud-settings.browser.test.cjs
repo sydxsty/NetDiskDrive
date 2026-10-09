@@ -88,7 +88,7 @@ const out=path.resolve(process.argv[2]),web=path.resolve(__dirname,'..');fs.mkdi
   for(const size of [4,8,16]){
    await page.locator('header [data-action="create"]').click();
    assert.deepEqual(await page.locator('#objectSize option').evaluateAll(nodes=>nodes.map(n=>Number(n.value))),[4194304,8388608,16777216]);
-   await page.locator('#objectSize').selectOption(String(size*1048576));await page.locator('#encrypted').uncheck();
+   await page.locator('#objectSize').selectOption(String(size*1048576));assert.equal(await page.locator('#encrypted,#password').count(),0);
    await page.evaluate(()=>{document.querySelector('#path').value='C:\\IsolatedFixture\\new-size.odv4';});
    await page.locator('#dialogSubmit').click();await page.locator('#dialog').waitFor({state:'hidden'});
    const created=await page.evaluate(()=>window.__calls.filter(c=>c.method==='disks.create').at(-1));assert.equal(created.args.objectSizeBytes,size*1048576);

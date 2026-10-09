@@ -66,7 +66,7 @@ public sealed partial class CloudRepository
         if (!document.RootElement.TryGetProperty("objectSizeBytes", out _) || !document.RootElement.TryGetProperty("transportCodec", out var codec))
             throw new UnsupportedCloudFormatException();
         if (codec.ValueKind != JsonValueKind.String) throw new IOException("云端提交描述的压缩格式字段损坏。");
-        if (codec.GetString() != ObjectTransport.Codec) throw new UnsupportedCloudFormatException();
+        if (!ObjectTransport.IsSupportedCodec(codec.GetString())) throw new UnsupportedCloudFormatException();
         var commit = JsonSerializer.Deserialize<RemoteCommit>(bytes, Json) ?? throw new IOException("云端提交描述无效。");
         ValidateCommit(root, info.Path, commit);
         return commit;
@@ -77,14 +77,14 @@ public sealed partial class CloudRepository
     {
         ValidateRoot(root);
         CloudObjectGeometry.Validate(objectSizeBytes);
-        var descriptor = new CanonicalObjectDescriptor(ObjectPath(root, id), objectSizeBytes, expectedHash);
+        var descriptor = ObjectDescriptor(root, id, objectSizeBytes, expectedHash);
         ObjectTransport.ValidateDescriptor(descriptor);
         int maximum = ObjectTransport.MaxWireLength(objectSizeBytes);
         await using var stream = store is ICloudBoundedObjectReader bounded
             ? await bounded.OpenReadBoundedAsync(descriptor.Path, maximum, ct).ConfigureAwait(false)
             : await store.OpenReadAsync(descriptor.Path, null, ct).ConfigureAwait(false);
         var wire = await ReadBoundedAsync(stream, maximum, ct).ConfigureAwait(false);
-        return (ObjectTransport.Decode(wire, descriptor), wire.LongLength);
+        return (ObjectTransport.Decode(wire, descriptor, EncryptionContext(root)), wire.LongLength);
     }
 
     /// <summary>Create durable reader protection and recheck the source generation before adopting it.</summary>
@@ -100,7 +100,7 @@ public sealed partial class CloudRepository
     public async Task<string> EnsureReplicaReaderAsync(string root, RemoteCommit commit, string readerId,
         bool previouslyConfirmed, CancellationToken ct = default)
     {
-        ValidateCommit(root, CommitPath(root, commit), commit);
+        AuthenticateCommit(root, commit);
         string path = root + "/readers/" + Component(readerId) + ".json";
         await store.CreateDirectoryAsync(root + "/readers", ct).ConfigureAwait(false);
         var payload = JsonSerializer.SerializeToUtf8Bytes(new { formatVersion = 4, rootObjectId = commit.RootObjectId, rootSha256 = commit.RootSha256, generation = commit.Generation }, Json);
@@ -127,7 +127,8 @@ public sealed partial class CloudRepository
         {
             bool hasNext;
             try { hasNext = await directories.MoveNextAsync().ConfigureAwait(false); }
-            catch (CloudObjectNotFoundException) { break; }
+            catch (CloudObjectNotFoundException) { await store.CreateDirectoryAsync(BasePath, ct).ConfigureAwait(false); break; }
+            catch (CloudProviderException error) when (error.Code is "Baidu:-9" or "Baidu:31066") { await store.CreateDirectoryAsync(BasePath, ct).ConfigureAwait(false); break; }
             if (!hasNext) break;
             var directory = directories.Current;
             if (!directory.IsDirectory || !IsRootForVolume(directory.Path, directory.Path[(directory.Path.LastIndexOf('/') + 1)..])) continue;

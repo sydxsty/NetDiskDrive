@@ -18,7 +18,7 @@ The native job supplies authenticated canonical descriptors and incremental
 add/remove sets. Existing native receipts skip source reads. An optional
 `ICloudEncodedObjectStore` is asked for a confirmed canonical receipt before
 opening source bytes. On a miss, `PreparedObjectUpload.CreateAsync` reads and
-verifies the canonical object once, encodes its sealed bytes as `zstd-v1`, and
+verifies the canonical object once, encodes its sealed bytes as `zstd-v2`, and
 owns an immutable wire buffer. The provider uploads/retries that same buffer,
 using its independent wire SHA-256, length, and per-4-MiB MD5 list. Canonical
 SHA/size always remain native identity; wire identity never substitutes for them.
@@ -191,7 +191,7 @@ is mandatory and comes from native volume information. Native status/job
 `object_size`, each export, canonical root receipts, and logical progress must
 match that immutable geometry. Missing or conflicting size is an error before
 publication. `RemoteCommit` requires explicit JSON `objectSizeBytes` and
-`transportCodec: "zstd-v1"`; no missing-field or raw-object fallback exists.
+`transportCodec: "zstd-v2"`; no missing-field or raw-object fallback exists.
 `RemoteDisk.ObjectSizeBytes` exposes actual geometry for browsing. Listings skip
 only explicitly unsupported old-format volumes, preserving I/O and corruption
 errors. The old directories and objects are not moved or deleted.
@@ -203,7 +203,7 @@ single standard zstd frame are mandatory. Dictionary references, window sizes
 above 16 MiB, missing/wrong content size, extra frames, trailing bytes, truncated
 streams, and canonical SHA mismatch fail. The authenticated expected SHA comes
 from the caller's native descriptor or selected commit, never from the envelope
-alone. Native root authentication must additionally verify the imported root.
+alone. Native root validation must additionally verify the imported plaintext root.
 Copy and original restores preserve source object geometry.
 
 `ICloudBoundedObjectReader` avoids Head/LIST for variable wire lengths: the Baidu
@@ -231,3 +231,42 @@ Current focused offline verification: `--filter object-transport` selects the
 preparation progress, receipt-before-read, acknowledgment ordering, retries,
 zero-request no-op and explicit cleanup. All fixtures use local model stores;
 these are correctness checks, not throughput measurements or real-account tests.
+
+
+## Cloud-only encryption
+
+Local native objects contain plaintext. Every new cloud `.obj`, including data,
+index and root, is first compressed with zstd and may then be encrypted with
+AES-256-GCM. The plaintext transport is `zstd-v2`; encrypted transport is
+`zstd-aes256gcm-v2`. Old formats are unsupported and are never migrated implicitly.
+
+`CloudEncryptionContext.Create(volumeId, password)` creates a random 32-byte disk
+salt once and derives a 32-byte master key with PBKDF2-HMAC-SHA256, exactly 600,000
+iterations. The public `CloudEncryptionSettings` is retained in each commit;
+`Unlock` validates its bounded, fixed parameters and its key check before any
+object download. A salt prevents shared password precomputation; it does not
+make a weak password resistant to targeted offline guessing. The application
+persists the exported master key only through Windows DPAPI. No plaintext
+password or unprotected key belongs in the cloud or ordinary settings JSON.
+
+`RegisterEncryption(root, context)` configures a repository; callers own context
+lifetime. `AuthenticateCommit` is required before adopting a listed version.
+A HMAC authenticates every typed commit field, including volume, writer,
+generation, root/hash, capacity, geometry and encryption profile. Registered
+encrypted roots reject a plaintext downgrade. Public commit names, sizes and
+key-derivation settings remain visible; object content and indexes are encrypted.
+
+The AES key is separately derived from the master key. Each object's 96-bit
+pseudorandom nonce is derived using a domain-separated HMAC over its immutable
+path, canonical size/hash, encryption identity and compressed payload hash.
+Identical retries retain identical ciphertext without a per-object nonce journal;
+a different compressed representation cannot reuse the same nonce/plaintext
+combination. Codec/compressor profile changes still require a new transport
+identity. GCM authenticates the header and descriptor; failed authentication
+returns before zstd inspects the payload. Receipt identity includes the full
+public encryption settings identity, preventing plaintext/wrong-key reuse.
+
+`--filter cloud-encryption` covers all object sizes, compression order, password,
+KDF bounds, tampering and substitution, authenticated commits, reader lazy reads,
+stable salt, zero-request unchanged sync, lost acknowledgements and missing
+`/OverlayDisk` creation. These are offline correctness tests.

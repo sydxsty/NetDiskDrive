@@ -110,7 +110,7 @@ HTTP handler 可注入。默认自动重定向关闭，手工仅跟随 GET 的�
 
 ## zstd 对象传输与原始身份
 
-当前同步层使用 `ICloudEncodedObjectStore`：先用 `CanonicalObjectDescriptor(path, 4/8/16MiB, canonicalSHA, "zstd-v1")` 查询 `TryGetEncodedReceiptAsync`；未命中才读取本地对象并创建 `PreparedObjectUpload`，然后 `PutEncodedAsync`。工厂先一次读取并核对原始 sealed 字节的 SHA，再按固定 codec 生成独占 wire 缓冲。wire 自己具有长度、SHA、整体及每 4 MiB 分片 MD5，HTTP 重试共用它。后台缓存的同一条 WAL 回执同时记录 canonical 身份和已确认 wire 身份；重启仍可在读源前命中。普通 wire SHA 回执不能自行充当 canonical 证明。账户范围、完整目录证明、日志损坏与并行变更失效规则均继续适用。
+当前同步层使用 `ICloudEncodedObjectStore`：先用 `CanonicalObjectDescriptor(path, 4/8/16MiB, canonicalSHA, "zstd-v2")` 查询 `TryGetEncodedReceiptAsync`；未命中才读取本地对象并创建 `PreparedObjectUpload`，然后 `PutEncodedAsync`。工厂先一次读取并核对原始 sealed 字节的 SHA，再按固定 codec 生成独占 wire 缓冲。wire 自己具有长度、SHA、整体及每 4 MiB 分片 MD5，HTTP 重试共用它。后台缓存的同一条 WAL 回执同时记录 canonical 身份和已确认 wire 身份；重启仍可在读源前命中。普通 wire SHA 回执不能自行充当 canonical 证明。账户范围、完整目录证明、日志损坏与并行变更失效规则均继续适用。
 
 `.obj` 使用 128 字节信封和单个 zstd frame；JSON 不压缩。正常上传后只信明确成功回执与已有字段一致性，分片 MD5 出现时核对；不下载新对象。未知已存在路径、丢失合并回执仍可对 wire 读回 SHA 以排除不可变路径冲突。未成功验证的不确定结果不产生 canonical 回执。
 
@@ -119,3 +119,10 @@ HTTP handler 可注入。默认自动重定向关闭，手工仅跟随 GET 的�
 codec 使用固定 `ZstdSharp.Port 0.8.8`、level 3、content-size=1、checksum=0、nbWorkers=0；会改变 wire 字节的升级必须使用新 codec 标识。MIT 许可证和包中固定源码提交记录位于 `docs/ZSTD-LICENSE.txt`、`docs/ZSTD-PROVENANCE.md`。
 
 本轮必要离线测试入口：`--filter object-transport`（6 组 codec 边界）、`--filter encoded-object`（4 组 provider 回执/分片/下载/恢复）、`--filter object-size`（3 组通用 4/8/16 MiB 分片接口）。这些只使用模拟 HTTP；不调用真实账户、不做吞吐基准。新的传输格式尚未作为本轮真实网盘测试结果宣称。
+
+
+云端加密在同步层完成，百度模块只接收已经压缩、可选 AES-256-GCM 加密的独占缓冲区。
+加密 codec 为 `zstd-aes256gcm-v2`；canonical 回执同时包含磁盘加密设置标识，
+相同路径的明文或其他密钥回执不能复用。上传成功不下载回验，重试复用相同字节。
+云盘列表遇到 `/OverlayDisk` 不存在时由仓库层自动创建；目录创建仍复用本模块的
+账户范围缓存和按路径锁，无需每次刷新都发送创建请求。

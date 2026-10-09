@@ -1,14 +1,7 @@
 use super::{Error, Result, PAGE};
-use argon2::{Algorithm, Argon2, Params, Version};
-use chacha20poly1305::{
-    aead::{Aead, AeadInPlace, KeyInit, Payload},
-    Tag, XChaCha20Poly1305, XNonce,
-};
-use rand::{rngs::OsRng, RngCore};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
-use zeroize::Zeroizing;
 
 pub const PAYLOAD: usize = 4016;
 pub const ROOT: u8 = 1;
@@ -78,71 +71,57 @@ impl PageRef {
     }
 }
 
+/// Local/canonical object format. Encryption belongs to the cloud transport.
 #[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Config {
     pub format_version: u32,
+    pub local_storage: String,
     pub id: Uuid,
-    pub crypto_id: Option<Uuid>,
+    pub integrity_id: Option<Uuid>,
     pub capacity_bytes: u64,
     pub object_size: u64,
     pub encrypted: bool,
-    pub salt: [u8; 16],
-    pub nonce: [u8; 24],
-    pub wrapped_key: Vec<u8>,
     pub restoring: bool,
     pub lazy: bool,
     pub direct_base: bool,
     pub wide: bool,
     pub cache_capable: bool,
-    /// A fork allocates in the next disjoint ordinal range, leaving all source
-    /// ordinals stable so later source generations and local snapshots coexist.
     #[serde(default, skip_serializing_if = "zero_allocation_depth")]
     pub allocation_depth: u8,
 }
-fn zero_allocation_depth(value: &u8) -> bool { *value == 0 }
-impl Config {
-    fn ad(&self) -> Vec<u8> {
-        let mut a = b"OverlayDisk v4 volume key".to_vec();
-        a.extend_from_slice(self.id.as_bytes());
-        a.extend_from_slice(&self.capacity_bytes.to_le_bytes());
-        a.extend_from_slice(self.crypto_id.unwrap_or(self.id).as_bytes());
-        if self.lazy {
-            a.extend_from_slice(b"lazy-backed-container-v1");
-        }
-        if self.direct_base {
-            a.extend_from_slice(b"portable-page-base-v1");
-        }
-        if self.wide {
-            a.extend_from_slice(b"wide-page-tree-v1");
-        }
-        a.extend_from_slice(b"object-geometry-v1");
-        a.extend_from_slice(&self.object_size.to_le_bytes());
-        if self.allocation_depth != 0 {
-            a.extend_from_slice(b"fork-object-namespace");
-            a.push(self.allocation_depth);
-        }
-        a
+fn zero_allocation_depth(value: &u8) -> bool {
+    *value == 0
+}
+fn reject_local_password(password: Option<&str>) -> Result<()> {
+    if password.is_some_and(|p| !p.is_empty()) {
+        return Err(Error::Invalid(
+            "local disk encryption is unsupported; configure cloud encryption in the application"
+                .into(),
+        ));
     }
+    Ok(())
+}
+impl Config {
     #[cfg(test)]
-    pub fn create(capacity: u64, password: Option<&str>) -> Result<(Self, Crypto)> {
+    pub fn create(capacity: u64, password: Option<&str>) -> Result<(Self, PageCodec)> {
         Self::create_sized(capacity, password, super::OBJECT)
     }
     pub fn create_sized(
         capacity: u64,
         password: Option<&str>,
         object_size: u64,
-    ) -> Result<(Self, Crypto)> {
+    ) -> Result<(Self, PageCodec)> {
+        reject_local_password(password)?;
         let geometry = super::Geometry::new(object_size)?;
-        let mut config = Self {
+        let config = Self {
             format_version: 4,
+            local_storage: "plaintext-v1".into(),
             id: Uuid::new_v4(),
-            crypto_id: None,
+            integrity_id: None,
             capacity_bytes: capacity,
             object_size,
-            encrypted: password.is_some(),
-            salt: [0; 16],
-            nonce: [0; 24],
-            wrapped_key: Vec::new(),
+            encrypted: false,
             restoring: false,
             lazy: false,
             direct_base: false,
@@ -150,37 +129,15 @@ impl Config {
             cache_capable: false,
             allocation_depth: 0,
         };
-        let key = if let Some(password) = password {
-            if password.is_empty() {
-                return Err(Error::Invalid("password cannot be empty".into()));
-            }
-            OsRng.fill_bytes(&mut config.salt);
-            OsRng.fill_bytes(&mut config.nonce);
-            let mut key = Zeroizing::new([0; 32]);
-            OsRng.fill_bytes(key.as_mut());
-            let wrapping = derive(password, &config.salt)?;
-            config.wrapped_key = XChaCha20Poly1305::new_from_slice(wrapping.as_ref())
-                .unwrap()
-                .encrypt(
-                    XNonce::from_slice(&config.nonce),
-                    Payload {
-                        msg: key.as_ref(),
-                        aad: &config.ad(),
-                    },
-                )
-                .map_err(|_| Error::Integrity("key wrapping failed".into()))?;
-            Some(key)
-        } else {
-            None
-        };
-        let crypto = Crypto {
+        let codec = PageCodec {
             id: config.id,
-            key,
             geometry,
         };
-        Ok((config, crypto))
+        Ok((config, codec))
     }
-    pub fn unlock(&self, password: Option<&str>) -> Result<Crypto> {
+    pub fn unlock(&self, password: Option<&str>) -> Result<PageCodec> {
+        reject_local_password(password)?;
+        self.validate_plaintext()?;
         let geometry = super::Geometry::new(self.object_size)?;
         super::store::allocation_range(self)?;
         if self.format_version != 4
@@ -188,83 +145,55 @@ impl Config {
             || self.capacity_bytes > super::MAX_CAPACITY
             || !self.capacity_bytes.is_multiple_of(512)
         {
-            return Err(Error::Invalid("invalid V4 configuration".into()));
+            return Err(Error::Invalid("invalid plaintext V4 configuration".into()));
         }
-        let key = if self.encrypted {
-            let password = password.ok_or(Error::Password)?;
-            let wrapping = derive(password, &self.salt)?;
-            let bytes = Zeroizing::new(
-                XChaCha20Poly1305::new_from_slice(wrapping.as_ref())
-                    .unwrap()
-                    .decrypt(
-                        XNonce::from_slice(&self.nonce),
-                        Payload {
-                            msg: &self.wrapped_key,
-                            aad: &self.ad(),
-                        },
-                    )
-                    .map_err(|_| Error::Password)?,
-            );
-            if bytes.len() != 32 {
-                return Err(Error::Password);
-            }
-            let mut key = Zeroizing::new([0; 32]);
-            key.copy_from_slice(&bytes);
-            Some(key)
-        } else {
-            if password.is_some() {
-                return Err(Error::Invalid("unencrypted volume: omit password".into()));
-            }
-            None
-        };
-        Ok(Crypto {
-            id: self.crypto_id.unwrap_or(self.id),
-            key,
+        Ok(PageCodec {
+            id: self.integrity_id.unwrap_or(self.id),
             geometry,
         })
     }
-    #[cfg(test)]
-    pub fn fork(&self, crypto: &Crypto, password: Option<&str>) -> Result<Self> {
-        self.fork_identity(crypto, password, Uuid::new_v4())
+    pub(super) fn validate_plaintext(&self) -> Result<()> {
+        if self.local_storage != "plaintext-v1" || self.encrypted {
+            return Err(Error::Invalid(
+                "unsupported local storage format; this build requires plaintext-v1 containers"
+                    .into(),
+            ));
+        }
+        Ok(())
     }
-    pub fn fork_identity(&self, crypto: &Crypto, password: Option<&str>, id: Uuid) -> Result<Self> {
+    #[cfg(test)]
+    pub fn fork(&self, codec: &PageCodec, password: Option<&str>) -> Result<Self> {
+        self.fork_identity(codec, password, Uuid::new_v4())
+    }
+    pub fn fork_identity(
+        &self,
+        codec: &PageCodec,
+        password: Option<&str>,
+        id: Uuid,
+    ) -> Result<Self> {
+        reject_local_password(password)?;
+        self.validate_plaintext()?;
         let mut c = self.clone();
         if id != self.id {
-            c.allocation_depth = c.allocation_depth.checked_add(1)
+            c.allocation_depth = c
+                .allocation_depth
+                .checked_add(1)
                 .ok_or_else(|| Error::Invalid("copy ancestry is exhausted".into()))?;
             super::store::allocation_range(&c)?;
         }
         c.id = id;
-        c.crypto_id = Some(crypto.id);
+        c.integrity_id = Some(codec.id);
         c.restoring = true;
-        c.encrypted = crypto.key.is_some();
-        if let Some(key) = &crypto.key {
-            let password = password.filter(|v| !v.is_empty()).ok_or(Error::Password)?;
-            OsRng.fill_bytes(&mut c.salt);
-            OsRng.fill_bytes(&mut c.nonce);
-            let wrapping = derive(password, &c.salt)?;
-            c.wrapped_key = XChaCha20Poly1305::new_from_slice(wrapping.as_ref())
-                .unwrap()
-                .encrypt(
-                    XNonce::from_slice(&c.nonce),
-                    Payload {
-                        msg: key.as_ref(),
-                        aad: &c.ad(),
-                    },
-                )
-                .map_err(|_| Error::Password)?;
-        } else if password.is_some() {
-            return Err(Error::Invalid("unencrypted source: omit password".into()));
-        }
         Ok(c)
     }
     pub fn encode(&self) -> Result<[u8; PAGE]> {
+        self.validate_plaintext()?;
         let data = serde_json::to_vec(self)?;
         if data.len() > PAGE - 48 {
             return Err(Error::Invalid("configuration too large".into()));
         }
         let mut out = [0; PAGE];
-        out[..8].copy_from_slice(b"ODV4CFGO");
+        out[..8].copy_from_slice(b"ODV4PLN1");
         out[8..12].copy_from_slice(&(data.len() as u32).to_le_bytes());
         out[16..16 + data.len()].copy_from_slice(&data);
         let hash = Sha256::digest(&out[..PAGE - 32]);
@@ -272,131 +201,74 @@ impl Config {
         Ok(out)
     }
     pub fn decode(input: &[u8; PAGE]) -> Result<Self> {
-        if &input[..8] != b"ODV4CFGO"
-            || Sha256::digest(&input[..PAGE - 32])[..] != input[PAGE - 32..]
-        {
-            return Err(Error::Integrity(
-                "unsupported configuration or checksum".into(),
-            ));
+        if &input[..8] != b"ODV4PLN1" {
+            return Err(Error::Invalid("unsupported local storage format; old containers require their original application".into()));
+        }
+        if Sha256::digest(&input[..PAGE - 32])[..] != input[PAGE - 32..] {
+            return Err(Error::Integrity("configuration checksum".into()));
         }
         let size = u32::from_le_bytes(input[8..12].try_into().unwrap()) as usize;
         if size > PAGE - 48 {
             return Err(Error::Integrity("configuration length".into()));
         }
         let config: Self = serde_json::from_slice(&input[16..16 + size])?;
+        config.validate_plaintext()?;
         super::Geometry::new(config.object_size)?;
         Ok(config)
     }
 }
 
-fn derive(password: &str, salt: &[u8; 16]) -> Result<Zeroizing<[u8; 32]>> {
-    let mut key = Zeroizing::new([0; 32]);
-    Argon2::new(
-        Algorithm::Argon2id,
-        Version::V0x13,
-        Params::new(65536, 3, 1, Some(32)).unwrap(),
-    )
-    .hash_password_into(password.as_bytes(), salt, key.as_mut())
-    .map_err(|_| Error::Password)?;
-    Ok(key)
-}
-pub struct Crypto {
+/// Plaintext codec with position-bound checksums. These checksums detect
+/// corruption; cloud AEAD provides secrecy and adversarial authentication.
+pub struct PageCodec {
     pub(super) geometry: super::Geometry,
     pub id: Uuid,
-    pub key: Option<Zeroizing<[u8; 32]>>,
 }
-impl Crypto {
+impl PageCodec {
     pub fn seal_blob(&self, aad: &[u8], data: &mut [u8]) -> Result<([u8; 24], [u8; 16])> {
-        let mut nonce = [0; 24];
-        OsRng.fill_bytes(&mut nonce);
-        let tag = if let Some(key) = &self.key {
-            XChaCha20Poly1305::new_from_slice(key.as_ref())
-                .unwrap()
-                .encrypt_in_place_detached(XNonce::from_slice(&nonce), aad, data)
-                .map_err(|_| Error::Integrity("descriptor encryption".into()))?
-                .into()
-        } else {
-            let mut h = Sha256::new();
-            h.update(aad);
-            h.update(&data[..]);
-            h.finalize()[..16].try_into().unwrap()
-        };
-        Ok((nonce, tag))
+        let mut h = Sha256::new();
+        h.update(aad);
+        h.update(&data[..]);
+        Ok(([0; 24], h.finalize()[..16].try_into().unwrap()))
     }
     pub fn open_blob(
         &self,
         aad: &[u8],
-        nonce: &[u8; 24],
+        reserved: &[u8; 24],
         tag: &[u8; 16],
         data: &mut [u8],
     ) -> Result<()> {
-        if let Some(key) = &self.key {
-            XChaCha20Poly1305::new_from_slice(key.as_ref())
-                .unwrap()
-                .decrypt_in_place_detached(
-                    XNonce::from_slice(nonce),
-                    aad,
-                    data,
-                    Tag::from_slice(tag),
-                )
-                .map_err(|_| Error::Integrity("object descriptors authentication".into()))?;
-        } else {
-            let mut h = Sha256::new();
-            h.update(aad);
-            h.update(&data[..]);
-            if h.finalize()[..16] != tag[..] {
-                return Err(Error::Integrity("object descriptors checksum".into()));
-            }
+        let mut h = Sha256::new();
+        h.update(aad);
+        h.update(&data[..]);
+        if *reserved != [0; 24] || h.finalize()[..16] != tag[..] {
+            return Err(Error::Integrity("object descriptors checksum".into()));
         }
         Ok(())
     }
     pub fn frame(&self, kind: u8, seq: u64, offset: u64, data: &[u8]) -> Result<[u8; PAGE]> {
-        let mut nonce = [0; 24];
-        OsRng.fill_bytes(&mut nonce);
-        self.frame_nonce(kind, seq, offset, data, nonce)
-    }
-    pub fn frame_nonce(
-        &self,
-        kind: u8,
-        seq: u64,
-        offset: u64,
-        data: &[u8],
-        nonce: [u8; 24],
-    ) -> Result<[u8; PAGE]> {
         if data.len() > PAYLOAD {
             return Err(Error::Invalid("metadata page too large".into()));
         }
         let mut out = [0u8; PAGE];
-        out[..8].copy_from_slice(b"ODV4MET1");
+        out[..8].copy_from_slice(b"ODV4METP");
         out[8] = kind;
-        out[9] = u8::from(self.key.is_some());
         out[16..24].copy_from_slice(&seq.to_le_bytes());
         out[24..32].copy_from_slice(&offset.to_le_bytes());
-        out[32..56].copy_from_slice(&nonce);
         out[56..60].copy_from_slice(&(data.len() as u32).to_le_bytes());
         out[64..64 + data.len()].copy_from_slice(data);
-        let mut ad = out[..64].to_vec();
-        ad.extend_from_slice(self.id.as_bytes());
-        let tag = if let Some(key) = &self.key {
-            let nonce: [u8; 24] = out[32..56].try_into().unwrap();
-            XChaCha20Poly1305::new_from_slice(key.as_ref())
-                .unwrap()
-                .encrypt_in_place_detached(XNonce::from_slice(&nonce), &ad, &mut out[64..PAGE - 16])
-                .map_err(|_| Error::Integrity("metadata encryption".into()))?
-                .to_vec()
-        } else {
-            let mut h = Sha256::new();
-            h.update(&ad);
-            h.update(&out[64..PAGE - 16]);
-            h.finalize()[..16].to_vec()
-        };
-        out[PAGE - 16..].copy_from_slice(&tag);
+        let mut h = Sha256::new();
+        h.update(&out[..64]);
+        h.update(self.id.as_bytes());
+        h.update(&out[64..PAGE - 16]);
+        out[PAGE - 16..].copy_from_slice(&h.finalize()[..16]);
         Ok(out)
     }
     pub fn unframe(&self, kind: u8, offset: u64, input: &[u8; PAGE]) -> Result<Vec<u8>> {
-        if &input[..8] != b"ODV4MET1"
+        if &input[..8] != b"ODV4METP"
             || input[8] != kind
-            || input[9] != u8::from(self.key.is_some())
+            || input[9] != 0
+            || input[32..56] != [0; 24]
             || input[24..32] != offset.to_le_bytes()
         {
             return Err(Error::Integrity("metadata identity".into()));
@@ -405,28 +277,14 @@ impl Crypto {
         if len > PAYLOAD {
             return Err(Error::Integrity("metadata length".into()));
         }
-        let mut ad = input[..64].to_vec();
-        ad.extend_from_slice(self.id.as_bytes());
-        let mut body = Zeroizing::new(input[64..PAGE - 16].to_vec());
-        if let Some(key) = &self.key {
-            XChaCha20Poly1305::new_from_slice(key.as_ref())
-                .unwrap()
-                .decrypt_in_place_detached(
-                    XNonce::from_slice(&input[32..56]),
-                    &ad,
-                    &mut body,
-                    Tag::from_slice(&input[PAGE - 16..]),
-                )
-                .map_err(|_| Error::Integrity("metadata authentication".into()))?;
-        } else {
-            let mut h = Sha256::new();
-            h.update(&ad);
-            h.update(&body);
-            if h.finalize()[..16] != input[PAGE - 16..] {
-                return Err(Error::Integrity("metadata checksum".into()));
-            }
+        let mut h = Sha256::new();
+        h.update(&input[..64]);
+        h.update(self.id.as_bytes());
+        h.update(&input[64..PAGE - 16]);
+        if h.finalize()[..16] != input[PAGE - 16..] {
+            return Err(Error::Integrity("metadata checksum".into()));
         }
-        Ok(body[..len].to_vec())
+        Ok(input[64..64 + len].to_vec())
     }
     fn page_ad(&self, page: u64, version: u64) -> [u8; 32] {
         let mut ad = [0; 32];
@@ -439,46 +297,23 @@ impl Crypto {
         &self,
         page: u64,
         version: u64,
-        nonce: [u8; 24],
+        reserved: [u8; 24],
         data: &[u8; PAGE],
     ) -> Result<([u8; PAGE], [u8; 16])> {
-        let mut output = *data;
-        let ad = self.page_ad(page, version);
-        let tag = if let Some(key) = &self.key {
-            XChaCha20Poly1305::new_from_slice(key.as_ref())
-                .unwrap()
-                .encrypt_in_place_detached(XNonce::from_slice(&nonce), &ad, &mut output)
-                .map_err(|_| Error::Integrity("data encryption".into()))?
-                .into()
-        } else {
-            let mut hash = Sha256::new();
-            hash.update(ad);
-            hash.update(nonce);
-            hash.update(output);
-            hash.finalize()[..16].try_into().unwrap()
-        };
-        Ok((output, tag))
+        if reserved != [0; 24] {
+            return Err(Error::Invalid("plaintext page reserved bytes".into()));
+        }
+        let mut h = Sha256::new();
+        h.update(self.page_ad(page, version));
+        h.update(data);
+        Ok((*data, h.finalize()[..16].try_into().unwrap()))
     }
     pub fn decode_page(&self, page: u64, reference: PageRef, data: &mut [u8; PAGE]) -> Result<()> {
-        let ad = self.page_ad(page, reference.version);
-        if let Some(key) = &self.key {
-            XChaCha20Poly1305::new_from_slice(key.as_ref())
-                .unwrap()
-                .decrypt_in_place_detached(
-                    XNonce::from_slice(&reference.nonce),
-                    &ad,
-                    data,
-                    Tag::from_slice(&reference.tag),
-                )
-                .map_err(|_| Error::Integrity(format!("data page {page}")))?;
-        } else {
-            let mut hash = Sha256::new();
-            hash.update(ad);
-            hash.update(reference.nonce);
-            hash.update(&data[..]);
-            if hash.finalize()[..16] != reference.tag {
-                return Err(Error::Integrity(format!("data page {page}")));
-            }
+        let mut h = Sha256::new();
+        h.update(self.page_ad(page, reference.version));
+        h.update(&data[..]);
+        if reference.nonce != [0; 24] || h.finalize()[..16] != reference.tag {
+            return Err(Error::Integrity(format!("data page {page}")));
         }
         Ok(())
     }

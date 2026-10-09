@@ -9,7 +9,7 @@ namespace OverlayDisk;
 /// <summary>Offline object-provider fixtures. Any mounted volumes are created exclusively in output.</summary>
 internal static class LazyHydrationSelfTests
 {
-    private const string Password = "OverlayDisk-lazy-fixture-only";
+    private const string? Password = null;
     private const int MiB = 1024 * 1024;
     private static void Check(bool value, string message) { if (!value) throw new IOException("Lazy fixture: " + message); }
     private static byte[] Pattern(int seed, int size) { var data = new byte[size]; new Random(seed).NextBytes(data); return data; }
@@ -99,7 +99,7 @@ internal static class LazyHydrationSelfTests
         try
         {
             Progress("creating owned source NTFS volume");
-            await sourceController.CreateAsync(new("Lazy-Source-Fixture", sourcePath, 256UL * MiB, letter, true), Password);
+            await sourceController.CreateAsync(new("Lazy-Source-Fixture", sourcePath, 256UL * MiB, letter, false), Password);
             var sourceEntry = sourceController.Disks.Single(); string root = letter + @":\";
             await File.WriteAllBytesAsync(Path.Combine(root, "video-fixture.mp4"), video);
             await File.WriteAllBytesAsync(Path.Combine(root, "untouched.bin"), untouched);

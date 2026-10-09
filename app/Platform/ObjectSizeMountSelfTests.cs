@@ -17,7 +17,7 @@ public static class ObjectSizeMountSelfTests
         using var controller = new DiskController(Path.Combine(fixture, "catalog"));
         char Letter() => Enumerable.Range('D', 'Z' - 'D' + 1).Select(value => (char)value)
             .First(value => !DriveInfo.GetDrives().Any(drive => char.ToUpperInvariant(drive.Name[0]) == value));
-        const string password = "isolated-object-size-mount-fixture";
+        const string? password = null;
         async Task VerifyFileAsync(DiskEntry entry, string? secret)
         {
             string file = entry.DriveLetter + @":\object-size-fixture.bin";
@@ -41,8 +41,8 @@ public static class ObjectSizeMountSelfTests
             foreach (uint size in new uint[] { 4u << 20, 8u << 20, 16u << 20 })
             {
                 string path = Path.Combine(fixture, "object-" + size / (1024 * 1024) + "m.odv4");
-                Log($"creating new encrypted {size / (1024 * 1024)} MiB object fixture");
-                await controller.CreateAsync(new("Object fixture " + size / (1024 * 1024), path, 256UL << 20, Letter(), true, false, size), password).ConfigureAwait(false);
+                Log($"creating new plaintext {size / (1024 * 1024)} MiB object fixture");
+                await controller.CreateAsync(new("Object fixture " + size / (1024 * 1024), path, 256UL << 20, Letter(), false, false, size), password).ConfigureAwait(false);
                 var entry = controller.Disks.Single(disk => string.Equals(disk.ContainerPath, path, StringComparison.OrdinalIgnoreCase));
                 Check(entry.Initialized && entry.Mounted && entry.ObjectSizeBytes == size, "created entry not initialized with selected object size");
                 await VerifyFileAsync(entry, password).ConfigureAwait(false);

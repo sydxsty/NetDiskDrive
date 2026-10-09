@@ -115,6 +115,7 @@ public sealed partial class ApplicationService
             Log(id, run.Job.Id, "replica", "version.check", "检查原来源的最新提交；不扫描对象目录");
             var latest = await repository.LatestForReplicaAsync(source.RemoteRoot, source.VerifiedCommit ? source.Commit : null, ct)
                 ?? throw new IOException("云端没有完整可加载版本。");
+            UnlockCloudCommit(repository, source.AccountId, source.RemoteRoot, latest.Commit, null);
             bool sameRoot = Text(status, "root_object_id") == latest.Commit.RootObjectId
                 && Text(status, "root_sha256").Equals(latest.Commit.RootSha256, StringComparison.OrdinalIgnoreCase);
             if (sameRoot && !source.VerifiedCommit)

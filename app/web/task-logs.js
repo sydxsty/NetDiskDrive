@@ -175,13 +175,13 @@
       if (this.diskId&&!names.has(this.diskId)) names.set(this.diskId,this.name(this.diskId));
       const select=this.host.querySelector('.journal-disk-filter');
       const options='<option value="">全部磁盘</option>'+[...names].map(([id,name])=>`<option value="${escape(id)}">${escape(name)}</option>`).join('');
-      if (select.dataset.options!==options&&document.activeElement!==select) { select.innerHTML=options;select.value=this.diskId;select.dataset.options=options; }
+      if (select.dataset.options!==options&&document.activeElement!==select) { LiveDom.html(select,options);select.value=this.diskId;select.dataset.options=options; }
       for (const node of this.host.querySelectorAll('.journal-disk-name')) node.textContent=this.name(node.dataset.diskId);
     }
     renderRows() {
       if (!this.host) return;
       const body=this.host.querySelector('tbody'),empty=this.host.querySelector('.journal-empty');
-      body.innerHTML=this.items.map(entry=>{
+      LiveDom.html(body,this.items.map(entry=>{
         const time=timestamp(entry.timestampUtc),[label,color]=status(entry);
         const details=[];
         if (entry.objectKind) details.push(objectKinds[entry.objectKind]||entry.objectKind);
@@ -192,7 +192,7 @@
         return `<tr data-log-sequence="${escape(entry.sequence)}"><td><time datetime="${escape(entry.timestampUtc)}" title="${escape(time.full)}">${escape(time.date)}<br><strong>${escape(time.time)}</strong></time><span class="journal-sequence">#${escape(entry.sequence)}</span></td>
           <td><span class="badge ${color}">${label}</span></td><td><strong class="journal-disk-name" data-disk-id="${escape(entry.diskId||'')}" title="${escape(entry.diskId||'')}">${escape(this.name(entry.diskId))}</strong><span class="journal-kind">${escape(kindLabels[entry.kind]||entry.kind||'')}</span></td>
           <td><div class="journal-message"><strong>${escape(action)}</strong><span>${escape(entry.message||'')}</span></div>${entry.objectId?`<div class="journal-object"><span>对象</span><code>${escape(entry.objectId)}</code><button class="quiet small" data-log-action="copy" data-sequence="${escape(entry.sequence)}" aria-label="复制完整对象 ID">复制 ID</button></div>`:''}${details.length?`<div class="journal-meta">${details.map(escape).join(' · ')}</div>`:''}</td></tr>`;
-      }).join('');
+      }).join(''));
       empty.textContent=this.error?'暂时无法载入日志，请重试。':this.loaded?'当前范围内没有记录，可调整筛选或返回最新日志。':'正在载入日志…';
       empty.classList.toggle('hidden',this.items.length!==0);
     }

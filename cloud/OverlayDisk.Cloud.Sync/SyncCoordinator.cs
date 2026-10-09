@@ -1,4 +1,5 @@
 using System.Text.Json;
+using System.Security.Cryptography;
 using OverlayDisk.Cloud.Contracts;
 
 namespace OverlayDisk.Cloud.Sync;
@@ -14,6 +15,7 @@ public sealed class SyncCoordinator(CloudRepository repository)
         int prepareCacheMiB = SyncPreparationLimits.DefaultCacheMiB)
     {
         SyncPreparationLimits.ValidateCacheMiB(prepareCacheMiB);
+        if (encrypted != (repository.EncryptionSettings(binding.RemoteRoot) is not null)) throw new IOException("云端加密设置与解锁密钥不一致。");
         int objectSize = VolumeObjectSize(volume);
         var scope = repository.Scope(binding, volume.Id);
         await using var lease = await repository.Cache.AcquireAsync(scope, ct);
@@ -22,10 +24,13 @@ public sealed class SyncCoordinator(CloudRepository repository)
         var initial = Unwrap(await volume.ControlAsync(new { cmd = "cloud.status" }, ct), "status");
         ValidateNativeGeometry(initial, objectSize);
         ValidateCachedGeometry(cache, objectSize);
+        if (cache.Latest is { } cachedCommit) repository.AuthenticateCommit(binding.RemoteRoot, cachedCommit);
+        if (cache.Publication is { } cachedIntent) repository.AuthenticateCommit(binding.RemoteRoot, cachedIntent.Commit);
         await repository.EnsureWriterAsync(binding, volume.Id, cache, ct);
         await volume.ControlAsync(new { cmd = "cloud.pause", paused = false }, ct);
         await ReconcileAsync(volume, binding, cache, initial, log, ct);
         ValidateCachedGeometry(cache, objectSize);
+        if (cache.Latest is { } latestCommit) repository.AuthenticateCommit(binding.RemoteRoot, latestCommit);
         if (NoJob(initial) && !Dirty(initial) && GetLong(initial, "data_generation") == GetLong(initial, "published_generation") && cache.Latest is not null)
             return await UnchangedAsync(volume, binding, cache, progress, log, ct);
 
@@ -150,7 +155,7 @@ public sealed class SyncCoordinator(CloudRepository repository)
         if (intent is not null && (intent.Commit.Generation != generation || intent.Commit.RootObjectId != rootId || !intent.Commit.RootSha256.Equals(rootHash, StringComparison.OrdinalIgnoreCase)))
             throw new IOException("尚有另一发布意图需要先恢复。");
         var commit = intent?.Commit ?? (latest?.RootObjectId == rootId ? latest : null) ??
-            new RemoteCommit(4, volume.Id, binding.DeviceId, generation, name, capacity, encrypted, rootId, rootHash, DateTimeOffset.UtcNow) { ObjectSizeBytes = objectSize };
+            repository.ProtectCommit(binding.RemoteRoot, new RemoteCommit(4, volume.Id, binding.DeviceId, generation, name, capacity, encrypted, rootId, rootHash, DateTimeOffset.UtcNow) { ObjectSizeBytes = objectSize });
         string commitPath = CloudRepository.CommitPath(binding.RemoteRoot, commit);
         var removed = intent?.Removed ?? await DeltaAsync(volume, jobId, "remove", ct);
         if (removed.Overlaps(alive)) throw new IOException("本轮增量同时添加和删除同一对象。");
@@ -271,6 +276,7 @@ public sealed class SyncCoordinator(CloudRepository repository)
         await ReconcileAsync(volume,binding,cache,status,log,ct);
         if (!NoJob(status)||cache.Publication is not null) throw new IOException("请先完成当前固定版本的同步，再清理云端旧块。");
         if (cache.Latest is null||!MatchesPublished(status,cache.Latest)) throw new IOException("尚未确认当前云端完整版本，不能清理。");
+        repository.AuthenticateCommit(binding.RemoteRoot, cache.Latest);
         Log(log,"cleanup.started","开始手动清理已确认不再使用的云端对象");
         bool pending=await TryCleanupAsync(volume,binding,cache,log,ct);
         Log(log,pending?"cleanup.deferred":"cleanup.completed",pending?"部分对象尚不能清理，清单已保留，可稍后手动继续":"手动清理已完成");
@@ -370,7 +376,7 @@ public sealed class SyncCoordinator(CloudRepository repository)
     private async Task<CloudObjectInfo> UploadObjectAsync(ICloudVolume volume, CloudBinding binding, string jobId, ExportObject obj, CancellationToken ct,
         IProgress<SyncLogEntry>? log, ulong generation)
     {
-        var descriptor = new CanonicalObjectDescriptor(CloudRepository.ObjectPath(binding.RemoteRoot, obj.Id), checked((int)obj.Length), obj.Sha256);
+        var descriptor = repository.ObjectDescriptor(binding.RemoteRoot, obj.Id, checked((int)obj.Length), obj.Sha256);
         if (repository.Store is ICloudEncodedObjectStore prepared)
         {
             var known = await prepared.TryGetEncodedReceiptAsync(descriptor, ct);
@@ -399,8 +405,12 @@ public sealed class SyncCoordinator(CloudRepository repository)
         try
         {
             byte[] bytes = await volume.ReadObjectAsync(jobId, obj.Id, ct);
-            using var content = new MemoryStream(bytes, false);
-            return await PreparedObjectUpload.CreateAsync(descriptor, content, ct);
+            try
+            {
+                using var content = new MemoryStream(bytes, false);
+                return await PreparedObjectUpload.CreateAsync(descriptor, content, repository.EncryptionContext(descriptor.Path[..descriptor.Path.IndexOf("/objects/", StringComparison.Ordinal)]), ct);
+            }
+            finally { CryptographicOperations.ZeroMemory(bytes); }
         }
         finally { payloadReader.Release(); }
     }

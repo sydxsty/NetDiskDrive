@@ -1,4 +1,4 @@
-use super::codec::{hash, hex, Crypto, MetaRef, PageRef};
+use super::codec::{hash, hex, PageCodec, MetaRef, PageRef};
 use super::portable_validation::validate_node_reference;
 use super::store::{self, Object, Page, PORTABLE};
 use super::*;
@@ -42,7 +42,7 @@ fn node_header(level: u8, base: u64, bitmap: u64) -> Vec<u8> {
 
 /// Produce correctly authenticated bytes, including all parent hashes. Failures
 /// must therefore come from graph validation rather than a stale checksum.
-fn metadata(config: &Config, crypto: &Crypto, mutation: Mutation) -> Vec<u8> {
+fn metadata(config: &Config, crypto: &PageCodec, mutation: Mutation) -> Vec<u8> {
     let g = crypto.geometry;
     let oid = 1;
     let id = object_id(oid);
@@ -132,7 +132,7 @@ fn metadata(config: &Config, crypto: &Crypto, mutation: Mutation) -> Vec<u8> {
         Mutation::EmptyRootWithHash => reference.offset = 0,
         _ => {}
     }
-    let descriptor = json!({"format_version":4,"container_id":config.id,"crypto_id":crypto.id,
+    let descriptor = json!({"format_version":4,"container_id":config.id,"integrity_id":crypto.id,
         "capacity_bytes":config.capacity_bytes,"generation":1,"index":reference,"index_depth":4,
         "page_size":PAGE,"object_size":g.object_size});
     let at = g.header_bytes();
@@ -180,7 +180,7 @@ fn metadata(config: &Config, crypto: &Crypto, mutation: Mutation) -> Vec<u8> {
 
 #[test]
 fn authenticated_invalid_portable_graphs_are_rejected_before_import() {
-    let (config, crypto) = Config::create(64 << 20, Some("password")).unwrap();
+    let (config, crypto) = Config::create(64 << 20, None).unwrap();
     let dir = tempfile::tempdir().unwrap();
     let cases = [
         Mutation::LocalRoot,
@@ -214,7 +214,7 @@ fn authenticated_invalid_portable_graphs_are_rejected_before_import() {
             Volume::restore_begin_options(
                 &path,
                 &raw,
-                Some("password"),
+                None,
                 json!({"mode":"copy","lazy":true,"backing":backing})
             )
             .is_err(),
@@ -293,8 +293,8 @@ fn portable_readers_reject_wrong_kinds_and_unallocated_slots_but_allow_lazy_plac
 }
 
 #[test]
-fn encrypted_writer_objects_validate_without_fetching_any_dependency() {
-    let f = lazy_tests::fixture(Some("password"));
+fn plaintext_writer_objects_validate_without_fetching_any_dependency() {
+    let f = lazy_tests::fixture(None);
     let store = f.source.shared.store.lock().unwrap();
     for raw in f.objects.values() {
         let address = u64::from_le_bytes(raw[24..32].try_into().unwrap());

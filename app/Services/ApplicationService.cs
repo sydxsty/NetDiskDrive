@@ -227,6 +227,8 @@ public sealed partial class ApplicationService : IApplicationService
             lock (gate) values["lazySource"] = settings.Restores.Values.Any(r => r.Lazy && !r.ContainerDeleted && r.LocalDiskId == Text(disk, "id"));
             lock (gate) values["localCache"] = settings.LocalCaches.GetValueOrDefault(Text(disk, "id")) ?? new LocalCacheSettings();
             values["cacheError"] = cacheErrors.GetValueOrDefault(Text(disk, "id")) ?? Text(disk, "cacheError");
+            values["cloudEncrypted"] = CloudEncrypted(Text(disk, "id"));
+            values["cloudKeyRequired"] = CloudKeyRequired(Text(disk, "id"));
             values["sync"] = SyncView(disk); views.Add(values);
             values["replica"] = ReplicaView(disk);
         }
@@ -310,6 +312,10 @@ public sealed partial class ApplicationService : IApplicationService
                 finally { settingsGate.Release(); }
             }
             case "cloud.list": return await Repository().ListDisksForReplicaAsync(ct);
+            case "cloud.unlock":
+                await accountGate.WaitAsync(ct);
+                try { RequireRunning(); UnlockDiskCloudKey(id, Password(args)); await ApplyCacheSettingsSafeAsync(id, ct); Changed(); return new { ok = true }; }
+                finally { accountGate.Release(); }
             case "cache.settings":
                 await accountGate.WaitAsync(ct);
                 try { RequireRunning(); return await SaveCacheSettingsAsync(id, args, ct); }
@@ -348,6 +354,7 @@ public sealed partial class ApplicationService : IApplicationService
                     Text(nativeBinding, "backend_id") == binding.ProviderId && Text(nativeBinding, "account_id") == accountId &&
                     Text(nativeBinding, "remote_root") == remoteRoot && Guid.TryParse(Text(nativeBinding, "device_id"), out _))
                     binding = binding with { DeviceId = Text(nativeBinding, "device_id") };
+                ConfigureCloudEncryption(repository, accountId, remoteRoot, id, Flag(args, "encrypted"), Password(args));
                 await repository.EnsureWriterAsync(binding, id, ct);
                 await volume.ControlAsync(new { cmd = "cloud.bind", backend_id = binding.ProviderId, account_id = binding.AccountId, remote_root = binding.RemoteRoot, device_id = binding.DeviceId, enabled = true }, ct);
                 lock (gate) { settings.Bindings[id] = binding; settings.PausedDisks.Remove(id); settings.PendingDisks.Add(id); if (requestedCache is not null) settings.LocalCaches[id] = requestedCache; }
@@ -435,7 +442,7 @@ public sealed partial class ApplicationService : IApplicationService
     private CloudRepository Repository()
     {
         if (client == null || account == null) throw new IOException("请先登录百度网盘。");
-        return new CloudRepository(client, syncCache, account.AccountId);
+        return RegisterCloudKeys(new CloudRepository(client, syncCache, account.AccountId), account.AccountId);
     }
     private void RequireRunning()
     { if (exiting || stopped) throw new IOException("程序正在退出，请等待安全关闭后重新打开。"); }
@@ -727,7 +734,7 @@ public sealed partial class ApplicationService : IApplicationService
                     run.Progress = p; Changed();
                 });
                 var events = new InlineProgress<SyncLogEntry>(e => Log(id, run.Id, "sync", e.Action, e.Message, e.Level, e.ObjectId, e.ObjectKind, e.Bytes, e.Generation, e.TimestampUtc, e.WireBytes));
-                var result = await new SyncCoordinator(repository).RunAsync(new WorkerVolume(worker, id, DiskObjectSize(Disk(id))), binding, Text(disk, "name"), UInt(disk, "capacityBytes"), Flag(disk, "encrypted"), concurrency, observer, run.Cancellation.Token, events, prepareCacheMiB);
+                var result = await new SyncCoordinator(repository).RunAsync(new WorkerVolume(worker, id, DiskObjectSize(Disk(id))), binding, Text(disk, "name"), UInt(disk, "capacityBytes"), CloudEncrypted(id), concurrency, observer, run.Cancellation.Token, events, prepareCacheMiB);
                 lock (gate)
                 {
                     settings.LastSuccess[id] = result.Commit.UpdatedUtc;
@@ -930,7 +937,7 @@ public sealed partial class ApplicationService : IApplicationService
                 { Log("", "", "system", "session.save_failed", "磁盘已安全关闭；退出时登录状态保存失败。", "warning"); }
                 await client.DisposeAsync(); client = null;
             }
-            stopped = true;
+            DisposeCloudKeys(); stopped = true;
             try { journal?.Dispose(); } catch (IOException) { /* Optional activity history must not reopen a safely stopped service. */ }
         }
         catch { lock (jobGate) { exiting = false; networkAdmissionsOpen = true; } throw; }
@@ -965,6 +972,7 @@ public sealed partial class ApplicationService : IApplicationService
         }
         await worker.InvokeAsync("restore.preflight", Element(new { mode, sourceVolumeId = volumeId, path }), ct);
         var current = await repository.LatestForReplicaAsync(root, ct: ct) ?? throw new IOException("云端没有完整版本。");
+        UnlockCloudCommit(repository, account!.AccountId, root, current.Commit, Password(args));
         var originalBinding = original ? await repository.PrepareOriginalRestoreForReplicaAsync(volumeId, current.Commit, ct) : null;
         var record = new RestoreRecord { AccountId = account!.AccountId, RemoteRoot = root, TargetPath = path,
             Name = Text(args, "name", current.Commit.Name + (original ? "" : " 副本")), Commit = current.Commit,
@@ -980,7 +988,7 @@ public sealed partial class ApplicationService : IApplicationService
                 { old.ContainerDeleted = true; runs.TryRemove(old.Id, out _); }
             settings.Restores[record.Id] = record;
         }
-        Save(); StartRestoreRun(record, Password(args), repository); return new { taskId = record.Id };
+        Save(); StartRestoreRun(record, null, repository); return new { taskId = record.Id };
     }
     private void StartRestoreRun(RestoreRecord record, string? password, CloudRepository repository)
     {
@@ -993,6 +1001,7 @@ public sealed partial class ApplicationService : IApplicationService
             throw new IOException("原硬盘恢复任务缺少已确认的导入方式。");
         if (record.AccountId != account?.AccountId) throw new IOException("请登录创建该恢复任务时使用的网盘账户。");
         if (runs.TryGetValue(record.Id, out var old) && old.Task is { IsCompleted: false }) return;
+        UnlockCloudCommit(repository, record.AccountId, record.RemoteRoot, record.Commit, password);
         var run = new JobRun { Id = record.Id, DiskId = record.Commit.VolumeId, Kind = "restore", Title = (record.Mode == "original" ? "恢复原硬盘 · " : "新建云端副本 · ") + record.Name, RequiresPassword = record.Commit.Encrypted };
         runs[record.Id] = run;
         Log(run.DiskId, run.Id, "restore", "restore.started", run.Title, generation: record.Commit.Generation);
@@ -1012,7 +1021,7 @@ public sealed partial class ApplicationService : IApplicationService
                 await repository.EnsureReplicaReaderAsync(record.RemoteRoot, record.Commit, record.Id, record.Begun, ct);
                 var downloadedRoot = await repository.ReadObjectForReplicaAsync(record.RemoteRoot, record.Commit.RootObjectId, record.Commit.RootSha256, record.Commit.ObjectSizeBytes, ct);
                 byte[] root = downloadedRoot.Canonical; Interlocked.Add(ref run.DownloadedBytes, downloadedRoot.WireBytes);
-                var begin = Element(await worker.BeginRestoreAsync(Element(new { path = record.TargetPath, name = record.Name, password, resume = record.Begun || File.Exists(record.TargetPath), lazy = record.Lazy,
+                var begin = Element(await worker.BeginRestoreAsync(Element(new { path = record.TargetPath, name = record.Name, password = (string?)null, resume = record.Begun || File.Exists(record.TargetPath), lazy = record.Lazy,
                     mode = record.Mode, sourceVolumeId = record.Commit.VolumeId, objectSizeBytes = record.Commit.ObjectSizeBytes, commit = record.Commit,
                     publication = record.OriginalBinding is { } originalBinding ? new { commit = record.Commit,
                         binding = new { backend_id = originalBinding.ProviderId, account_id = originalBinding.AccountId,
@@ -1031,7 +1040,7 @@ public sealed partial class ApplicationService : IApplicationService
                     if (status.TryGetProperty("root_sha256", out var sha) && sha.ValueKind == JsonValueKind.String && sha.GetString() != record.Commit.RootSha256) throw new IOException("恢复文件的根校验值不匹配。");
                     if (Text(status, "mode", "copy") != record.Mode) throw new IOException("恢复容器的导入方式与任务记录不一致。");
                     if (record.Mode == "original" && workerId != record.Commit.VolumeId) throw new IOException("原硬盘恢复不能更改磁盘身份。");
-                    if (Text(status, "source_volume_id") != record.Commit.VolumeId || UInt(status, "generation") != record.Commit.Generation || UInt(status, "capacity_bytes") != record.Commit.CapacityBytes || Flag(status, "encrypted") != record.Commit.Encrypted || DiskObjectSize(status) != record.Commit.ObjectSizeBytes)
+                    if (Text(status, "source_volume_id") != record.Commit.VolumeId || UInt(status, "generation") != record.Commit.Generation || UInt(status, "capacity_bytes") != record.Commit.CapacityBytes || Flag(status, "encrypted") || DiskObjectSize(status) != record.Commit.ObjectSizeBytes)
                         throw new IOException("云端提交描述与已认证的磁盘根不一致。");
                     string phase = Text(status, "phase");
                     long done = SyncCoordinator.GetLong(status, "completed_objects") * record.Commit.ObjectSizeBytes;

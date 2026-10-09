@@ -40,8 +40,8 @@ class TaskMonitorView {
   this.host.querySelector('.task-network-limits').textContent=`所有磁盘共用 · 每秒 ${limits.requestsPerSecond??state.settings?.baiduRequestsPerSecond??3} 次 · 同时 ${limits.maximumConcurrentRequests??state.settings?.baiduMaximumConcurrentRequests??4} 个`;
   if(!this.disks.some(d=>d.id===this.diskId))this.diskId=this.disks.find(d=>d.id===preferredDisk)?.id||this.disks.find(d=>d.unlocked)?.id||this.disks[0]?.id||'';
   const selector=this.host.querySelector('.task-diagnostics-disk');
-  const options=this.disks.map(d=>`<option value="${this.esc(d.id)}">${this.esc(d.name)}${d.unlocked?'':' · 未解锁'}</option>`).join('')||'<option value="">没有磁盘</option>';
-  if(this.optionsHtml!==options){selector.innerHTML=options;this.optionsHtml=options;}
+  const options=this.disks.map(d=>`<option value="${this.esc(d.id)}">${this.esc(d.name)}${d.unlocked?'':' · 未打开'}</option>`).join('')||'<option value="">没有磁盘</option>';
+  if(this.optionsHtml!==options){LiveDom.html(selector,options);this.optionsHtml=options;}
   selector.value=this.diskId;selector.disabled=!this.disks.length;
   this.updateDisk();this.tick();
  }
@@ -50,7 +50,7 @@ class TaskMonitorView {
   const next=this.disks?.find(d=>d.id===this.diskId),ready=!!(this.connected&&next?.unlocked);
   if(this.disk?.id!==next?.id||this.ready!==ready){
    this.invalidate();this.host.querySelector('.task-diagnostics-values').replaceChildren();
-   this.feedback(!next?'添加磁盘后可查看诊断。':!this.connected?'磁盘服务连接后可查看诊断。':!next.unlocked?'解锁这块磁盘后可查看诊断。':'展开后读取当前磁盘的诊断。');
+   this.feedback(!next?'添加磁盘后可查看诊断。':!this.connected?'磁盘服务连接后可查看诊断。':!next.unlocked?'打开这块磁盘后可查看诊断。':'展开后读取当前磁盘的诊断。');
   }
   this.disk=next;this.ready=ready;
   this.host.querySelector('[data-monitor-op="refresh"]').disabled=!ready||!!this.inFlight;
@@ -77,12 +77,12 @@ class TaskMonitorView {
   return operation.promise;
  }
  draw(stats){
-  const labels={phase:'当前阶段',message:'正在处理',phase_elapsed_ms:'当前阶段（ms）',queue_wait_ms:'请求排队（ms）',filesystem_flush_ms:'文件系统刷新（ms）',physical_read_bytes:'实际磁盘读取',physical_write_bytes:'本地写入',upload_read_bytes:'导出规范字节（含内存补零）',foreground_read_bytes:'前台读取',foreground_write_bytes:'前台写入',changed_pages:'实际变化页',deduplicated_pages:'相同内容写入',api_requests:'网盘请求',api_queued:'网盘排队请求',api_active:'网盘进行中请求',api_requests_per_second:'全局请求上限（次/秒）',sent_bytes:'实际传输',reused_bytes:'复用内容',seal_fresh_pages:'封口复用新页',seal_disk_pages:'封口读取旧页',seal_validated_pages:'旧页认证校验',seal_logical_zero_bytes:'逻辑补零',upload_zero_fill_bytes:'上传补零',receipt_log_bytes:'回执日志写入',receipt_log_pages:'回执日志页数',receipt_log_flushes:'回执日志刷盘次数',receipt_log_objects:'回执确认对象数',receipt_checkpoints:'回执检查点次数',receipt_recovered_uncertain_tails:'回执异常尾恢复次数',crypto_pages:'批量页编码',crypto_parallel_pages:'并行编码页',crypto_worker_limit:'编码工作线程上限',metadata_write_pages:'索引写入页',metadata_write_batches:'合并索引写入次数',cloud_index_lookup_batches:'增量索引查询批次'};
+  const labels={phase:'当前阶段',message:'正在处理',phase_elapsed_ms:'当前阶段（ms）',queue_wait_ms:'请求排队（ms）',filesystem_flush_ms:'文件系统刷新（ms）',physical_read_bytes:'实际磁盘读取',physical_write_bytes:'本地写入',upload_read_bytes:'导出规范字节（含内存补零）',foreground_read_bytes:'前台读取',foreground_write_bytes:'前台写入',changed_pages:'实际变化页',deduplicated_pages:'相同内容写入',api_requests:'网盘请求',api_queued:'网盘排队请求',api_active:'网盘进行中请求',api_requests_per_second:'全局请求上限（次/秒）',sent_bytes:'实际传输',reused_bytes:'复用内容',seal_fresh_pages:'封口复用新页',seal_disk_pages:'封口读取旧页',seal_validated_pages:'旧页认证校验',seal_logical_zero_bytes:'逻辑补零',upload_zero_fill_bytes:'上传补零',receipt_log_bytes:'回执日志写入',receipt_log_pages:'回执日志页数',receipt_log_flushes:'回执日志刷盘次数',receipt_log_objects:'回执确认对象数',receipt_checkpoints:'回执检查点次数',receipt_recovered_uncertain_tails:'回执异常尾恢复次数',page_encoded_pages:'批量页编码',page_parallel_pages:'并行编码页',page_worker_limit:'编码工作线程上限',metadata_write_pages:'索引写入页',metadata_write_batches:'合并索引写入次数',cloud_index_lookup_batches:'增量索引查询批次'};
   const fields=Object.entries(stats||{}).filter(([key,value])=>labels[key]&&typeof value!=='object');
   const preparation=this.drawPreparation(stats?.preparation_diagnostics);
-  const cumulative=fields.length?`<section class="task-cumulative-diagnostics"><h4>磁盘与请求计数</h4><p class="muted">本地计数从本次解锁开始，包含前台读写；网盘请求为当前账户会话累计。</p><div class="task-diagnostic-metrics">${fields.map(([key,value])=>this.metric(key,labels[key],key==='phase'?this.phase(value):value)).join('')}</div></section>`:'';
+  const cumulative=fields.length?`<section class="task-cumulative-diagnostics"><h4>磁盘与请求计数</h4><p class="muted">本地计数从本次打开开始，包含前台读写；网盘请求为当前账户会话累计。</p><div class="task-diagnostic-metrics">${fields.map(([key,value])=>this.metric(key,labels[key],key==='phase'?this.phase(value):value)).join('')}</div></section>`:'';
   const host=this.host.querySelector('.task-diagnostics-values'),scroll=host.scrollTop;
-  host.innerHTML=preparation+cumulative||'<span class="muted">暂无诊断数据</span>';host.scrollTop=scroll;
+  LiveDom.html(host,preparation+cumulative||'<span class="muted">暂无诊断数据</span>');
  }
  metric(key,label,value){return `<div data-metric="${this.esc(key)}"><span>${this.esc(label)}</span><b>${this.esc(key.endsWith('_bytes')?this.bytes(value):value)}</b></div>`;}
  drawPreparation(preparation){

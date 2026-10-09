@@ -21,10 +21,15 @@ are included.
 
 ## Immutable transport profile
 
-`zstd-v1` means this pinned encoder implementation at compression level 3,
+`zstd-v2` and `zstd-aes256gcm-v2` use this pinned encoder implementation at compression level 3,
 content-size enabled, frame checksum disabled, and zero internal zstd workers.
-A 128-byte OverlayDisk envelope binds version, canonical length/SHA-256,
-compressed length/SHA-256, reserved zero bytes, and the header checksum.
+The plaintext transport uses a 128-byte checksum envelope. The encrypted
+transport first compresses the plaintext canonical object, then uses AES-256-GCM
+with an authenticated 128-byte envelope and descriptor context. Its nonce is
+derived from the disk key, immutable identity and compressed-payload digest, so
+retries of identical objects are byte-stable without reusing a nonce for a
+different compressed representation. Salt and KDF parameters live in the disk
+commit; receipt identities include the encryption settings identity.
 There is exactly one standard zstd frame, no dictionary, and a maximum 16 MiB
 window. The decoder accepts only the expected 4/8/16 MiB canonical size and
 checks its caller-supplied authenticated SHA-256 after bounded decompression.

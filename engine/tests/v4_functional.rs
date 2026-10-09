@@ -54,8 +54,9 @@ fn commit(v: &Volume, j: &Value) {
     v.control(&json!({"cmd":"cloud.commit","job_id":j["id"],"root_object_id":j["root_object_id"],"root_sha256":j["root_sha256"],"receipt":"memory-root-readback"})).unwrap();
 }
 #[test]
-fn encrypted_and_plain_random_sector_model_reopens_single_file() {
-    for password in [None, Some("correct horse test")] {
+fn plaintext_random_sector_model_reopens_single_file() {
+    {
+            let password: Option<&str> = None;
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("source.odv4");
         let v = create(&path, password);
@@ -98,7 +99,7 @@ fn encrypted_and_plain_random_sector_model_reopens_single_file() {
 fn incremental_snapshot_objects_survive_new_writes_reopen_and_compaction() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("disk.odv4");
-    let v = create(&path, Some("encrypted test"));
+    let v = create(&path, None);
     v.control(&json!({"cmd":"cloud.bind","binding":{"provider":"memory","account_id":"test","writer_id":"test","remote_root":"/test","enabled":true}})).unwrap();
     let data = (0..8 * 1024 * 1024)
         .map(|i| (i / 4096 + i % 251) as u8)
@@ -136,7 +137,7 @@ fn incremental_snapshot_objects_survive_new_writes_reopen_and_compaction() {
         "ordinary compaction cannot dirty cloud data"
     );
     drop(v);
-    let v = Volume::open(&path, Some("encrypted test")).unwrap();
+    let v = Volume::open(&path, None).unwrap();
     assert!(prepare(&v).is_null());
     let status = v.control(&json!({"cmd":"cloud.status"})).unwrap();
     assert_eq!(
@@ -151,7 +152,7 @@ fn incremental_snapshot_objects_survive_new_writes_reopen_and_compaction() {
     let copy = Volume::restore_begin_v4(
         &target,
         &objects[second["root_object_id"].as_str().unwrap()],
-        Some("encrypted test"),
+        None,
     )
     .unwrap();
     assert_ne!(copy.info().unwrap().id, v.info().unwrap().id);

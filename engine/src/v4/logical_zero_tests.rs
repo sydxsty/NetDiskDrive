@@ -87,7 +87,7 @@ fn assert_tail_untouched(store: &Store, object: &Object, writes: bool) {
 fn logical_zero_tail_skips_physical_io_and_survives_reopen_for_every_geometry() {
     let directory = directory();
     for size in [4 << 20, 8 << 20, 16 << 20] {
-        let password = (size == 8 << 20).then_some("logical-zero-encrypted");
+        let password = None;
         let path = directory.path().join(format!("{size}.odv4"));
         let (config, mut store) = create(&path, size, password);
         let (page, object) = append(&mut store, 79);
@@ -142,7 +142,7 @@ fn logical_zero_boundaries_do_not_hide_header_payload_or_root_descriptor_damage(
     let (_config, mut store) = create(
         &directory.path().join("bounds.odv4"),
         OBJECT,
-        Some("bounds"),
+        None,
     );
     let (_, data) = append(&mut store, 41);
     let data = seal(&mut store, data.oid).unwrap();

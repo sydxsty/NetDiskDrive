@@ -105,7 +105,7 @@ internal static class AppCloudSelfTests
             if (driveLetter == default) throw new IOException("没有可用的测试盘符。");
             checks.Add("ordinary application loads only its own protected login session");
             SetStage("create-and-save-file");
-            await Call("disks.create", new { name = "云端闭环测试", containerPath = sourcePath, capacityBytes = 256UL * 1024 * 1024, driveLetter = driveLetter.ToString(), encrypted = true, password });
+            await Call("disks.create", new { name = "云端闭环测试", containerPath = sourcePath, capacityBytes = 256UL * 1024 * 1024, driveLetter = driveLetter.ToString(), encrypted = false });
             var source = FindDisk(await State(), sourcePath); sourceId = Text(source, "id"); Remember(source, sourcePath);
             if (!Flag(source, "mounted")) throw new IOException("测试源盘未挂载。");
             byte[] expected = new byte[64 * 1024]; new Random(9201).NextBytes(expected);
@@ -117,11 +117,11 @@ internal static class AppCloudSelfTests
             checks.Add("real administrator worker creates NTFS and saves a 64 KiB file before safe unmount");
 
             SetStage("sync");
-            await Call("disks.unlock", new { id = sourceId, password });
+            await Call("disks.unlock", new { id = sourceId });
             remoteRoot = CloudRepository.RootPath(sourceId);
             if (await provider.HeadAsync(remoteRoot) is not null) throw new IOException("测试云目录已存在，已拒绝写入。");
             Remember(source, sourcePath);
-            await Call("sync.enable", new { id = sourceId });
+            await Call("sync.enable", new { id = sourceId, encrypted = true, password });
             state = await WaitTask("sync", sourceId); synced = true;
             SourceCheckpoint("after-sync", state);
             checks.Add("ApplicationService publishes and confirms the real cloud synchronization job");
@@ -141,7 +141,7 @@ internal static class AppCloudSelfTests
             var target = FindDisk(state, targetPath); targetId = Text(target, "id"); Remember(target, targetPath);
             if (targetId == sourceId) throw new IOException("恢复盘未获得独立身份。");
             SetStage("mount-and-verify-restored-file");
-            await Call("disks.mount", new { id = targetId, password });
+            await Call("disks.mount", new { id = targetId });
             target = FindDisk(await State(), targetPath);
             string restoredFile = Text(target, "driveLetter") + @":\" + fileName;
             byte[] actual = await File.ReadAllBytesAsync(restoredFile);

@@ -13,7 +13,8 @@ namespace OverlayDisk.Services;
 internal static class CachePolicySelfTests
 {
     private const int MiB = 1024 * 1024, Chunks = 12;
-    private const string Password = "isolated-cache-policy-fixture", Account = "cache-policy-fixture";
+    private const string? Password = null;
+    private const string Account = "cache-policy-fixture";
     private static readonly JsonSerializerOptions Json = new(JsonSerializerDefaults.Web);
     internal static async Task<int> RunAsync(string output)
     {

@@ -23,7 +23,7 @@ internal static class SelfTests
         var passed = new List<string>();
         passed.AddRange(PlatformSelfTests.RunAsync().GetAwaiter().GetResult());
         passed.AddRange(Services.LazySourcePolicySelfTests.Run());
-        foreach (bool encrypted in new[] { false, true })
+        foreach (bool encrypted in new[] { false })
         {
             string containerDirectory = Path.Combine(output, encrypted ? "encrypted" : "plain");
             Directory.CreateDirectory(containerDirectory);
@@ -63,12 +63,11 @@ internal static class SelfTests
                 catch (IOException) { bounds = true; }
                 Check(bounds, "越界请求必须报错");
             }
-            if (encrypted)
             {
                 bool rejected = false;
                 try { using var wrong = new CoreDisk(path, "wrong-password"); }
                 catch (IOException) { rejected = true; }
-                Check(rejected, "错误密码必须被拒绝");
+                Check(rejected, "本地格式不应接受密码参数");
             }
             using (var disk = new CoreDisk(path, password))
             {
@@ -195,8 +194,8 @@ internal static class SelfTests
         using var controller = new DiskController(Path.Combine(output, "settings"));
         if (!controller.IsAdministrator || !controller.DriverAvailable) throw new IOException("真实挂载测试需要管理员权限和已安装的 WinSpd 驱动。");
         char letter = Enumerable.Range('D', 23).Select(i => (char)i).Reverse().First(c => !DriveInfo.GetDrives().Any(d => d.Name[0] == c));
-        var request = new CreateDiskRequest("OD-FunctionTest", Path.Combine(output, "disk.odv4"), 256UL * 1024 * 1024, letter, true);
-        const string password = "OverlayDisk-disposable-test-only";
+        var request = new CreateDiskRequest("OD-FunctionTest", Path.Combine(output, "disk.odv4"), 256UL * 1024 * 1024, letter, false);
+        const string? password = null;
         DiskEntry? entry = null;
         try
         {

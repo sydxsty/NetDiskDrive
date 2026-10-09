@@ -162,7 +162,7 @@ internal sealed partial class BaiduMetadataCache
     private static bool ValidEntry(string parent, CachedCloudObject? entry) => entry?.Info is { } info &&
         !string.IsNullOrEmpty(info.Path) && info.Path.Length <= 4096 && Parent(info.Path) == parent && info.Length >= 0 &&
         (entry.Sha256 is null || entry.Sha256.Length == 64 && entry.Sha256.All(Uri.IsHexDigit)) &&
-        (entry.Canonical is not { } canonical || canonical.Path == info.Path && canonical.Codec == ObjectTransport.Codec &&
+        (entry.Canonical is not { } canonical || canonical.Path == info.Path && ObjectTransport.IsSupportedCodec(canonical.Codec) && (canonical.Codec == ObjectTransport.EncryptedCodec ? canonical.EncryptionId is { Length: 64 } && canonical.EncryptionId.All(Uri.IsHexDigit) : canonical.EncryptionId is null) &&
             CloudObjectGeometry.IsSupported(canonical.Length) && canonical.Sha256 is { Length: 64 } && canonical.Sha256.All(Uri.IsHexDigit) &&
             entry.Sha256 is not null && !info.IsDirectory && info.Length > ObjectTransport.HeaderLength && info.Length <= ObjectTransport.MaxWireLength(canonical.Length));
 

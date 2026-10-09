@@ -35,8 +35,8 @@ internal static class ObjectGeometryTests
                 Binding.RemoteRoot + "/objects/" + Volume.DataId[..2], Binding.RemoteRoot + "/objects/" + Volume.RootId[..2]]);
             await using var lease = await Cache.AcquireAsync(Scope); await Cache.SaveAsync(Scope, state);
         }
-        internal Task<SyncResult> Run(Progress? progress = null) => new SyncCoordinator(Repository).RunAsync(Volume, Binding, "geometry", 64UL << 20, true, 2, progress, default);
-        internal RemoteCommit Commit(int objectSize) => new(4, Volume.Id, Writer, 1, "geometry", 64UL << 20, true, Volume.RootId, Volume.RootHash, DateTimeOffset.UnixEpoch) { ObjectSizeBytes = objectSize };
+        internal Task<SyncResult> Run(Progress? progress = null) => new SyncCoordinator(Repository).RunAsync(Volume, Binding, "geometry", 64UL << 20, false, 2, progress, default);
+        internal RemoteCommit Commit(int objectSize) => new(4, Volume.Id, Writer, 1, "geometry", 64UL << 20, false, Volume.RootId, Volume.RootHash, DateTimeOffset.UnixEpoch) { ObjectSizeBytes = objectSize };
     }
     private sealed class Progress : IProgress<TransferProgress>
     { internal List<TransferProgress> Items { get; } = []; public void Report(TransferProgress value) { lock (Items) Items.Add(value); } }

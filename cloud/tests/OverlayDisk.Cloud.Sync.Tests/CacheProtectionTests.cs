@@ -9,7 +9,7 @@ internal static class CacheProtectionTests
     private const string RootId = "1e6d3324-e8cb-4bd0-9296-b41a969f693e", Account = "cache-account";
     private static readonly JsonSerializerOptions Json = new(JsonSerializerDefaults.Web);
     private static string Root => CloudRepository.RootPath(VolumeId);
-    private static RemoteCommit Commit => new(4, VolumeId, WriterId, 7, "Cache", 64UL << 20, true, RootId, new string('a', 64), DateTimeOffset.UnixEpoch);
+    private static RemoteCommit Commit => new(4, VolumeId, WriterId, 7, "Cache", 64UL << 20, false, RootId, new string('a', 64), DateTimeOffset.UnixEpoch);
     private static string ObjectId(int n) => "00000000-0000-0000-0000-" + n.ToString("x12");
     internal static readonly (string Name, Func<Task> Run)[] All =
     [
@@ -150,7 +150,7 @@ internal static class CacheProtectionTests
             "Protected first batch blocked progress or lost retained references");
         Assert(f.Store.Calls.Count(c => c == "read:" + f.Pin) == 1 && f.Store.DeleteCalls == 81 && f.Store.Files.ContainsKey(f.Pin), "Own pin caused full GC blocking or was itself collected");
         Assert(Enumerable.Range(1, 70).All(i => f.Store.Files.ContainsKey(CloudRepository.ObjectPath(Root, ObjectId(i)))), "Snapshot/current reference was deleted");
-        f.Store.Calls.Clear(); await new SyncCoordinator(f.Repository).RunAsync(f.Volume, f.Binding, "Cache", Commit.CapacityBytes, true, 1, null, default);
+        f.Store.Calls.Clear(); await new SyncCoordinator(f.Repository).RunAsync(f.Volume, f.Binding, "Cache", Commit.CapacityBytes, false, 1, null, default);
         Assert(f.Store.Calls.Count == 0, "No-op sync refreshed the cache pin or ran automatic cleanup");
         var onlyCommit = new Fixture(); await onlyCommit.Seed(); await onlyCommit.Enable();
         state = await onlyCommit.Load(); state.PendingDeleteCommits.Add(oldCommit); onlyCommit.Store.Files[oldCommit] = [2]; await onlyCommit.Save(state);

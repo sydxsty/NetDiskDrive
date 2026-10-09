@@ -1,3 +1,4 @@
+using OverlayDisk.Cloud.Contracts;
 using System.Security.Cryptography;
 using System.Text.Json;
 using OverlayDisk.Cloud.Baidu;
@@ -17,7 +18,7 @@ internal static class LiveCloudSelfTests
         var account = await provider.ValidateAsync();
         var repository = new CloudRepository(provider);
         string path = Path.Combine(output, "source.odv4"), target = Path.Combine(output, "restored.odv4");
-        const string password = "Cloud-functional-test-only-测试";
+        const string? password = null;
         CoreDisk.Create(path, 64UL * 1024 * 1024, password);
         string? root = null; string? volumeId = null; bool uploaded = false, restored = false, cleaned = false;
         try
@@ -25,6 +26,8 @@ internal static class LiveCloudSelfTests
             using (var disk = new CoreDisk(path, password))
             {
                 volumeId = disk.Id.ToString(); root = CloudRepository.RootPath(volumeId);
+                using var cloudEncryption = CloudEncryptionContext.Create(volumeId, "cloud-only-live-fixture-password");
+                repository.RegisterEncryption(root, cloudEncryption);
                 if (await provider.HeadAsync(root) is not null) throw new IOException("测试目录已经存在，已拒绝写入。");
                 byte[] first = new byte[8192], second = new byte[12288]; new Random(713).NextBytes(first); new Random(719).NextBytes(second);
                 disk.Write(512, first, first.Length); disk.Write(4UL * 1024 * 1024 - 512, second, second.Length); disk.Trim(4096, 512); Array.Clear(first, 4096 - 512, 512); disk.Flush();

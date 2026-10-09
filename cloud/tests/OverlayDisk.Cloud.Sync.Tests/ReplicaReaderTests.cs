@@ -24,7 +24,7 @@ internal static class ReplicaReaderTests
         ("replica: cancellation cannot select or pin a new source", Cancellation)
     ];
     private static RemoteCommit Commit(ulong generation, string? objectId = null) => new(4, Volume, Writer, generation,
-        "Replica", 64UL * 1024 * 1024, true, objectId ?? $"00000000-0000-0000-0000-{generation:D12}", new string('a', 64), DateTimeOffset.UnixEpoch);
+        "Replica", 64UL * 1024 * 1024, false, objectId ?? $"00000000-0000-0000-0000-{generation:D12}", new string('a', 64), DateTimeOffset.UnixEpoch);
     private static void Assert(bool value, string reason) { if (!value) throw new Exception(reason); }
     private static async Task Reject(Func<Task> action)
     { try { await action(); } catch (IOException) { return; } throw new Exception("Unsafe reader metadata was accepted"); }

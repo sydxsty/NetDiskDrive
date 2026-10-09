@@ -10,7 +10,7 @@ internal static class LocalRestoreSelfTests
         if (Directory.Exists(output)) throw new IOException("请使用全新的本地恢复测试目录。");
         Directory.CreateDirectory(output);
         string catalog = Path.Combine(output, "settings"), sourcePath = Path.Combine(output, "source.odv4"), targetPath = Path.Combine(output, "target.odv4");
-        const string password = "isolated-restore-fixture-password";
+        const string? password = null;
         byte[] expected = new byte[1024 * 1024];
         new Random(71).NextBytes(expected);
         CoreDisk.Create(sourcePath, 128UL * 1024 * 1024, password);
@@ -52,10 +52,10 @@ internal static class LocalRestoreSelfTests
         {
             var state = await Call("state", new { });
             var task = state.GetProperty("tasks").EnumerateArray().Single(t => t.GetProperty("id").GetString() == taskId);
-            if (!task.GetProperty("requiresPassword").GetBoolean() || !task.GetProperty("sourceRequiresPassword").GetBoolean())
+            if (task.GetProperty("requiresPassword").GetBoolean() || task.GetProperty("sourceRequiresPassword").GetBoolean())
                 throw new IOException("重启后未请求恢复目标和源磁盘的密码。");
             string metadata = File.ReadAllText(Path.Combine(catalog, "snapshot-restores.json"));
-            if (metadata.Contains(password, StringComparison.Ordinal)) throw new IOException("任务元数据保存了密码。");
+            if (metadata.Contains("isolated-restore-fixture-password", StringComparison.Ordinal)) throw new IOException("任务元数据保存了密码。");
             checks.Add("recreated worker recovers durable task metadata without persisting passwords");
             await Call("snapshots.restoreResume", new { taskId, targetPassword = password, sourcePassword = password });
             using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(60));
@@ -77,7 +77,7 @@ internal static class LocalRestoreSelfTests
                     if (!actual.AsSpan().SequenceEqual(expected)) throw new IOException("恢复后的磁盘数据与快照不一致。");
                 }
             }
-            checks.Add("resume reattaches encrypted source and target, completes import and verifies all 16 MiB");
+            checks.Add("resume reattaches plaintext source and target, completes import and verifies all 16 MiB");
         }
         finally { await service.ShutdownAsync(default); }
         File.WriteAllText(Path.Combine(output, "result.json"), JsonSerializer.Serialize(new { passed = true, checks }));

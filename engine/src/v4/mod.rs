@@ -2,7 +2,7 @@
 mod cache;
 mod cloud;
 mod codec;
-mod crypto_work;
+mod page_work;
 mod geometry;
 mod io;
 mod lazy;
@@ -28,7 +28,7 @@ mod on_demand_tests;
 mod store;
 mod tree;
 mod volume;
-use codec::{Config, Crypto, MetaRef};
+use codec::{Config, PageCodec, MetaRef};
 use geometry::Geometry;
 use io::Device;
 pub use lazy::{ObjectProvider, RemoteObject};
@@ -60,8 +60,6 @@ pub enum Error {
     Invalid(String),
     #[error("authentication or integrity failure: {0}")]
     Integrity(String),
-    #[error("wrong password or damaged key envelope")]
-    Password,
     #[error("volume already open")]
     Locked,
     #[error("persistence failed; reopen volume: {0}")]
@@ -106,6 +104,8 @@ mod reclaim_tests;
 
 #[cfg(test)]
 mod write_seal_tests;
+#[cfg(test)]
+mod plaintext_tests;
 
 #[cfg(test)]
 mod geometry_tests;

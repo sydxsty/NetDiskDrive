@@ -12,7 +12,7 @@ internal static class OriginalRestoreTests
     private static readonly JsonSerializerOptions Json = new(JsonSerializerDefaults.Web);
     private static string Root => CloudRepository.RootPath(Volume);
     private static RemoteCommit Commit(ulong generation = 7) => new(4, Volume, Writer, generation, "Original disk",
-        64UL * 1024 * 1024, true, RootObject, new string('a', 64), DateTimeOffset.UnixEpoch);
+        64UL * 1024 * 1024, false, RootObject, new string('a', 64), DateTimeOffset.UnixEpoch);
     internal static readonly (string Name, Func<Task> Run)[] All =
     [
         ("original restore attaches the recorded writer with metadata reads only and zero-API no-op", AttachAndNoop),
@@ -112,7 +112,7 @@ internal static class OriginalRestoreTests
         Assert(!state.ConfirmedFolders.Contains(Root + "/objects") && !state.ConfirmedFolders.Contains(Root + "/readers"), "Attach invented unverified directories");
         store.Calls.Clear();
         var reopenedRepository = new CloudRepository(store, cache, Account);
-        var result = await new SyncCoordinator(reopenedRepository).RunAsync(new RestoredVolume(Commit()), binding, "Original", Commit().CapacityBytes, true, 1, null, default);
+        var result = await new SyncCoordinator(reopenedRepository).RunAsync(new RestoredVolume(Commit()), binding, "Original", Commit().CapacityBytes, false, 1, null, default);
         Assert(result.Commit == Commit() && !result.HasPendingChanges && store.Calls.Count == 0, "First unchanged original sync issued a cloud API or changed identity");
     }
 
@@ -208,7 +208,7 @@ internal static class OriginalRestoreTests
         Assert(baseline.PendingDeleteObjects.Count == 0 && baseline.PendingDeleteCommits.SetEquals([oldPath]), "Unproven obsolete-object/future-commit candidate remained eligible for GC");
         store.Calls.Clear();
         await Reject(() => new SyncCoordinator(repository).RunAsync(new RestoredVolume(Commit() with { RootSha256 = new string('b', 64) }), binding,
-            "Original", Commit().CapacityBytes, true, 1, null, default));
+            "Original", Commit().CapacityBytes, false, 1, null, default));
         Assert(store.Calls.Count == 0, "Wrong native root triggered a cloud mutation instead of refusing no-op");
         await Save(cache, store, Baseline(store, Commit(8)));
         await Reject(() => repository.PrepareOriginalRestoreAsync(Volume, Commit()));

@@ -141,11 +141,11 @@ fn logical_state(v: &Volume) -> (u64, u64, Value, Value) {
 }
 
 #[test]
-fn encrypted_publication_cache_frees_physical_bytes_and_reopens_without_guest_changes() {
+fn plaintext_publication_cache_frees_physical_bytes_and_reopens_without_guest_changes() {
     let directory = TempDir::new().unwrap();
     let path = directory.path().join("published.odv4");
-    Volume::create(&path, 64 << 20, Some("cache-fixture-password")).unwrap();
-    let v = Volume::open(&path, Some("cache-fixture-password")).unwrap();
+    Volume::create(&path, 64 << 20, None).unwrap();
+    let v = Volume::open(&path, None).unwrap();
     let expected: Vec<u8> = (0..1200 * PAGE)
         .map(|i| ((i * 37 + i / PAGE) % 251) as u8)
         .collect();
@@ -191,7 +191,7 @@ fn encrypted_publication_cache_frees_physical_bytes_and_reopens_without_guest_ch
     assert_eq!(logical_state(&v), before);
     assert!(v.control(&json!({"cmd":"cloud.prepare"})).unwrap()["job"].is_null());
     drop(v);
-    let reopened = Volume::open(&path, Some("cache-fixture-password")).unwrap();
+    let reopened = Volume::open(&path, None).unwrap();
     assert_eq!(
         reopened.control(&json!({"cmd":"cache.status"})).unwrap()["online"],
         false
@@ -272,8 +272,8 @@ fn unconfirmed_source_and_unpublished_dirty_objects_are_never_discarded() {
 fn snapshot_only_published_history_can_be_evicted_and_gc_keeps_its_remote_source() {
     let directory = TempDir::new().unwrap();
     let path = directory.path().join("history.odv4");
-    Volume::create(&path, 64 << 20, Some("history-password")).unwrap();
-    let v = Volume::open(&path, Some("history-password")).unwrap();
+    Volume::create(&path, 64 << 20, None).unwrap();
+    let v = Volume::open(&path, None).unwrap();
     let remote = Remote::default();
     v.write(0, &[41; PAGE]).unwrap();
     v.flush().unwrap();

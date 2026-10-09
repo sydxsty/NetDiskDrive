@@ -28,8 +28,8 @@ fn publish(v: &Volume, job: &Value) -> Result<Value> {
         "root_sha256":job["root_sha256"],"receipt":"isolated-memory-cloud"}))
 }
 fn fixture(path: &Path, count: usize) -> (Volume, Value, Vec<Value>) {
-    Volume::create(path, 64 << 20, Some("receipt-password")).unwrap();
-    let v = Volume::open(path, Some("receipt-password")).unwrap();
+    Volume::create(path, 64 << 20, None).unwrap();
+    let v = Volume::open(path, None).unwrap();
     // Many small immutable objects exercise checkpoint boundaries without a
     // large payload or a throughput benchmark.
     {
@@ -71,12 +71,12 @@ fn receipt_is_one_durable_page_duplicate_is_zero_write_and_reopen_preserves_it()
     v.snapshot_create().unwrap();
     assert_eq!(v.control(&json!({"cmd":"cloud.status"})).unwrap()["job"]["uploaded_objects"], 1);
     drop(v);
-    let v = Volume::open(&path, Some("receipt-password")).unwrap();
+    let v = Volume::open(&path, None).unwrap();
     assert_eq!(objects(&v, &job).iter().filter(|o| o["uploaded"] == true).count(), 1);
     ack(&v, &job, &items).unwrap();
     publish(&v, &job).unwrap();
     drop(v);
-    let v = Volume::open(&path, Some("receipt-password")).unwrap();
+    let v = Volume::open(&path, None).unwrap();
     assert!(objects(&v, &job).iter().all(|o| o["uploaded"] == true));
     assert_eq!(v.control(&json!({"cmd":"cloud.prepare"})).unwrap()["up_to_date"], true);
 }
@@ -95,7 +95,7 @@ fn receipt_checkpoint_reuses_journal_only_after_durable_root_and_keeps_read_leas
     assert_eq!(tree::len(&mut reader, &store::SET, old.job.as_ref().unwrap().receipts).unwrap(), 0);
     assert_eq!(lease.receipts.count(old.job.as_ref().unwrap()), 256);
     drop(reader); drop(lease); drop(v);
-    let v = Volume::open(&path, Some("receipt-password")).unwrap();
+    let v = Volume::open(&path, None).unwrap();
     assert_eq!(objects(&v, &job).iter().filter(|o| o["uploaded"] == true).count(), items.len());
     publish(&v, &job).unwrap();
     let mut read = [0; PAGE]; v.read(259 * PAGE as u64, &mut read).unwrap();
@@ -109,7 +109,7 @@ fn damaged_receipt_tail_never_confirms_missing_objects_and_can_resume() {
     let mut frame = [0; PAGE]; v.shared.device.read(5 * PAGE as u64, &mut frame).unwrap();
     frame[120] ^= 1; v.shared.device.write(5 * PAGE as u64, &frame).unwrap();
     v.shared.device.sync().unwrap(); drop(v);
-    let v = Volume::open(&path, Some("receipt-password")).unwrap();
+    let v = Volume::open(&path, None).unwrap();
     assert_eq!(objects(&v, &job).iter().filter(|o| o["uploaded"] == true).count(), 1);
     assert!(publish(&v, &job).is_err());
     ack(&v, &job, &items).unwrap();
@@ -126,7 +126,7 @@ fn failed_receipt_sync_never_reports_success_or_permits_publication() {
     assert!(v.control(&json!({"cmd":"cloud.status"})).is_err());
     v.shared.device.fail_sync.store(false, Ordering::Relaxed);
     drop(v);
-    let v = Volume::open(&path, Some("receipt-password")).unwrap();
+    let v = Volume::open(&path, None).unwrap();
     // A failed OS flush can have written some or all bytes. Only authenticated
     // records are replayed; retry is idempotent in both outcomes.
     ack(&v, &job, &items).unwrap(); publish(&v, &job).unwrap();
@@ -146,7 +146,7 @@ fn invalid_receipt_batch_is_atomic_and_old_journal_cannot_confirm_a_new_job() {
     assert_ne!(next["id"], job["id"]);
     let next_items = objects(&v, &next);
     drop(v);
-    let v = Volume::open(&path, Some("receipt-password")).unwrap();
+    let v = Volume::open(&path, None).unwrap();
     assert!(objects(&v, &next).iter().all(|o| o["uploaded"] == false));
     assert!(publish(&v, &next).is_err());
     ack(&v, &next, &next_items).unwrap(); publish(&v, &next).unwrap();
@@ -180,7 +180,7 @@ fn crash_after_receipt_sync_or_checkpoint_preserves_confirmed_prefix() {
         let status = Command::new(std::env::current_exe().unwrap()).args(["--ignored", "--exact", "v4::receipt_tests::receipt_crash_child"])
             .env("OD_V4_RECEIPT_PATH", &path).env("OD_V4_RECEIPT_CRASH", stage).status().unwrap();
         assert_eq!(status.code(), Some(77));
-        let v = Volume::open(&path, Some("receipt-password")).unwrap();
+        let v = Volume::open(&path, None).unwrap();
         assert_eq!(objects(&v, &job).iter().filter(|o| o["uploaded"] == true).count(), 1);
         ack(&v, &job, &items).unwrap(); publish(&v, &job).unwrap();
     }
@@ -209,7 +209,7 @@ fn interrupted_checkpoint_keeps_old_log_until_new_root_is_durable() {
             std::thread::sleep(Duration::from_millis(10));
         }
         child.kill().unwrap(); child.wait().unwrap();
-        let v = Volume::open(&path, Some("receipt-password")).unwrap();
+        let v = Volume::open(&path, None).unwrap();
         assert_eq!(objects(&v, &job).iter().filter(|o| o["uploaded"] == true).count(), 1);
         ack(&v, &job, &items).unwrap(); publish(&v, &job).unwrap();
     }
@@ -218,7 +218,7 @@ fn interrupted_checkpoint_keeps_old_log_until_new_root_is_durable() {
 #[ignore]
 fn receipt_crash_child() {
     let path = std::env::var("OD_V4_RECEIPT_PATH").unwrap();
-    let v = Volume::open(path, Some("receipt-password")).unwrap();
+    let v = Volume::open(path, None).unwrap();
     let job = v.control(&json!({"cmd":"cloud.status"})).unwrap()["job"].clone();
     if std::env::var("OD_V4_RECEIPT_CRASH").unwrap() == "receipt_after_checkpoint" {
         v.shared.store.lock().unwrap().checkpoint_receipts().unwrap();

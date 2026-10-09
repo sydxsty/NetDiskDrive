@@ -144,7 +144,7 @@ const initialState={connected:true,driverAvailable:true,account:null,disks:[disk
     assert.match(await page.locator('.task-network-current').innerText(),/当前 2 个请求进行中，5 个排队/);
     assert.equal(await diagnosticCalls(),0);assert.equal(await page.locator('.task-diagnostics').getAttribute('open'),null);
     await page.locator('.task-diagnostics summary').click();
-    assert.match(await page.locator('.task-diagnostics-feedback').innerText(),/解锁这块磁盘/);assert.equal(await diagnosticCalls(),0);
+    assert.match(await page.locator('.task-diagnostics-feedback').innerText(),/打开这块磁盘/);assert.equal(await diagnosticCalls(),0);
     await page.locator('.task-diagnostics-disk').selectOption('disk-b');
     await page.waitForFunction(()=>document.querySelector('.task-diagnostics-values').textContent.includes('诊断 disk-b'));
     const preparation=page.locator('.task-preparation-diagnostics'),cumulative=page.locator('.task-cumulative-diagnostics');

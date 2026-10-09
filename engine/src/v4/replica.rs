@@ -495,7 +495,7 @@ impl Volume {
             }
             let source = store::public_config(raw)?;
             if source.id != replica.source_volume_id
-                || source.crypto_id.unwrap_or(source.id) != s.crypto.id
+                || source.integrity_id.unwrap_or(source.id) != s.crypto.id
                 || source.capacity_bytes != s.config.capacity_bytes
                 || source.object_size != s.object_size()
                 || source
@@ -539,7 +539,7 @@ impl Volume {
                 .ok_or_else(|| integrity("replica index depth"))?;
             if descriptor["format_version"] != 4
                 || descriptor["container_id"] != source.id.to_string()
-                || descriptor["crypto_id"] != s.crypto.id.to_string()
+                || descriptor["integrity_id"] != s.crypto.id.to_string()
                 || descriptor["capacity_bytes"] != s.config.capacity_bytes
                 || descriptor["object_size"] != g.object_size
                 || descriptor["page_size"] != PAGE
@@ -577,7 +577,7 @@ impl Volume {
                 || commit["generation"] != generation
                 || commit["capacityBytes"] != source.capacity_bytes
                 || commit["objectSizeBytes"] != source.object_size
-                || commit["encrypted"] != source.encrypted
+                || !commit["encrypted"].is_boolean()
                 || commit["formatVersion"] != 4
             {
                 return Err(integrity("replica commit differs from authenticated root"));

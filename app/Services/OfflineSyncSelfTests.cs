@@ -13,11 +13,20 @@ internal static class OfflineSyncSelfTests
         if (Directory.Exists(output)) throw new IOException("请使用新的离线同步测试目录。");
         Directory.CreateDirectory(output);
         string source = Path.Combine(output, "source.odv4"), target = Path.Combine(output, "target.odv4"), cachePath = Path.Combine(output, "cache");
-        const string password = "isolated-cache-test-password";
+        const string? password = null;
         CoreDisk.Create(source, 64UL * 1024 * 1024, password, objectSizeBytes);
         var store = new MemoryStore(); var checks = new List<string>(); var events = new List<SyncLogEntry>();
         CloudBinding binding; SyncResult first, second;
-        CloudRepository Repo() => new(store, new FileCloudSyncCache(cachePath), "offline-account");
+        string sourceId; using (var inspect = new CoreDisk(source, null)) { sourceId = inspect.Id.ToString(); Check(!inspect.Encrypted, "本地容器不应加密"); }
+        using var encryption = CloudEncryptionContext.Create(sourceId, "cloud-only-functional-fixture-password");
+        byte[] key = encryption.ExportKey(); string protectedKey;
+        try { protectedKey = WindowsCloudKeyVault.Protect(key); }
+        finally { System.Security.Cryptography.CryptographicOperations.ZeroMemory(key); }
+        byte[] reopenedKey = WindowsCloudKeyVault.Unprotect(protectedKey);
+        using var savedEncryption = CloudEncryptionContext.FromKey(encryption.Settings, reopenedKey);
+        System.Security.Cryptography.CryptographicOperations.ZeroMemory(reopenedKey);
+        checks.Add("local container is plaintext; cloud key survives current-user DPAPI save/load without storing the password");
+        CloudRepository Repo() { var repository = new CloudRepository(store, new FileCloudSyncCache(cachePath), "offline-account"); repository.RegisterEncryption(CloudRepository.RootPath(sourceId), savedEncryption); return repository; }
         async Task<SyncResult> Run(CoreDisk disk) => await new SyncCoordinator(Repo()).RunAsync(new Volume(disk), binding, "cache fixture", disk.Capacity, true, 2, null, default, new Events(events));
         using (var disk = new CoreDisk(source, password))
         {
@@ -26,6 +35,10 @@ internal static class OfflineSyncSelfTests
             var data = new byte[8192]; new Random(711).NextBytes(data);
             disk.Write(512, data, data.Length); disk.Write(8UL * 1024 * 1024, data, data.Length); disk.Flush();
             first = await Run(disk);
+            Check(first.Commit.Encrypted && first.Commit.Encryption == encryption.Settings, "云端版本丢失固定盐或加密参数");
+            Repo().AuthenticateCommit(binding.RemoteRoot, first.Commit);
+            Check(store.Files.Where(p => p.Key.EndsWith(".obj", StringComparison.Ordinal)).All(p => p.Value.Length < objectSizeBytes / 8), "稀疏对象没有在加密之前完成压缩");
+            checks.Add("plaintext sparse native objects compress before cloud encryption, and root commit authenticates with the saved per-disk salt");
             Check(Diagnostic(disk, "upload_read_bytes") > 0, "诊断未统计首次同步的真实对象读取");
         }
         using (var disk = new CoreDisk(source, password))
@@ -57,6 +70,41 @@ internal static class OfflineSyncSelfTests
             await CheckReadAndIdenticalWriteAsync(disk, store, Run, second, checks, 16UL * 1024 * 1024, 1024 * 1024);
 
             var repository = Repo(); byte[] root = await repository.ReadObjectAsync(binding.RemoteRoot, second.Commit.RootObjectId, second.Commit.RootSha256, (int)objectSizeBytes, default);
+            foreach (string mode in new[] { "copy", "original" })
+            {
+                string lazyPath = Path.Combine(output, "encrypted-cloud-" + mode + ".odv4");
+                var options = JsonSerializer.SerializeToElement(new { mode, lazy = true,
+                    publication = mode == "original" ? new { commit = second.Commit, binding = new {
+                        backend_id = binding.ProviderId, account_id = binding.AccountId, remote_root = binding.RemoteRoot, device_id = binding.DeviceId, enabled = true } } : null,
+                    backing = new { provider_id = binding.ProviderId, account_id = binding.AccountId, source_volume_id = sourceId,
+                        remote_root = binding.RemoteRoot, root_object_id = second.Commit.RootObjectId, root_sha256 = second.Commit.RootSha256,
+                        reader_pin = binding.RemoteRoot + "/readers/" + Guid.NewGuid().ToString() + ".json" } }, SettingsStorage.Json);
+                using var lazy = CoreDisk.BeginRestore(lazyPath, root, null, options);
+                lazy.SetObjectProvider((request, ct) => repository.ReadObjectAsync(binding.RemoteRoot, request.ObjectId, request.Sha256, request.Length, ct));
+                for (int step = 0; ; step++)
+                {
+                    Check(step < 64, "加密云端按需恢复没有及时就绪");
+                    var state = lazy.Control(new { cmd = "restore.status", cursor = 0, limit = 128 });
+                    if (state.GetProperty("phase").GetString() is "ready" or "complete") { lazy.Control(new { cmd = "restore.finish" }); break; }
+                    foreach (var item in state.GetProperty("needed").EnumerateArray())
+                    {
+                        var obj = SyncCoordinator.ParseObject(item);
+                        Check(obj.Kind == "metadata", "按需恢复预先请求了文件内容");
+                        lazy.AcceptRestoreObject(obj.Id, await repository.ReadObjectAsync(binding.RemoteRoot, obj.Id, obj.Sha256, (int)objectSizeBytes, default));
+                    }
+                    lazy.Control(new { cmd = "restore.step", max_pages = 256 });
+                }
+                Check(!lazy.Encrypted && (lazy.Id.ToString() == sourceId) == (mode == "original"), "云端加密标志错误地改变本地模式或副本身份");
+                byte[] expectedPage = new byte[4096], actualPage = new byte[4096];
+                disk.Read(16UL * 1024 * 1024, expectedPage, expectedPage.Length); lazy.Read(16UL * 1024 * 1024, actualPage, actualPage.Length);
+                Check(expectedPage.SequenceEqual(actualPage), "从加密云端按需读取的数据不一致");
+                if (mode == "original")
+                {
+                    store.Calls.Clear(); var unchanged = await Run(lazy);
+                    Check(unchanged.Commit == second.Commit && store.Calls.IsEmpty, "加密云端原盘无修改同步仍请求网盘");
+                }
+            }
+            checks.Add("encrypted cloud imports as plaintext original and independent copy; data hydrates on demand, and original no-change sync makes zero provider calls");
             using var restored = CoreDisk.BeginRestore(target, root, password);
             for (int step = 0; ; step++)
             {

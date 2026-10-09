@@ -1,10 +1,9 @@
 //! Bounded, process-wide CPU workers. Only immutable plaintext references enter
 //! the queue; the storage transaction still assigns and publishes ordered slots.
 use super::{
-    codec::{hash, Crypto, PageRef},
+    codec::{hash, PageCodec, PageRef},
     Error, Result, PAGE,
 };
-use rand::{rngs::OsRng, RngCore};
 use std::{
     ops::Deref,
     sync::{mpsc, Arc, Mutex, OnceLock},
@@ -47,7 +46,7 @@ pub(super) struct Batch {
 const TASK_PAGES: usize = 64;
 const PARALLEL_MIN: usize = 128;
 struct Task {
-    crypto: Arc<Crypto>,
+    crypto: Arc<PageCodec>,
     version: u64,
     pages: Vec<(u64, Arc<PlainPage>)>,
     reply: mpsc::Sender<Result<Vec<EncodedPage>>>,
@@ -68,7 +67,7 @@ impl Pool {
         for n in 0..workers {
             let receive = receive.clone();
             thread::Builder::new()
-                .name(format!("overlay-crypto-{n}"))
+                .name(format!("overlay-page-{n}"))
                 .spawn(move || loop {
                     let task = match receive.lock() {
                         Ok(r) => r.recv(),
@@ -80,7 +79,9 @@ impl Pool {
                     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                         encode_task(&task.crypto, task.version, &task.pages)
                     }))
-                    .unwrap_or_else(|_| Err(Error::Invalid("encryption worker panicked".into())));
+                    .unwrap_or_else(|_| {
+                        Err(Error::Invalid("page encoding worker panicked".into()))
+                    });
                     let _ = task.reply.send(result);
                 })
                 .map_err(|e| e.to_string())?;
@@ -89,15 +90,13 @@ impl Pool {
     }
 }
 fn encode_task(
-    crypto: &Crypto,
+    crypto: &PageCodec,
     version: u64,
     pages: &[(u64, Arc<PlainPage>)],
 ) -> Result<Vec<EncodedPage>> {
-    let mut nonces = vec![0; pages.len() * 24];
-    OsRng.fill_bytes(&mut nonces);
     let mut out = Vec::with_capacity(pages.len());
-    for ((index, plain), nonce) in pages.iter().zip(nonces.chunks_exact(24)) {
-        let nonce = nonce.try_into().unwrap();
+    for (index, plain) in pages {
+        let nonce = [0; 24];
         let (cipher, tag) = crypto.encode_page(*index, version, nonce, &plain.bytes)?;
         out.push(EncodedPage {
             index: *index,
@@ -116,7 +115,7 @@ fn encode_task(
     Ok(out)
 }
 pub(super) fn encode_batch(
-    crypto: Arc<Crypto>,
+    crypto: Arc<PageCodec>,
     version: u64,
     pages: &[(u64, Arc<PlainPage>)],
 ) -> Result<Batch> {
@@ -128,9 +127,8 @@ pub(super) fn encode_batch(
             parallel: false,
         });
     }
-    let parallel = pages.len() >= PARALLEL_MIN
-        && crypto.key.is_some()
-        && thread::available_parallelism().is_ok_and(|n| n.get() > 1);
+    let parallel =
+        pages.len() >= PARALLEL_MIN && thread::available_parallelism().is_ok_and(|n| n.get() > 1);
     if !parallel {
         let mut encoded = Vec::with_capacity(pages.len());
         for chunk in pages.chunks(TASK_PAGES) {
@@ -146,7 +144,7 @@ pub(super) fn encode_batch(
     let pool = POOL
         .get_or_init(Pool::create)
         .as_ref()
-        .map_err(|e| Error::Invalid(format!("encryption pool: {e}")))?;
+        .map_err(|e| Error::Invalid(format!("page encoding pool: {e}")))?;
     let (reply, results) = mpsc::channel();
     let mut accepted = 0;
     let mut failed = None;
@@ -161,7 +159,7 @@ pub(super) fn encode_batch(
             })
             .is_err()
         {
-            failed = Some(Error::Invalid("encryption workers stopped".into()));
+            failed = Some(Error::Invalid("page encoding workers stopped".into()));
             break;
         }
         accepted += 1;
@@ -175,7 +173,7 @@ pub(super) fn encode_batch(
                 failed.get_or_insert(error);
             }
             Err(_) => {
-                failed.get_or_insert(Error::Invalid("encryption completion missing".into()));
+                failed.get_or_insert(Error::Invalid("page encoding completion missing".into()));
                 break;
             }
         }
@@ -192,13 +190,12 @@ pub(super) fn encode_batch(
     })
 }
 pub(super) fn encode_one(
-    crypto: &Crypto,
+    crypto: &PageCodec,
     index: u64,
     version: u64,
     bytes: &[u8; PAGE],
 ) -> Result<EncodedPage> {
-    let mut nonce = [0; 24];
-    OsRng.fill_bytes(&mut nonce);
+    let nonce = [0; 24];
     let (cipher, tag) = crypto.encode_page(index, version, nonce, bytes)?;
     Ok(EncodedPage {
         index,

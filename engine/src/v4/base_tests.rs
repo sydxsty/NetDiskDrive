@@ -42,10 +42,10 @@ fn prepare(v: &Volume) -> Value {
 }
 #[test]
 fn original_base_noop_then_only_changed_path_survives_snapshot_and_reopen() {
-    let f = lazy_tests::fixture(Some("password"));
+    let f = lazy_tests::fixture(None);
     let path = f._dir.path().join("original.odv4");
     let opt = options(&f, "original", true);
-    let v = Volume::restore_begin_options(&path, &f.root, Some("password"), opt.clone()).unwrap();
+    let v = Volume::restore_begin_options(&path, &f.root, None, opt.clone()).unwrap();
     assert_eq!(
         v.control(&json!({"cmd":"cloud.status"})).unwrap()["binding"],
         opt["publication"]["binding"]
@@ -103,7 +103,7 @@ fn original_base_noop_then_only_changed_path_survives_snapshot_and_reopen() {
     }
     v.snapshot_release(&snapshot).unwrap();
     drop(v);
-    let v = Volume::open(&path, Some("password")).unwrap();
+    let v = Volume::open(&path, None).unwrap();
     let mut out = [0; PAGE];
     v.read(0, &mut out).unwrap();
     assert_eq!(out, [87; PAGE]);

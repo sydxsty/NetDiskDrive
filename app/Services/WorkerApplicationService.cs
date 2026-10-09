@@ -227,7 +227,8 @@ public sealed partial class WorkerApplicationService : IWorkerDispatcher, IWorke
         {
             var name = Text(args, "name"); var path = Text(args, "containerPath");
             ulong capacity = args.GetProperty("capacityBytes").GetUInt64();
-            char letter = Text(args, "driveLetter", "Z")[0]; bool encrypted = args.GetProperty("encrypted").GetBoolean();
+            char letter = Text(args, "driveLetter", "Z")[0]; bool encrypted = args.TryGetProperty("encrypted", out var encryption) && encryption.ValueKind == JsonValueKind.True;
+            if (encrypted || Secret(args) is not null) throw new IOException("本地磁盘不再加密，请在启用云同步时设置云端密码。");
             uint objectSize = args.TryGetProperty("objectSizeBytes", out var size) ? size.GetUInt32() : CloudObjectGeometry.DefaultSize;
             CloudObjectGeometry.Validate(checked((int)objectSize));
             await controller.CreateAsync(new(name, path, capacity, letter, encrypted, OptionalBool(args, "readOnly") ?? false, objectSize), Secret(args)); return GetState();
@@ -552,7 +553,7 @@ public sealed partial class WorkerApplicationService : IWorkerDispatcher, IWorke
             || Text(commit, "rootObjectId") != Text(status, "root_object_id")
             || !Text(commit, "rootSha256").Equals(Text(status, "root_sha256"), StringComparison.OrdinalIgnoreCase)
             || !commit.TryGetProperty("encrypted", out var encrypted) || encrypted.ValueKind is not (JsonValueKind.True or JsonValueKind.False)
-            || encrypted.GetBoolean() != core.Encrypted || commit.TryGetProperty("rootSlot", out _) && !U64(commit, "rootSlot", 0))
+            || core.Encrypted || commit.TryGetProperty("rootSlot", out _) && !U64(commit, "rootSlot", 0))
             throw new IOException("原磁盘恢复任务的发布版本与已保存记录不一致，不能在继续任务时更换。");
     }
     private async Task EnsureOriginalIdentityAvailableAsync(Guid sourceId, RestoreSession? own, CancellationToken ct, string? sameClosedTarget = null)

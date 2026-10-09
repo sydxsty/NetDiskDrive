@@ -14,7 +14,7 @@ const output=path.resolve(process.argv[2]),web=path.resolve(__dirname,'..');fs.m
  await page.addInitScript(()=>{
   const listeners=[],reply=message=>queueMicrotask(()=>listeners.forEach(callback=>callback({data:message})));
   const state={connected:true,driverAvailable:true,account:{accountId:'isolated',displayName:'隔离测试'},settings:{},tasks:[],disks:[
-   {id:'replica',name:'资料副本',driveLetter:'Z',containerPath:'C:\\IsolatedFixture\\copy.odv4',capacityBytes:4*1024**4,objectSizeBytes:8388608,encrypted:true,mounted:true,unlocked:true,readOnly:true,sync:{enabled:false},lazy:{enabled:true,cached_objects:4,missing_objects:2,index_complete:false},replica:{available:true,sourceGeneration:12,hasLocalChanges:false,indexComplete:false,state:'idle',verifiedScope:'可使用；已加载对象已验证，未访问部分按需验证'}},
+   {id:'replica',name:'资料副本',driveLetter:'Z',containerPath:'C:\\IsolatedFixture\\copy.odv4',capacityBytes:4*1024**4,objectSizeBytes:8388608,cloudEncrypted:true,mounted:true,unlocked:true,readOnly:true,sync:{enabled:false},lazy:{enabled:true,cached_objects:4,missing_objects:2,index_complete:false},replica:{available:true,sourceGeneration:12,hasLocalChanges:false,indexComplete:false,state:'idle',verifiedScope:'可使用；已加载对象已验证，未访问部分按需验证'}},
    {id:'local',name:'本地盘',driveLetter:'Y',containerPath:'C:\\IsolatedFixture\\local.odv4',capacityBytes:1024**3,mounted:false,unlocked:true,sync:{enabled:false}}
   ]};
   window.__state=state;window.__calls=[];window.__logs=[];window.__nextCandidate={generation:13,expectedRevision:'9007199254740993',localChanges:false,unchanged:false};window.__delayPrepare=false;window.__delayApply=false;window.__applyError=null;
@@ -65,16 +65,15 @@ const output=path.resolve(process.argv[2]),web=path.resolve(__dirname,'..');fs.m
   checks.push('Only imported disks expose manual latest loading; mounted UI and handler reject it, and ordinary state/page refresh never checks remote generations.');
 
   await card().locator('[data-action="unmount"]').click();await button().waitFor({state:'visible'});
-  await button().click();assert.match(await page.locator('#dialogTitle').innerText(),/解锁/);
-  await page.locator('#password').fill('isolated-password');await page.locator('#dialogSubmit').click();
+  await button().click();
   await page.waitForFunction(()=>document.querySelector('#dialogTitle').textContent==='加载云端最新快照');
-  assert.deepEqual((await last('disks.unlock')).args,{id:'replica',password:'isolated-password'});
+  assert.deepEqual((await last('disks.unlock')).args,{id:'replica'});
   assert.equal(await count('disks.mount'),0);assert.equal(await count('replica.apply'),0);
   await page.waitForFunction(()=>document.activeElement?.textContent==='取消');
   assert.match(await page.locator('#dialogBody').innerText(),/目标版本 13/);
   const prepared=(await last('replica.prepare')).args;assert.deepEqual(prepared,{id:'replica'});
   await cancel();assert.equal((await last('replica.cancel')).args.token,'candidate-1');
-  checks.push('A locked encrypted replica unlocks without mounting; clean updates still await target-version confirmation with Cancel focused, and cancelling releases the reservation.');
+  checks.push('A closed local replica opens without a password or mounting; clean updates still await target-version confirmation with Cancel focused, and cancelling releases the reservation.');
 
   await button().click();await page.evaluate(()=>window.__failRefreshAfterApply=true);await page.locator('#dialogSubmit').click();await page.locator('#dialog').waitFor({state:'hidden'});
   assert.match(await page.locator('#toast').innerText(),/快照已加载，但界面状态尚未刷新/);assert.equal(await count('replica.apply'),1);
@@ -141,7 +140,7 @@ const output=path.resolve(process.argv[2]),web=path.resolve(__dirname,'..');fs.m
   await setFixture({replica:{message:'<script>fixture</script>',state:'preparing'}});
   assert.equal(await card().locator('.replica-status script').count(),0);assert.match(await card().locator('.replica-status').innerText(),/<script>fixture<\/script>/);
   await setFixture({disk:{unlocked:false,lazySource:{},lazy:{enabled:true,index_complete:false}},replica:{state:'idle',message:''}});
-  assert.match(await card().locator('.lazy-cache-status').innerText(),/解锁后查看缓存数量/);assert.doesNotMatch(await card().locator('.lazy-cache-status').innerText(),/已缓存 0/);
+  assert.match(await card().locator('.lazy-cache-status').innerText(),/打开后查看缓存数量/);assert.doesNotMatch(await card().locator('.lazy-cache-status').innerText(),/已缓存 0/);
   await setFixture({disk:{unlocked:true,lazy:{enabled:true,cached_objects:4,missing_objects:2,index_complete:false}}});
   await setFixture({replica:{state:'idle',message:''}});await visit('blocks');
   await page.locator('[data-physical-block="0"]').waitFor();assert.match(await page.locator('[data-physical-block="0"]').getAttribute('class'),/unresolved/);

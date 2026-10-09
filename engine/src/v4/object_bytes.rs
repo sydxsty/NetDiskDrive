@@ -1,7 +1,7 @@
 //! Canonical immutable object bytes. Unused local extent bytes are not part of
 //! an object: readers synthesize their zero padding without reading/writing it.
 //! Network input is never normalized before authentication.
-use super::codec::{self, hash, hex, Crypto};
+use super::codec::{self, hash, hex, PageCodec};
 use super::store::{Object, PORTABLE};
 use super::{Device, Error, Geometry, RemoteObject, Result, PAGE};
 use serde_json::Value;
@@ -35,7 +35,7 @@ pub(super) fn header_end(g: Geometry, header: &Value) -> Result<usize> {
     payload_end(g, kind, used)
 }
 
-pub(super) fn header(crypto: &Crypto, oid: u64, frame: &[u8; PAGE]) -> Result<Value> {
+pub(super) fn header(crypto: &PageCodec, oid: u64, frame: &[u8; PAGE]) -> Result<Value> {
     let g = crypto.geometry;
     if oid == 0 || oid >= PORTABLE / g.object_size {
         return Err(integrity("object ordinal"));
@@ -83,7 +83,7 @@ fn catalogue(g: Geometry, object: &Object) -> Result<(u64, usize)> {
     Ok((base, end))
 }
 
-fn match_catalogue(crypto: &Crypto, object: &Object, frame: &[u8; PAGE]) -> Result<Value> {
+fn match_catalogue(crypto: &PageCodec, object: &Object, frame: &[u8; PAGE]) -> Result<Value> {
     let header = header(crypto, object.oid, frame)?;
     if header["id"].as_str() != Some(object.id.to_string().as_str())
         || header["kind"].as_u64() != Some(object.kind as u64)
@@ -102,7 +102,7 @@ fn match_catalogue(crypto: &Crypto, object: &Object, frame: &[u8; PAGE]) -> Resu
 /// The returned count is synthesized bytes, not physical I/O.
 pub(super) fn read_range(
     device: &Device,
-    crypto: &Crypto,
+    crypto: &PageCodec,
     object: &Object,
     offset: u64,
     output: &mut [u8],
@@ -144,7 +144,7 @@ pub(super) fn read_range(
 
 /// All local whole-object consumers (restore, compaction, snapshot export) use
 /// this path, so ignored extent garbage cannot influence their object digest.
-pub(super) fn read_verified(device: &Device, crypto: &Crypto, object: &Object) -> Result<Vec<u8>> {
+pub(super) fn read_verified(device: &Device, crypto: &PageCodec, object: &Object) -> Result<Vec<u8>> {
     let mut raw = vec![0; crypto.geometry.object_size as usize];
     let (header, _) = read_range(device, crypto, object, 0, &mut raw)?;
     if hash(&raw) != object.sha

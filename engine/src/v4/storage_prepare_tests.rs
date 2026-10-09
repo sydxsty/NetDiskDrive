@@ -52,8 +52,8 @@ fn overlap(at: u64, len: usize, start: u64, end: u64) -> u64 {
 }
 
 #[test]
-fn dependencies_and_generated_ciphertext_survive_preparation_batches() {
-    let (_dir, _config, mut store) = fixture(Some("prepare-cache-test"));
+fn dependencies_and_encoded_pages_survive_preparation_batches() {
+    let (_dir, _config, mut store) = fixture(None);
     let page = sealed_page(&mut store);
     store.configure_prepare_cache(64).unwrap();
     let mut oid = 0;
@@ -110,7 +110,7 @@ fn dependencies_and_generated_ciphertext_survive_preparation_batches() {
 
 #[test]
 fn reopened_metadata_tail_reads_and_authenticates_instead_of_trusting_cache() {
-    let (dir, config, mut store) = fixture(Some("reopen-cache-test"));
+    let (dir, config, mut store) = fixture(None);
     let page = sealed_page(&mut store);
     store.configure_prepare_cache(64).unwrap();
     let (oid, _) = append_metadata(&mut store, 0, &page, 0);
@@ -122,7 +122,7 @@ fn reopened_metadata_tail_reads_and_authenticates_instead_of_trusting_cache() {
     let mut store = Store::open(
         Device::open(&path, false).unwrap(),
         config.clone(),
-        config.unlock(Some("reopen-cache-test")).unwrap(),
+        config.unlock(None).unwrap(),
     )
     .unwrap();
     store.configure_prepare_cache(16).unwrap();
@@ -134,7 +134,7 @@ fn reopened_metadata_tail_reads_and_authenticates_instead_of_trusting_cache() {
     let mut damaged = Store::open(
         Device::open(&broken, false).unwrap(),
         config.clone(),
-        config.unlock(Some("reopen-cache-test")).unwrap(),
+        config.unlock(None).unwrap(),
     )
     .unwrap();
     damaged.configure_prepare_cache(16).unwrap();
@@ -153,7 +153,7 @@ fn reopened_metadata_tail_reads_and_authenticates_instead_of_trusting_cache() {
 }
 
 #[test]
-fn failed_flush_discards_staged_dependencies_and_ciphertext() {
+fn failed_flush_discards_staged_dependencies_and_encoded_pages() {
     let (dir, config, mut store) = fixture(None);
     let page = sealed_page(&mut store);
     store.configure_prepare_cache(16).unwrap();

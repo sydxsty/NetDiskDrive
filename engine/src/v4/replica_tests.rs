@@ -53,8 +53,8 @@ fn apply(disk: &Volume, discard: bool) -> Result<Value> {
 
 #[test]
 fn quick_import_reads_only_top_index_and_persists_read_only_data_hydration() {
-    let f = lazy_tests::fixture(Some("password"));
-    let disk = begin(&f, "quick.odv4", Some("password"));
+    let f = lazy_tests::fixture(None);
+    let disk = begin(&f, "quick.odv4", None);
     let s = disk.control(&json!({"cmd":"restore.status"})).unwrap();
     assert_eq!(s["completed_nodes"], 1);
     assert_eq!(s["completed_pages"], 0);
@@ -78,7 +78,7 @@ fn quick_import_reads_only_top_index_and_persists_read_only_data_hydration() {
         false
     );
     drop(disk);
-    let disk = Volume::open(f._dir.path().join("quick.odv4"), Some("password")).unwrap();
+    let disk = Volume::open(f._dir.path().join("quick.odv4"), None).unwrap();
     disk.read(0, &mut bytes).unwrap();
     assert_eq!(bytes, [11; PAGE]);
 }
@@ -207,9 +207,9 @@ fn identity_is_local_presentation_not_a_dirty_page_and_empty_plan_is_durable() {
 
 #[test]
 fn binary_gpt_identity_is_atomic_clean_and_durable_beyond_json_request_limit() {
-    let f = lazy_tests::fixture(Some("password"));
+    let f = lazy_tests::fixture(None);
     let path = f._dir.path().join("binary-gpt.odv4");
-    let disk = begin(&f, "binary-gpt.odv4", Some("password"));
+    let disk = begin(&f, "binary-gpt.odv4", None);
     let capacity = disk.capacity();
     let primary = vec![255; 17408];
     let backup = vec![254; 16896];
@@ -232,7 +232,7 @@ fn binary_gpt_identity_is_atomic_clean_and_durable_beyond_json_request_limit() {
     assert_eq!(identity[0].bytes, backup);
     assert_eq!(identity[1].bytes, primary);
     drop(disk);
-    let reopened = Volume::open(path, Some("password")).unwrap();
+    let reopened = Volume::open(path, None).unwrap();
     let identity = reopened.shared.identity.lock().unwrap();
     assert_eq!(identity.len(), 2);
     assert_eq!(identity[0].bytes, backup);
@@ -329,8 +329,8 @@ fn publish(v: &Volume, objects: &mut HashMap<String, Vec<u8>>) -> Value {
 }
 #[test]
 fn newer_source_and_local_writes_use_disjoint_ordinals_and_keep_manual_snapshot() {
-    let f = lazy_tests::fixture(Some("password"));
-    let disk = begin(&f, "new-generation.odv4", Some("password"));
+    let f = lazy_tests::fixture(None);
+    let disk = begin(&f, "new-generation.odv4", None);
     let mut objects = (*f.objects).clone();
     publish(&f.source, &mut objects);
     disk.set_object_provider(Some(lazy_tests::provider(
@@ -385,7 +385,7 @@ fn newer_source_and_local_writes_use_disjoint_ordinals_and_keep_manual_snapshot(
         false
     );
     drop(disk);
-    let disk = Volume::open(f._dir.path().join("new-generation.odv4"), Some("password")).unwrap();
+    let disk = Volume::open(f._dir.path().join("new-generation.odv4"), None).unwrap();
     disk.read(0, &mut bytes).unwrap();
     assert_eq!(bytes, [99; PAGE]);
     let index = disk

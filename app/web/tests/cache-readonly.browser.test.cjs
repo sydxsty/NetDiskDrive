@@ -13,7 +13,7 @@ const output=path.resolve(process.argv[2]),web=path.resolve(__dirname,'..');fs.m
  const page=await context.newPage();page.on('pageerror',e=>errors.push(e.message));
  await page.addInitScript(()=>{
   const listeners=[],reply=m=>queueMicrotask(()=>listeners.forEach(f=>f({data:m})));
-  const state={connected:true,driverAvailable:true,account:{accountId:'fixture',displayName:'隔离测试'},settings:{},tasks:[],disks:[{id:'cache-disk',name:'视频库',driveLetter:'Z',containerPath:'C:\\IsolatedFixture\\disk.odv4',capacityBytes:4*1024**4,encrypted:true,unlocked:false,mounted:false,readOnly:false,localCache:{limitBytes:0,policy:'lru'},sync:{enabled:false},cache:{source_ready:false,allocated_bytes:2*1024**3,missing_objects:0}}]};
+  const state={connected:true,driverAvailable:true,account:{accountId:'fixture',displayName:'隔离测试'},settings:{},tasks:[],disks:[{id:'cache-disk',name:'视频库',driveLetter:'Z',containerPath:'C:\\IsolatedFixture\\disk.odv4',capacityBytes:4*1024**4,cloudEncrypted:true,unlocked:false,mounted:false,readOnly:false,localCache:{limitBytes:0,policy:'lru'},sync:{enabled:false},cache:{source_ready:false,allocated_bytes:2*1024**3,missing_objects:0}}]};
   window.__state=state;window.__calls=[];
   window.chrome={webview:{addEventListener:(name,f)=>{if(name==='message')listeners.push(f);},postMessage:({requestId,method,args})=>{
    window.__calls.push({method,args:structuredClone(args)});const disk=state.disks[0];let data={ok:true};
@@ -39,9 +39,9 @@ const output=path.resolve(process.argv[2]),web=path.resolve(__dirname,'..');fs.m
  try{
   await page.goto(origin+'/index.html');await page.locator('[data-action="mount"]').waitFor();
   await page.locator('[data-action="mount"]').click();assert.equal(await page.locator('#mountReadOnly').inputValue(),'readwrite');
-  await page.locator('#mountReadOnly').selectOption('readonly');await page.locator('#password').fill('isolated-password');
+  await page.locator('#mountReadOnly').selectOption('readonly');assert.equal(await page.locator('#password').count(),0);
   await page.locator('#dialogSubmit').click();await page.locator('#dialog').waitFor({state:'hidden'});
-  assert.deepEqual((await last('disks.mount')).args,{id:'cache-disk',readOnly:true,password:'isolated-password'});
+  assert.deepEqual((await last('disks.mount')).args,{id:'cache-disk',readOnly:true});
   assert.match(await page.locator('[data-disk="cache-disk"] .muted').innerText(),/只读/);
   checks.push('Every mount exposes read-only/read-write, sends the chosen mode with unlock, and displays the active mode.');
 
@@ -67,16 +67,16 @@ const output=path.resolve(process.argv[2]),web=path.resolve(__dirname,'..');fs.m
   checks.push('The selected mode persists into the next mount and can be changed after safely unmounting.');
 
   await page.evaluate(async()=>{window.__state.disks[0].unlocked=true;await refresh();});await visit('cloud');await page.locator('[data-action="syncEnable"]').click();
-  await page.locator('#cacheLimited').check();await page.locator('#cacheLimit').fill('256');await page.locator('#cachePolicy').selectOption('sequential');
+  await page.locator('#cloudEncrypted').uncheck();await page.locator('#cacheLimited').check();await page.locator('#cacheLimit').fill('256');await page.locator('#cachePolicy').selectOption('sequential');
   await page.locator('#dialogSubmit').click();await page.locator('#dialog').waitFor({state:'hidden'});
-  assert.deepEqual((await last('sync.enable')).args,{id:'cache-disk',localCache:{limitBytes:256*1024**3,policy:'sequential'}});
+  assert.deepEqual((await last('sync.enable')).args,{id:'cache-disk',localCache:{limitBytes:256*1024**3,policy:'sequential'},encrypted:false,password:null});
   checks.push('Enabling cloud sync includes a per-disk capacity budget and the selected workload policy.');
 
   await page.evaluate(async()=>{Object.assign(window.__state.disks[0],{localCache:{limitBytes:1024**3,policy:'lru'},cache:{source_ready:true,allocated_bytes:2*1024**3,over_limit_bytes:1024**3,missing_objects:11},lazy:{enabled:true,cached_objects:4,missing_objects:11}});await refresh();});await visit('disks');
   assert.match(await page.locator('.lazy-cache-status').innerText(),/暂超上限/);assert.match(await page.locator('.lazy-cache-status').innerText(),/未同步内容、索引/);assert.match(await page.locator('.lazy-cache-status').innerText(),/待按需下载 11 块/);
   checks.push('Physical cache usage, soft-limit excess and remaining demand-loaded blocks are shown separately from virtual capacity.');
 
-  await page.evaluate(()=>createDisk());await page.locator('#capacity').fill('4096');await page.locator('#encrypted').uncheck();
+  await page.evaluate(()=>createDisk());await page.locator('#capacity').fill('4096');assert.equal(await page.locator('#encrypted,#password').count(),0);
   await page.locator('#createReadOnly').selectOption('readonly');await page.evaluate(()=>document.querySelector('#path').value='C:\\IsolatedFixture\\large.odv4');
   await page.locator('#dialogSubmit').click();await page.locator('#dialog').waitFor({state:'hidden'});
   const created=(await last('disks.create')).args;assert.equal(created.capacityBytes,4*1024**4);assert.equal(created.readOnly,true);

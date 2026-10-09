@@ -4,7 +4,7 @@ using System.Text.Json;
 using OverlayDisk.Cloud.Contracts;
 using OverlayDisk.Cloud.Sync;
 
-internal static class Program
+internal static partial class Program
 {
     private static readonly JsonSerializerOptions Json = new(JsonSerializerDefaults.Web);
     private static void Assert(bool condition, string reason) { if (!condition) throw new Exception(reason); }
@@ -50,17 +50,18 @@ internal static class Program
             ("incremental sync never enumerates published closure", NoClosureEnumeration),
             ("sync never deletes; explicit cleanup uses retained delta", ManualCollectionOnly)
         };
-        tests = tests.Concat(CloudSyncCacheJournalTests.All).Concat(OriginalRestoreTests.All).Concat(CacheProtectionTests.All).Concat(PreparationProgressTests.All).Concat(ObjectGeometryTests.All).Concat(ReplicaReaderTests.All).ToArray();
+        tests = tests.Concat(CloudSyncCacheJournalTests.All).Concat(OriginalRestoreTests.All).Concat(CacheProtectionTests.All).Concat(PreparationProgressTests.All).Concat(ObjectGeometryTests.All).Concat(ReplicaReaderTests.All).Concat(CloudEncryptionTests).ToArray();
         if (args.Length != 0)
         {
-            if (args.Length != 2 || args[0] != "--filter" || args[1] is not ("upload-ack" or "original-restore" or "cache-policy" or "preparing" or "object-size" or "object-transport" or "replica"))
-            { Console.Error.WriteLine("Supported selection: --filter upload-ack|original-restore|cache-policy|preparing|object-size|object-transport|replica"); return 2; }
+            if (args.Length != 2 || args[0] != "--filter" || args[1] is not ("upload-ack" or "original-restore" or "cache-policy" or "preparing" or "object-size" or "object-transport" or "replica" or "cloud-encryption"))
+            { Console.Error.WriteLine("Supported selection: --filter upload-ack|original-restore|cache-policy|preparing|object-size|object-transport|replica|cloud-encryption"); return 2; }
             var selected = new HashSet<string>(StringComparer.Ordinal)
             {
                 nameof(PublishOrder), nameof(FailureAndResume), nameof(RootUploadFailure), nameof(CommitUploadFailure),
                 nameof(UploadAcknowledgmentOnly), nameof(NativeCommitCrash), nameof(PublicationAcknowledgmentLost), nameof(PersistentNoChanges)
             };
-            if (args[1] == "original-restore") tests = OriginalRestoreTests.All;
+            if (args[1] == "cloud-encryption") tests = CloudEncryptionTests;
+            else if (args[1] == "original-restore") tests = OriginalRestoreTests.All;
             else if (args[1] == "replica") tests = ReplicaReaderTests.All;
             else if (args[1] == "preparing") tests = PreparationProgressTests.All;
             else if (args[1] == "object-transport") tests = ObjectGeometryTests.All.Concat(PreparationProgressTests.All).Concat(tests.Where(test => new[] { nameof(PreparedReceiptBeforeRead), nameof(KnownImmutableRead), nameof(MixedFormatDiscovery), nameof(PublishOrder), nameof(FailureAndResume), nameof(RootUploadFailure), nameof(CommitUploadFailure), nameof(UploadAcknowledgmentOnly), nameof(NativeCommitCrash), nameof(PublicationAcknowledgmentLost), nameof(PersistentNoChanges), nameof(NoChanges), nameof(LocalHash), nameof(ManualCollectionOnly) }.Contains(test.Run.Method.Name))).ToArray();

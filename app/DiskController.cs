@@ -503,7 +503,7 @@ public sealed class DiskController : IDisposable
         if (File.Exists(path) || System.IO.Directory.Exists(path)) throw new IOException("数据文件已存在。请另选名称；已有磁盘请使用导入。");
         if (path.StartsWith(@"\\", StringComparison.Ordinal)) throw new ArgumentException("本地版的容器文件必须位于本机磁盘。");
         if (new DriveInfo(Path.GetPathRoot(path)!).DriveType == DriveType.Network) throw new ArgumentException("本地版不支持将容器保存在网络映射盘。");
-        if (request.Encrypted && string.IsNullOrEmpty(password)) throw new ArgumentException("加密磁盘需要设置密码。");
+        if (request.Encrypted || !string.IsNullOrEmpty(password)) throw new ArgumentException("本地磁盘不再加密，请在启用云同步时设置云端密码。");
     }
     private static void EnsureDriveAvailable(char letter)
     {

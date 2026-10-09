@@ -82,7 +82,7 @@ internal static partial class Program
         TransportReject(() => ObjectTransport.Decode(reserved, descriptor), "reserved bits with a recomputed checksum");
         TransportReject(() => ObjectTransport.Decode(wire, descriptor with { Sha256 = new string('0', 64) }), "wrong canonical digest");
         TransportReject(() => ObjectTransport.Decode(wire, descriptor with { Codec = "raw" }), "unsupported codec downgrade");
-        TransportReject(() => ObjectTransport.Decode(wire, descriptor with { Codec = "zstd-v2" }), "unknown codec version");
+        TransportReject(() => ObjectTransport.Decode(wire, descriptor with { Codec = "zstd-v1" }), "unknown codec version");
     }
 
     private static Task TransportFrameBounds()
@@ -193,8 +193,8 @@ internal static partial class Program
     private static int TransportDictionaryBytes(byte frameDescriptor) => (frameDescriptor & 3) switch { 0 => 0, 1 => 1, 2 => 2, _ => 4 };
     private static byte[] TransportEnvelope(byte[] compressed, CanonicalObjectDescriptor descriptor)
     {
-        byte[] wire = new byte[128 + compressed.Length]; "ODZSTD01"u8.CopyTo(wire);
-        BinaryPrimitives.WriteUInt32LittleEndian(wire.AsSpan(8), 1);
+        byte[] wire = new byte[128 + compressed.Length]; "ODZSTD02"u8.CopyTo(wire);
+        BinaryPrimitives.WriteUInt32LittleEndian(wire.AsSpan(8), 2);
         BinaryPrimitives.WriteInt32LittleEndian(wire.AsSpan(12), descriptor.Length);
         BinaryPrimitives.WriteInt32LittleEndian(wire.AsSpan(16), compressed.Length);
         Convert.FromHexString(descriptor.Sha256).CopyTo(wire, 32); compressed.CopyTo(wire, 128);

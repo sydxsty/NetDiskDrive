@@ -1,20 +1,18 @@
-//! Correctness and bounded-I/O regressions for encrypted batch writes and sealing.
+//! Correctness and bounded-I/O regressions for plaintext batch writes and sealing.
 //! No elapsed-time or throughput assertions; files are isolated temporary fixtures.
 use super::*;
 use crate::async_io::{Operation, Queue};
 use crate::async_v4::CoreBackend;
 use serde_json::{json, Value};
-use std::collections::BTreeSet;
 use std::io::{Read, Seek, SeekFrom, Write};
 use tempfile::TempDir;
 
-const PASSWORD: &str = "write-seal-fixture";
 const BASE: u64 = 16 * 1024 * 1024;
 fn create() -> (TempDir, Volume) {
     let dir = TempDir::new().unwrap();
     let path = dir.path().join("test.odv4");
-    Volume::create(&path, 64 * 1024 * 1024, Some(PASSWORD)).unwrap();
-    let volume = Volume::open(path, Some(PASSWORD)).unwrap();
+    Volume::create(&path, 64 * 1024 * 1024, None).unwrap();
+    let volume = Volume::open(path, None).unwrap();
     (dir, volume)
 }
 fn bytes(pages: usize, seed: usize) -> Vec<u8> {
@@ -72,7 +70,7 @@ fn overlap(at: u64, length: usize, start: u64, end: u64) -> u64 {
 }
 
 #[test]
-fn encrypted_cross_object_batch_seals_fresh_bytes_once_and_coalesces_io() {
+fn plaintext_cross_object_batch_seals_fresh_bytes_once_and_coalesces_io() {
     let (dir, disk) = create();
     let expected = bytes(1200, 29);
     disk.shared.device.events.lock().unwrap().clear();
@@ -90,7 +88,7 @@ fn encrypted_cross_object_batch_seals_fresh_bytes_once_and_coalesces_io() {
             .map(|(_, at, len)| overlap(*at, *len, payload, end))
             .sum::<u64>(),
         0,
-        "sealing a full object created in this batch reread its freshly generated ciphertext"
+        "sealing a full object created in this batch reread its freshly generated plaintext"
     );
     assert_eq!(
         events
@@ -111,16 +109,12 @@ fn encrypted_cross_object_batch_seals_fresh_bytes_once_and_coalesces_io() {
     );
     assert!(counter(&disk, "seal_fresh_pages") >= SLOTS);
     assert_eq!(counter(&disk, "seal_disk_pages"), 0);
-    assert!(counter(&disk, "crypto_pages") >= 1200);
-    let workers = counter(&disk, "crypto_worker_limit");
+    assert!(counter(&disk, "page_encoded_pages") >= 1200);
+    let workers = counter(&disk, "page_worker_limit");
     assert!((1..=4).contains(&workers));
     if workers > 1 {
-        assert!(counter(&disk, "crypto_parallel_pages") >= 1200);
+        assert!(counter(&disk, "page_parallel_pages") >= 1200);
     }
-    assert!(
-        (1..1200).contains(&counter(&disk, "crypto_nonce_batches")),
-        "randomness was requested separately for every page"
-    );
     assert!(
         counter(&disk, "metadata_write_pages") > counter(&disk, "metadata_write_batches"),
         "metadata writes were not coalesced"
@@ -128,12 +122,8 @@ fn encrypted_cross_object_batch_seals_fresh_bytes_once_and_coalesces_io() {
     {
         let mut store = disk.shared.store.lock().unwrap();
         let root = store.root.index;
-        let mut nonces = BTreeSet::new();
         for index in BASE / PAGE as u64..BASE / PAGE as u64 + 1200 {
-            assert!(
-                nonces.insert(store.page(root, index).unwrap().unwrap().reference.nonce),
-                "batch reused an encryption nonce"
-            );
+            assert_eq!(store.page(root, index).unwrap().unwrap().reference.nonce, [0; 24], "plaintext pages must not create encryption randomness");
         }
     }
     disk.shared.device.events.lock().unwrap().clear();
@@ -157,7 +147,7 @@ fn encrypted_cross_object_batch_seals_fresh_bytes_once_and_coalesces_io() {
     export_and_check(&disk, &job);
     assert!(counter(&disk, "cloud_index_lookup_batches") > 0);
     drop(disk);
-    let disk = Volume::open(dir.path().join("test.odv4"), Some(PASSWORD)).unwrap();
+    let disk = Volume::open(dir.path().join("test.odv4"), None).unwrap();
     disk.read(BASE, &mut actual).unwrap();
     assert_eq!(actual, expected);
 }
@@ -175,7 +165,7 @@ fn restarted_partial_tail_is_authenticated_before_sealing_and_corruption_fails()
     let corrupt = dir.path().join("damaged.odv4");
     std::fs::copy(&path, &corrupt).unwrap();
     {
-        let disk = Volume::open(&path, Some(PASSWORD)).unwrap();
+        let disk = Volume::open(&path, None).unwrap();
         let job = prepare(&disk);
         export_and_check(&disk, &job);
         assert!(counter(&disk, "seal_disk_pages") >= 73);
@@ -201,13 +191,13 @@ fn restarted_partial_tail_is_authenticated_before_sealing_and_corruption_fails()
         file.write_all(&byte).unwrap();
         file.sync_all().unwrap();
     }
-    let disk = Volume::open(&corrupt, Some(PASSWORD)).unwrap();
+    let disk = Volume::open(&corrupt, None).unwrap();
     let first = disk.control(&json!({"cmd":"cloud.prepare"})).unwrap();
     let result =
         disk.control(&json!({"cmd":"cloud.prepare","job_id":first["job"]["id"],"max_objects":4}));
     assert!(
         matches!(result, Err(Error::Integrity(_))),
-        "damaged persisted ciphertext was blessed as a new sealed object: {result:?}"
+        "damaged persisted plaintext was blessed as a new sealed object: {result:?}"
     );
     assert!(
         disk.write(BASE + PAGE as u64, &[7; PAGE]).is_err(),
@@ -250,11 +240,7 @@ fn tiny_sealed_objects_use_logical_zero_tail_without_padding_writes() {
         raw[18 * PAGE..].iter().all(|byte| *byte == 0),
         "skipped padding did not actually export zero bytes"
     );
-    assert_ne!(
-        &raw[17 * PAGE..18 * PAGE],
-        expected.as_slice(),
-        "encrypted payload was stored as plaintext"
-    );
+    assert_eq!(&raw[17 * PAGE..18 * PAGE], expected.as_slice(), "native exported payload must stay plaintext for cloud compression");
 }
 
 #[test]
@@ -268,7 +254,7 @@ fn reopened_uncommitted_tail_bytes_are_zeroed_before_export_not_trusted_as_spars
     assert!(!object.sealed);
     drop(disk);
     let path = dir.path().join("test.odv4");
-    // A killed append can leave ciphertext after the committed `used` boundary
+    // A killed append can leave plaintext after the committed `used` boundary
     // while both committed roots still describe an earlier partial object.
     {
         let mut file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
@@ -279,7 +265,7 @@ fn reopened_uncommitted_tail_bytes_are_zeroed_before_export_not_trusted_as_spars
         file.write_all(&bytes(3, 71)).unwrap();
         file.sync_all().unwrap();
     }
-    let disk = Volume::open(&path, Some(PASSWORD)).unwrap();
+    let disk = Volume::open(&path, None).unwrap();
     let job = prepare(&disk);
     let objects = export_and_check(&disk, &job);
     let data = objects
@@ -307,20 +293,20 @@ fn reopened_uncommitted_tail_bytes_are_zeroed_before_export_not_trusted_as_spars
 }
 
 #[test]
-fn identical_encrypted_batch_skips_crypto_writes_and_dirty_generation() {
+fn identical_plaintext_batch_skips_encoding_writes_and_dirty_generation() {
     let (_dir, disk) = create();
     let expected = bytes(256, 79);
     disk.write(BASE, &expected).unwrap();
     disk.flush().unwrap();
     let generation = disk.info().unwrap().data_generation;
-    let encrypted = counter(&disk, "crypto_pages");
+    let encoded = counter(&disk, "page_encoded_pages");
     let writes = disk.shared.device.diagnostics()["physical_write_calls"];
     disk.shared.device.events.lock().unwrap().clear();
     disk.write(BASE, &expected).unwrap();
     disk.flush().unwrap();
     assert_eq!(disk.info().unwrap().data_generation, generation);
     assert_eq!(disk.info().unwrap().dirty_bytes, 0);
-    assert_eq!(counter(&disk, "crypto_pages"), encrypted);
+    assert_eq!(counter(&disk, "page_encoded_pages"), encoded);
     assert_eq!(
         disk.shared.device.diagnostics()["physical_write_calls"],
         writes
@@ -344,7 +330,7 @@ fn abandoned_extent_beyond_committed_allocator_end_is_not_assumed_zero() {
         file.write_all(&bytes(3, 83)).unwrap();
         file.sync_all().unwrap();
     }
-    let disk = Volume::open(&path, Some(PASSWORD)).unwrap();
+    let disk = Volume::open(&path, None).unwrap();
     let expected = bytes(1, 89);
     disk.write(BASE, &expected).unwrap();
     disk.flush().unwrap();
@@ -389,7 +375,7 @@ fn batched_write_then_single_page_fua_preserves_order_snapshot_and_restart() {
             .next_completion(Duration::from_secs(30))
             .unwrap()
             .expect("FUA write did not complete");
-        assert!(completion.error.is_none(), "ordered encrypted write failed");
+        assert!(completion.error.is_none(), "ordered plaintext write failed");
         queue.release_completion(completion.token).unwrap();
     }
     expected[..PAGE].copy_from_slice(&replacement);
@@ -418,7 +404,7 @@ fn batched_write_then_single_page_fua_preserves_order_snapshot_and_restart() {
     queue.release_completion(3).unwrap();
     drop(queue);
     drop(disk);
-    let disk = Volume::open(dir.path().join("test.odv4"), Some(PASSWORD)).unwrap();
+    let disk = Volume::open(dir.path().join("test.odv4"), None).unwrap();
     expected[..PAGE].fill(29);
     disk.read(BASE, &mut actual).unwrap();
     assert_eq!(actual, expected);
