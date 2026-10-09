@@ -66,7 +66,20 @@ COW page maps, dirty keys, object/reference directories, snapshots, jobs, receip
 statistics and free-space deltas live in the same container. Sorted multi-key
 lookups share subtree traversal; private metadata frames and contiguous payload
 writes are coalesced into I/O of at most 1 MiB. New frames remain readable from
-the owning transaction's buffers before writeout.
+the owning transaction's buffers before writeout. Foreground writes use one
+shared-path lookup for the request's uncached page mappings; foreground reads
+batch page and object mappings in windows of at most 256 pages. Partial-page
+updates reuse the mapping already read, while full overwrites never fetch old
+payloads. The `frontend_index_node_visits` diagnostic includes cache hits and
+therefore exposes repeated traversal/decoding independently of physical I/O.
+
+Concurrent disjoint writes may publish their prepared pages when the durable
+page-map root and the exact visible values in their own range are unchanged.
+Overlapping updates or a changed durable page root still retry; publication
+rechecks the dirty-cache bound. `write_revision_retries` counts those conflicts.
+Reference retirement retains the authenticated old node references and uses the
+same bounded metadata cache as the COW update, instead of rereading old paths
+merely to decrement their child references.
 
 Data and metadata are synced before publishing either root copy. Both root slots
 are written and synced before retired ranges can be reused. Retirement sequence

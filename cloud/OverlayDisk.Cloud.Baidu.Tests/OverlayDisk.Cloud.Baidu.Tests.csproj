@@ -6,5 +6,5 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
   </PropertyGroup>
-  <ItemGroup><ProjectReference Include="../OverlayDisk.Cloud.Baidu/OverlayDisk.Cloud.Baidu.csproj" /></ItemGroup>
+  <ItemGroup><ProjectReference Include="../OverlayDisk.Cloud.Baidu/OverlayDisk.Cloud.Baidu.csproj" /><ProjectReference Include="../OverlayDisk.Cloud.Sync/OverlayDisk.Cloud.Sync.csproj" /></ItemGroup>
 </Project>

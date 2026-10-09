@@ -107,6 +107,9 @@ internal static partial class Program
             var f = new Fixture(); var missing = new MissingRootStore(f.Store, baidu); var repository = new CloudRepository(missing);
             Assert((await repository.ListDisksForReplicaAsync()).Count == 0 && missing.Created == 1, "Fresh empty cloud root was not created");
             Assert((await repository.ListDisksForReplicaAsync()).Count == 0 && missing.Created == 1, "Second listing recreated the root");
+            f.Store.SeedDirectory(f.Binding.RemoteRoot); missing.MissingCommits = true;
+            Assert((await repository.ListDisksForReplicaAsync()).Count == 0 && missing.Created == 1,
+                "A partial cloud disk without commits aborted generic discovery or created extra folders");
         }
         var legacy = new Fixture(); await legacy.Repository.ListDisksAsync(default); await legacy.Repository.ListDisksAsync(default);
         Assert(legacy.Events.Count(e => e == "mkdir:/OverlayDisk") == 1, "Normal listing did not create a missing root exactly once");
@@ -115,12 +118,12 @@ internal static partial class Program
     }
     private sealed class MissingRootStore(MemoryStore inner, bool baidu) : ICloudObjectStore
     {
-        public int Created; public string ProviderId => inner.ProviderId;
+        public int Created; public bool MissingCommits; public string ProviderId => inner.ProviderId;
         public Task<CloudAccountInfo> ValidateAsync(CancellationToken ct = default) => inner.ValidateAsync(ct);
         public Task<CloudObjectInfo?> HeadAsync(string path, CancellationToken ct = default) => inner.HeadAsync(path, ct);
         public async IAsyncEnumerable<CloudObjectInfo> ListAsync(string path, [EnumeratorCancellation] CancellationToken ct = default)
         {
-            if (path == CloudRepository.BasePath && Created == 0)
+            if (path == CloudRepository.BasePath && Created == 0 || MissingCommits && path.EndsWith("/commits", StringComparison.Ordinal))
             { if (baidu) throw new CloudProviderException("Baidu:-9", "Missing directory"); throw new CloudObjectNotFoundException(path); }
             await foreach (var item in inner.ListAsync(path, ct)) yield return item;
         }

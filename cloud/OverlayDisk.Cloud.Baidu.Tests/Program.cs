@@ -89,7 +89,7 @@ internal static partial class Program
             ,("object-size: invalid part indices checksums and declared sizes reject", ObjectSizeMultipartRejects)
             ,("object-size: 8/16 MiB known downloads preserve exact length without metadata probes", ObjectSizeKnownReads)
         };
-        tests = tests.Concat(ObjectTransportTests).Concat(EncodedObjectTests).Concat(ReplicaReaderBackendTests).Concat(JournalGroupTests).ToArray();
+        tests = tests.Concat(ObjectTransportTests).Concat(EncodedObjectTests).Concat(ReplicaReaderBackendTests).Concat(MissingDirectoryTests).Concat(JournalGroupTests).ToArray();
         if (args.Length != 0)
         {
             if (args.Length != 2 || args[0] != "--filter") { Console.Error.WriteLine("Use --filter <test-name> to select a focused test."); return 2; }
@@ -680,6 +680,11 @@ internal static partial class Program
         public Dictionary<string, byte[]> Files { get; } = new(StringComparer.Ordinal);
         private readonly HashSet<string> directories = ["/"];
         public void SeedDirectory(string path) => directories.Add(path);
+        public void RemoveDirectory(string path)
+        {
+            directories.RemoveWhere(value => value == path || value.StartsWith(path + "/", StringComparison.Ordinal));
+            foreach (var file in Files.Keys.Where(value => value.StartsWith(path + "/", StringComparison.Ordinal)).ToArray()) Files.Remove(file);
+        }
         private readonly Dictionary<string, SortedDictionary<int, byte[]>> parts = [];
         public List<Call> Calls { get; } = [];
         public int UploadedParts, PartAttempts, Downloads, TaskPolls;

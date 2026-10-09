@@ -411,7 +411,7 @@ impl Store {
             pending_externals: BTreeMap::new(),
             pending_data: BTreeMap::new(),
             pending_metadata: BTreeMap::new(),
-            fresh_nodes: BTreeMap::new(),
+            known_nodes: BTreeMap::new(),
             pending_blocks: Vec::new(),
             portable: None,
             cloud_deltas: BTreeMap::new(),
@@ -704,7 +704,7 @@ pub(super) struct Txn<'a> {
     pending_externals: BTreeMap<u64, Option<Vec<u8>>>,
     pending_data: BTreeMap<u64, [u8; PAGE]>,
     pending_metadata: BTreeMap<u64, [u8; PAGE]>,
-    fresh_nodes: BTreeMap<u64, MetaRef>,
+    known_nodes: BTreeMap<u64, MetaRef>,
     pending_blocks: Vec<(u64, u64)>,
     pub portable: Option<u64>,
     pub cloud_deltas: BTreeMap<u64, i64>,
@@ -845,6 +845,10 @@ impl Txn<'_> {
     fn refdelta(&mut self, r: MetaRef, n: i64, tag: u8) {
         if self.root.deferred_index && r.offset & PORTABLE != 0 { return; }
         if !r.empty() {
+            // Keep the authenticated address of old nodes as well as fresh
+            // nodes. Retirement can reuse their cached frames from the COW
+            // update instead of rereading every old path from physical disk.
+            self.known_nodes.insert(r.offset, r);
             let e = self.refs.entry(r.offset).or_insert((0, tag));
             e.0 += n;
         }
@@ -1323,7 +1327,7 @@ impl Txn<'_> {
                     .checked_add_signed(delta)
                     .ok_or_else(|| Error::Integrity("node reference underflow".into()))?;
                 let value = if after == 0 {
-                    let payload = if let Some(reference) = self.fresh_nodes.get(&offset).copied() {
+                    let payload = if let Some(reference) = self.known_nodes.get(&offset).copied() {
                         self.read_node(reference)?
                     } else if remote {
                         let object = self.object((offset & !PORTABLE) / g.object_size)?;
@@ -2234,7 +2238,7 @@ impl Txn<'_> {
     }
     fn cache_fresh_node(&mut self, r: MetaRef, payload: &[u8]) {
         self.store.prepare_cache.put_node(r, self.root.seq + 1, payload.to_vec());
-        self.fresh_nodes.insert(r.offset, r);
+        self.known_nodes.insert(r.offset, r);
     }
     fn read_frame(&self, offset: u64, out: &mut [u8; PAGE]) -> Result<()> {
         if let Some(bytes) = self

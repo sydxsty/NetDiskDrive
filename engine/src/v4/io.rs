@@ -86,9 +86,6 @@ impl Aligned {
             size: size.max(4096),
         })
     }
-    fn bytes(&self) -> &[u8] {
-        unsafe { std::slice::from_raw_parts(self.ptr.as_ptr(), self.size) }
-    }
     fn bytes_mut(&mut self) -> &mut [u8] {
         unsafe { std::slice::from_raw_parts_mut(self.ptr.as_ptr(), self.size) }
     }
@@ -102,6 +99,29 @@ impl Drop for Aligned {
             )
         }
     }
+}
+// Physical I/O is synchronous at this boundary even on the overlapped Windows
+// handle. Keep one small aligned scratch allocation per caller thread instead
+// of allocating and clearing it for each index page. Full-object transfers use
+// temporary storage and never increase this retained bound.
+const SCRATCH_LIMIT: usize = 1024 * 1024;
+thread_local! {
+    static IO_SCRATCH: RefCell<Option<Aligned>> = const { RefCell::new(None) };
+}
+fn with_aligned<T>(size: usize, operation: impl FnOnce(&mut [u8]) -> Result<T>) -> Result<T> {
+    if size > SCRATCH_LIMIT {
+        return operation(&mut Aligned::new(size)?.bytes_mut()[..size]);
+    }
+    IO_SCRATCH.with(|slot| {
+        // A nested call must never borrow another operation's live buffer.
+        let Ok(mut cached) = slot.try_borrow_mut() else {
+            return operation(&mut Aligned::new(size)?.bytes_mut()[..size]);
+        };
+        if cached.as_ref().is_none_or(|buffer| buffer.size < size) {
+            *cached = Some(Aligned::new(size.max(4096).next_power_of_two())?);
+        }
+        operation(&mut cached.as_mut().expect("aligned scratch initialized").bytes_mut()[..size])
+    })
 }
 impl Device {
     pub(super) fn io_scope(&self) -> IoScope {
@@ -287,13 +307,17 @@ impl Device {
             .ok_or_else(|| Error::Invalid("I/O overflow".into()))?
             .div_ceil(4096)
             * 4096;
-        let mut buffer = Aligned::new((end - start) as usize)?;
-        self.raw_read(start, &mut buffer.bytes_mut()[..(end - start) as usize])?;
+        with_aligned((end - start) as usize, |buffer| {
+            self.raw_read(start, buffer)?;
+            let within = (offset - start) as usize;
+            // A failed/short read leaves the caller's output untouched. Cached
+            // bytes from an earlier request can never escape after an error.
+            output.copy_from_slice(&buffer[within..within + output.len()]);
+            Ok(())
+        })?;
         self.read_bytes.fetch_add(end - start, Ordering::Relaxed);
         self.read_calls.fetch_add(1, Ordering::Relaxed);
         self.record_scoped(ScopedIoCounts { local_read_bytes: end - start, read_calls: 1, ..Default::default() });
-        let within = (offset - start) as usize;
-        output.copy_from_slice(&buffer.bytes()[within..within + output.len()]);
         Ok(())
     }
     pub fn write(&self, offset: u64, input: &[u8]) -> Result<()> {
@@ -321,9 +345,10 @@ impl Device {
             .lock()
             .unwrap()
             .push((true, offset, input.len()));
-        let mut buffer = Aligned::new(input.len())?;
-        buffer.bytes_mut()[..input.len()].copy_from_slice(input);
-        self.raw_write(offset, &buffer.bytes()[..input.len()])?;
+        with_aligned(input.len(), |buffer| {
+            buffer.copy_from_slice(input);
+            self.raw_write(offset, buffer)
+        })?;
         self.write_bytes
             .fetch_add(input.len() as u64, Ordering::Relaxed);
         self.write_calls.fetch_add(1, Ordering::Relaxed);
@@ -379,6 +404,7 @@ mod windows {
             name: *const u16,
         ) -> *mut c_void;
         fn CloseHandle(handle: *mut c_void) -> i32;
+        fn ResetEvent(handle: *mut c_void) -> i32;
         fn ReadFile(
             handle: *mut c_void,
             buffer: *mut c_void,
@@ -417,12 +443,37 @@ mod windows {
         ) -> i32;
     }
     struct Event(*mut c_void);
+    impl Event {
+        fn create() -> Result<Self> {
+            let event = Self(unsafe { CreateEventW(std::ptr::null(), 1, 0, std::ptr::null()) });
+            if event.0.is_null() { return Err(std::io::Error::last_os_error().into()); }
+            Ok(event)
+        }
+    }
     impl Drop for Event {
         fn drop(&mut self) {
             unsafe {
                 CloseHandle(self.0);
             }
         }
+    }
+    thread_local! {
+        static TRANSFER_EVENT: RefCell<Option<Event>> = const { RefCell::new(None) };
+    }
+    fn with_transfer_event<T>(operation: impl FnOnce(&Event) -> Result<T>) -> Result<T> {
+        TRANSFER_EVENT.with(|slot| {
+            let Ok(mut cached) = slot.try_borrow_mut() else {
+                return operation(&Event::create()?);
+            };
+            if cached.is_none() { *cached = Some(Event::create()?); }
+            let event = cached.as_ref().expect("transfer event initialized");
+            if unsafe { ResetEvent(event.0) } == 0 {
+                let error = std::io::Error::last_os_error();
+                *cached = None;
+                return Err(error.into());
+            }
+            operation(event)
+        })
     }
     pub fn set_sparse(file: &File) -> Result<()> {
         let event = Event(unsafe { CreateEventW(std::ptr::null(), 1, 0, std::ptr::null()) });
@@ -541,10 +592,18 @@ mod windows {
         if length > u32::MAX as usize {
             return Err(Error::Invalid("I/O transfer too large".into()));
         }
-        let event = Event(unsafe { CreateEventW(std::ptr::null(), 1, 0, std::ptr::null()) });
-        if event.0.is_null() {
-            return Err(std::io::Error::last_os_error().into());
-        }
+        // The callback waits for this operation's completion before returning;
+        // no OVERLAPPED or kernel request survives reuse of the per-thread event.
+        with_transfer_event(|event| transfer_with_event(file, offset, pointer, length, write, event))
+    }
+    fn transfer_with_event(
+        file: &File,
+        offset: u64,
+        pointer: *mut u8,
+        length: usize,
+        write: bool,
+        event: &Event,
+    ) -> Result<()> {
         let mut ov = Overlapped {
             internal: 0,
             internal_high: 0,
@@ -590,11 +649,95 @@ mod windows {
         }
         Ok(())
     }
+
+    #[cfg(test)]
+    #[test]
+    fn transfer_event_reuse_excludes_nested_operations() {
+        TRANSFER_EVENT.with(|slot| *slot.borrow_mut() = None);
+        let first = with_transfer_event(|event| {
+            let handle = event.0 as usize;
+            with_transfer_event(|nested| {
+                assert_ne!(nested.0 as usize, handle);
+                Ok(())
+            })?;
+            Ok(handle)
+        }).unwrap();
+        assert!(with_transfer_event::<()>(|_| Err(Error::Invalid("injected transfer error".into()))).is_err());
+        let again = with_transfer_event(|event| Ok(event.0 as usize)).unwrap();
+        assert_eq!(first, again);
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn aligned_scratch_is_bounded_reused_and_nested_calls_are_isolated() {
+        IO_SCRATCH.with(|slot| *slot.borrow_mut() = None);
+        let first = with_aligned(3 * 4096, |buffer| {
+            assert_eq!(buffer.as_ptr() as usize % 4096, 0);
+            buffer.fill(0x47);
+            let pointer = buffer.as_ptr() as usize;
+            with_aligned(4096, |nested| {
+                assert_ne!(nested.as_ptr() as usize, pointer);
+                nested.fill(0x81);
+                Ok(())
+            })?;
+            assert!(buffer.iter().all(|byte| *byte == 0x47));
+            Ok(pointer)
+        }).unwrap();
+        let reused = with_aligned(4096, |buffer| Ok(buffer.as_ptr() as usize)).unwrap();
+        assert_eq!(first, reused);
+        IO_SCRATCH.with(|slot| assert_eq!(slot.borrow().as_ref().unwrap().size, 4 * 4096));
+        with_aligned(SCRATCH_LIMIT + 4096, |buffer| {
+            assert_eq!(buffer.len(), SCRATCH_LIMIT + 4096);
+            buffer.fill(0x29);
+            Ok(())
+        }).unwrap();
+        assert_eq!(with_aligned(4096, |buffer| Ok(buffer.as_ptr() as usize)).unwrap(), first);
+        IO_SCRATCH.with(|slot| assert_eq!(slot.borrow().as_ref().unwrap().size, 4 * 4096));
+        with_aligned(SCRATCH_LIMIT, |_| Ok(())).unwrap();
+        IO_SCRATCH.with(|slot| assert_eq!(slot.borrow().as_ref().unwrap().size, SCRATCH_LIMIT));
+    }
+
+    #[test]
+    fn reused_physical_io_preserves_offsets_errors_and_thread_isolation() {
+        let folder = tempfile::tempdir().unwrap();
+        let device = std::sync::Arc::new(Device::open(&folder.path().join("scratch.odv4"), true).unwrap());
+        device.resize(1024 * 1024).unwrap();
+        let workers = (0..4).map(|thread| {
+            let device = device.clone();
+            std::thread::spawn(move || {
+                let base = thread * 65536;
+                for page in 0..16 {
+                    let value = (thread * 16 + page + 1) as u8;
+                    let offset = base + page * 4096;
+                    device.write(offset, &[value; 4096]).unwrap();
+                    let mut short = [0; 512];
+                    device.read(offset + 1536, &mut short).unwrap();
+                    assert_eq!(short, [value; 512]);
+                }
+            })
+        }).collect::<Vec<_>>();
+        for worker in workers { worker.join().unwrap(); }
+        // Partial reads may overwrite scratch before failing. They must not
+        // expose either those bytes or a previous request's stale bytes.
+        let mut untouched = [0xa9; 8192];
+        let before = device.diagnostics();
+        assert!(device.read(1024 * 1024 - 4096, &mut untouched).is_err());
+        assert_eq!(untouched, [0xa9; 8192]);
+        assert_eq!(device.diagnostics()["physical_read_calls"], before["physical_read_calls"]);
+        device.fail_after.store(0, Ordering::Relaxed);
+        assert!(device.write(0, &[0xff; 4096]).is_err());
+        device.fail_after.store(-1, Ordering::Relaxed);
+        let mut valid = [0; 4096];
+        device.read(0, &mut valid).unwrap();
+        assert_eq!(valid, [1; 4096]);
+        device.write(0, &[0x55; 4096]).unwrap();
+        device.read(0, &mut valid).unwrap();
+        assert_eq!(valid, [0x55; 4096]);
+    }
+
     #[test]
     fn sparse_reclaim_preserves_neighbors_and_counts_aligned_io() {
         let folder = tempfile::tempdir().unwrap();

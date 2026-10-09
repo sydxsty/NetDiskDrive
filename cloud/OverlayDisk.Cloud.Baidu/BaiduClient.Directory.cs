@@ -23,7 +23,7 @@ public sealed partial class BaiduClient
             using var document = await JsonAsync(HttpMethod.Get, Url(Pan, "rest/2.0/xpan/file",
                 ("method", "list"), ("dir", directory), ("page", page.ToString(CultureInfo.InvariantCulture)),
                 ("num", options.PageSize.ToString(CultureInfo.InvariantCulture)), ("order", "name"), ("desc", "0"), ("web", "1")),
-                null, "list", cancellationToken, native: true).ConfigureAwait(false);
+                null, "list", cancellationToken, native: true, missingDirectory: directory).ConfigureAwait(false);
             var root = Data(document.RootElement);
             if (!root.TryGetProperty("list", out var list) || list.ValueKind != JsonValueKind.Array)
                 throw new CloudProviderException("MissingListing", "Baidu did not return a directory listing.");
@@ -75,7 +75,7 @@ public sealed partial class BaiduClient
                 if (item.Path == path) found = item;
             return found;
         }
-        catch (CloudProviderException error) when (error.Code is "Baidu:-9" or "Baidu:31066")
+        catch (CloudObjectNotFoundException)
         { return null; }
     }
 
@@ -221,7 +221,7 @@ public sealed partial class BaiduClient
             await foreach (var item in ListAsync(parent, cancellationToken).ConfigureAwait(false))
                 if (paths.Contains(item.Path)) matches.Add(item);
         }
-        catch (CloudProviderException error) when (error.Code is "Baidu:-9" or "Baidu:31066") { }
+        catch (CloudObjectNotFoundException) { }
         return matches;
     }
 

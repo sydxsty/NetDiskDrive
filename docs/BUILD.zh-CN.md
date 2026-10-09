@@ -48,7 +48,7 @@ powershell -ExecutionPolicy Bypass -File scripts/test-local.ps1 -IncludeMount
 
 该选项只创建新的隔离测试容器，验证 NTFS、卸载重挂、懒加载最新快照切换和文件校验，不接受已有磁盘号作为目标。建议在测试电脑中运行。
 
-只验证本轮副本功能时，可在构建目录运行 `dotnet OverlayDisk.dll --replica-smoke C:\Temp\ReplicaCheck`。管理员终端中的 `dotnet OverlayDisk.dll --replica-mount-smoke C:\Temp\ReplicaMountCheck` 另创建新 256 MiB 加密测试盘，检查只读/读写挂载、卸载后切换及文件内容；两条命令都要求新的空输出目录，不访问真实网盘账户。
+只验证本轮副本功能时，可在构建目录运行 `dotnet OverlayDisk.dll --replica-smoke C:\Temp\ReplicaCheck`。管理员终端中的 `dotnet OverlayDisk.dll --replica-mount-smoke C:\Temp\ReplicaMountCheck` 另创建新 256 MiB 明文测试盘，检查只读/读写挂载、卸载后切换及文件内容；两条命令都要求新的空输出目录，不访问真实网盘账户。
 
 GPT 恢复回归可单独运行 `dotnet OverlayDisk.dll --replica-gpt-smoke C:\Temp\ReplicaGptCheck`。它在新的空目录中创建 4 TiB 虚拟容量的稀疏测试容器，通过真实应用服务与原生接口检查分区表、恢复重试及快照更新；只写入少量测试数据，无需管理员权限或真实挂载，云对象来自内存模拟后端。
 

@@ -63,6 +63,10 @@ pub(super) struct Shared {
     write_bytes: AtomicU64,
     changed: AtomicU64,
     deduplicated: AtomicU64,
+    index_node_visits: Arc<AtomicU64>,
+    write_revision_retries: AtomicU64,
+    #[cfg(test)]
+    modify_publish_barrier: Mutex<Option<Arc<std::sync::Barrier>>>,
 }
 pub struct Volume {
     pub(super) shared: Arc<Shared>,
@@ -74,6 +78,7 @@ pub(super) struct Reader {
     pub crypto: Arc<PageCodec>,
     pub root: Root,
     cache: Arc<Mutex<ReadCache>>,
+    index_node_visits: Arc<AtomicU64>,
     pub cache_runtime: Arc<super::cache::Runtime>,
 }
 impl Reader {
@@ -95,14 +100,33 @@ impl Reader {
             .map(|b| StoredPage::decode(&b))
             .transpose()
     }
+    fn pages(&mut self, keys: &[u64]) -> Result<Vec<Option<StoredPage>>> {
+        tree::get_many(self, &PAGES, self.root.index, keys)?
+            .into_iter()
+            .map(|v| v.as_deref().map(StoredPage::decode).transpose())
+            .collect()
+    }
+    fn objects(&mut self, ids: &[u64]) -> Result<BTreeMap<u64, store::Object>> {
+        let keys = ids.iter().copied().collect::<std::collections::BTreeSet<_>>()
+            .into_iter().collect::<Vec<_>>();
+        let values = tree::get_many(self, &OBJECTS, self.root.objects, &keys)?;
+        keys.into_iter().zip(values).map(|(id, value)| {
+            let value = value.ok_or_else(|| Error::Integrity("read view object absent".into()))?;
+            Ok((id, store::Object::decode(id, &value)?))
+        }).collect()
+    }
     pub(super) fn object(&mut self, oid: u64) -> Result<store::Object> {
         let value = tree::get(self, &OBJECTS, self.root.objects, oid)?
             .ok_or_else(|| Error::Integrity("read view object absent".into()))?;
         store::Object::decode(oid, &value)
     }
     pub(super) fn read_page(&mut self, index: u64) -> Result<Zeroizing<[u8; PAGE]>> {
+        let reference = self.page(index)?;
+        self.read_known_page(index, reference.as_ref())
+    }
+    fn read_known_page(&mut self, index: u64, reference: Option<&StoredPage>) -> Result<Zeroizing<[u8; PAGE]>> {
         let mut bytes = Zeroizing::new([0; PAGE]);
-        if let Some(p) = self.page(index)? {
+        if let Some(p) = reference {
             let object = self.object(p.reference.object)?;
             if object.missing {
                 return Err(Error::Missing(RemoteObject::data(
@@ -142,6 +166,7 @@ impl Reader {
 }
 impl Storage for Reader {
     fn read_node(&mut self, reference: MetaRef) -> Result<Vec<u8>> {
+        self.index_node_visits.fetch_add(1, Ordering::Relaxed);
         if let Some(bytes) = self
             .cache
             .lock()
@@ -303,6 +328,10 @@ impl Volume {
             write_bytes: AtomicU64::new(0),
             changed: AtomicU64::new(0),
             deduplicated: AtomicU64::new(0),
+            index_node_visits: Arc::new(AtomicU64::new(0)),
+            write_revision_retries: AtomicU64::new(0),
+            #[cfg(test)]
+            modify_publish_barrier: Mutex::new(None),
         });
         let background = shared.clone();
         let worker = thread::Builder::new()
@@ -382,6 +411,11 @@ impl Volume {
         let mut page = first;
         while page < end {
             let stop = (page + 256).min(end);
+            let keys = (page..stop).filter(|index| !changes.contains_key(index)).collect::<Vec<_>>();
+            let references = reader.pages(&keys)?;
+            let ids = references.iter().flatten().map(|p| p.reference.object).collect::<Vec<_>>();
+            let objects = reader.objects(&ids)?;
+            let mut references = keys.into_iter().zip(references).collect::<BTreeMap<_, _>>();
             let mut plan = Vec::new();
             for index in page..stop {
                 if let Some(value) = changes.get(&index) {
@@ -391,11 +425,11 @@ impl Volume {
                         copy_to_output(offset, output, index, &[0; PAGE]);
                     }
                     plan.push(None);
-                } else if let Some(reference) = reader.page(index)? {
-                    let object = reader.object(reference.reference.object)?;
+                } else if let Some(reference) = references.remove(&index).flatten() {
+                    let object = &objects[&reference.reference.object];
                     if object.missing {
                         return Err(Error::Missing(RemoteObject::data(
-                            &object,
+                            object,
                             self.object_size(),
                         )));
                     }
@@ -543,12 +577,14 @@ impl Volume {
         Ok(())
     }
     fn modify(&self, offset: u64, length: usize, input: Option<&[u8]>) -> Result<()> {
+        let first = offset / PAGE as u64;
+        let end = (offset + length as u64).div_ceil(PAGE as u64);
+        #[cfg(test)]
+        let mut publish_barrier = self.shared.modify_publish_barrier.lock().unwrap().clone();
         loop {
             let (lease, visible, revision) = {
                 let views = self.shared.views.lock().map_err(|_| Error::Poisoned)?;
                 check_views(&views)?;
-                let first = offset / PAGE as u64;
-                let end = (offset + length as u64).div_ceil(PAGE as u64);
                 let additional = (first..end)
                     .filter(|p| !views.dirty.contains_key(p))
                     .count();
@@ -572,6 +608,12 @@ impl Volume {
                 (lease, visible, views.revision)
             };
             let mut reader = self.shared.reader(&lease.root);
+            // Share each immutable index path across the whole request. In
+            // particular a full-page overwrite only needs the stored digest,
+            // never the previous payload, even when the payload is remote.
+            let keys = (first..end).filter(|index| !visible.contains_key(index)).collect::<Vec<_>>();
+            let stored = reader.pages(&keys)?;
+            let mut stored = keys.into_iter().zip(stored).collect::<BTreeMap<_, _>>();
             let mut updates = Changes::new();
             let mut done = 0;
             let mut same = 0;
@@ -580,9 +622,10 @@ impl Volume {
                 let index = at / PAGE as u64;
                 let within = at as usize % PAGE;
                 let take = (PAGE - within).min(length - done);
+                let previous = stored.remove(&index).flatten();
                 let inherited_identity = self.shared.identity_intersects(index * PAGE as u64, PAGE)?
                     && !visible.contains_key(&index)
-                    && match reader.page(index)? {
+                    && match previous.as_ref() {
                         Some(p) => reader.object(p.reference.object)?.origin_backed,
                         None => false,
                     };
@@ -593,7 +636,7 @@ impl Volume {
                 } else if let Some(value) = visible.get(&index) {
                     value.as_ref().map(|v| v.digest)
                 } else {
-                    reader.page(index)?.map(|p| p.digest)
+                    previous.as_ref().map(|p| p.digest)
                 };
                 let mut page = if within == 0 && take == PAGE {
                     Zeroizing::new([0; PAGE])
@@ -603,7 +646,7 @@ impl Volume {
                         .map(|v| Zeroizing::new(**v.as_ref()))
                         .unwrap_or_else(|| Zeroizing::new([0; PAGE]))
                 } else {
-                    reader.read_page(index)?
+                    reader.read_known_page(index, previous.as_ref())?
                 };
                 if inherited_identity && !(within == 0 && take == PAGE) {
                     self.apply_identity(index * PAGE as u64,page.as_mut())?;
@@ -636,10 +679,34 @@ impl Volume {
                 }
                 done += take;
             }
+            #[cfg(test)]
+            if let Some(barrier) = publish_barrier.take() {
+                barrier.wait();
+            }
             let mut views = self.shared.views.lock().map_err(|_| Error::Poisoned)?;
             check_views(&views)?;
             if views.revision != revision {
+                // A disjoint worker or a dirty -> inflight cut does not change
+                // the bytes this request observed. Preserve the optimistic
+                // work when both the durable root and the exact visible range
+                // still match; overlapping writes and root commits retry.
+                let same_root = self.shared.readers.lock().map_err(|_| Error::Poisoned)?.root.index
+                    == lease.root.index;
+                if !same_root || !visible_range_matches(&views, &visible, first, end) {
+                    self.shared.write_revision_retries.fetch_add(1, Ordering::Relaxed);
+                    drop(views);
+                    continue;
+                }
+            }
+            // Another disjoint writer may have consumed cache space while
+            // this request was prepared. Keep the original hard bound even
+            // when its revision change no longer forces a retry.
+            let additional = updates.keys().filter(|index| !views.dirty.contains_key(index)).count();
+            if (views.dirty.len() + views.inflight.as_ref().map_or(0, |v| v.len()) + additional) * PAGE
+                > DIRTY_LIMIT
+            {
                 drop(views);
+                self.flush()?;
                 continue;
             }
             self.shared.deduplicated.fetch_add(same, Ordering::Relaxed);
@@ -713,6 +780,14 @@ impl Volume {
                 self.shared.changed.load(Ordering::Relaxed),
             ),
             (
+                "frontend_index_node_visits".into(),
+                self.shared.index_node_visits.load(Ordering::Relaxed),
+            ),
+            (
+                "write_revision_retries".into(),
+                self.shared.write_revision_retries.load(Ordering::Relaxed),
+            ),
+            (
                 "deduplicated_pages".into(),
                 self.shared.deduplicated.load(Ordering::Relaxed),
             ),
@@ -741,6 +816,7 @@ impl Shared {
             crypto: self.crypto.clone(),
             root: root.clone(),
             cache: self.cache.clone(),
+            index_node_visits: self.index_node_visits.clone(),
             cache_runtime: self.cache_runtime.clone(),
         }
     }
@@ -918,6 +994,29 @@ impl Shared {
         self.wake.notify_all();
         result
     }
+}
+fn visible_range_matches(views: &Views, previous: &Changes, first: u64, end: u64) -> bool {
+    let same = |index: &u64, value: &Option<Bytes>| {
+        match (previous.get(index), value) {
+            (Some(None), None) => true,
+            (Some(Some(before)), Some(after)) => Arc::ptr_eq(before, after),
+            _ => false,
+        }
+    };
+    let mut seen = 0;
+    for (index, value) in views.dirty.range(first..end) {
+        if !same(index, value) { return false; }
+        seen += 1;
+    }
+    if let Some(inflight) = &views.inflight {
+        for (index, value) in inflight.range(first..end) {
+            if !views.dirty.contains_key(index) {
+                if !same(index, value) { return false; }
+                seen += 1;
+            }
+        }
+    }
+    seen == previous.len()
 }
 fn copy_to_output(offset: u64, out: &mut [u8], index: u64, bytes: &[u8; PAGE]) {
     let start = (index * PAGE as u64).max(offset);
@@ -1115,4 +1214,127 @@ mod tests {
         disk.flush().unwrap();
         assert_eq!(disk.info().unwrap().allocated_pages, 0);
     }
+    #[test]
+    fn foreground_batches_share_index_paths_without_reading_overwritten_payload() {
+        let (temp, disk) = volume();
+        disk.stop_background_commit_for_test();
+        let base = 16 * 1024 * 1024;
+        let original = vec![0x31; 1024 * 1024];
+        disk.write(base, &original).unwrap();
+        disk.flush().unwrap();
+        let (lease, mut reader) = disk.read_context().unwrap();
+        let before = disk.shared.index_node_visits.load(Ordering::Relaxed);
+        for index in base / PAGE as u64..(base + original.len() as u64) / PAGE as u64 {
+            assert!(reader.page(index).unwrap().is_some());
+        }
+        let scalar_visits = disk.shared.index_node_visits.load(Ordering::Relaxed) - before;
+        drop(reader);
+        drop(lease);
+        disk.shared.device.events.lock().unwrap().clear();
+        let before = disk.shared.index_node_visits.load(Ordering::Relaxed);
+        let replacement = vec![0x47; original.len()];
+        disk.write(base, &replacement).unwrap();
+        let bulk_visits = disk.shared.index_node_visits.load(Ordering::Relaxed) - before;
+        assert_eq!(scalar_visits, 1536);
+        assert_eq!(bulk_visits, 13, "one shared path per 32-page leaf, including root-level validation");
+        assert!(disk.shared.device.events.lock().unwrap().is_empty(), "full overwrite reread cached index or old data");
+        disk.flush().unwrap();
+        let before = disk.shared.index_node_visits.load(Ordering::Relaxed);
+        let mut actual = vec![0; replacement.len()];
+        disk.read(base, &mut actual).unwrap();
+        assert_eq!(actual, replacement);
+        assert_eq!(disk.shared.index_node_visits.load(Ordering::Relaxed) - before, 20,
+            "read should share 13 page-map nodes and seven object-map nodes");
+        drop(disk);
+        let disk = Volume::open(temp.path().join("test.odv4"), None).unwrap();
+        disk.read(base, &mut actual).unwrap();
+        assert_eq!(actual, replacement);
+    }
+
+    #[test]
+    fn concurrent_disjoint_writes_keep_prepared_pages_without_retry() {
+        let (_temp, disk) = volume();
+        disk.stop_background_commit_for_test();
+        let disk = Arc::new(disk);
+        *disk.shared.modify_publish_barrier.lock().unwrap() = Some(Arc::new(std::sync::Barrier::new(2)));
+        let workers = (0..2).map(|i| {
+            let disk = disk.clone();
+            thread::spawn(move || disk.write((16 + i) * 1024 * 1024, &vec![i as u8 + 17; 1024 * 1024]).unwrap())
+        }).collect::<Vec<_>>();
+        for worker in workers { worker.join().unwrap(); }
+        *disk.shared.modify_publish_barrier.lock().unwrap() = None;
+        assert_eq!(disk.shared.write_revision_retries.load(Ordering::Relaxed), 0);
+        disk.flush().unwrap();
+        for i in 0..2 {
+            let mut actual = vec![0; 1024 * 1024];
+            disk.read((16 + i) * 1024 * 1024, &mut actual).unwrap();
+            assert_eq!(actual, vec![i as u8 + 17; actual.len()]);
+        }
+    }
+
+    #[test]
+    fn concurrent_partial_writes_to_same_page_retry_and_preserve_both_sectors() {
+        let (temp, disk) = volume();
+        disk.stop_background_commit_for_test();
+        let base = 16 * 1024 * 1024;
+        disk.write(base, &[0x23; PAGE]).unwrap();
+        disk.flush().unwrap();
+        let disk = Arc::new(disk);
+        *disk.shared.modify_publish_barrier.lock().unwrap() = Some(Arc::new(std::sync::Barrier::new(2)));
+        let workers = (0..2).map(|i| {
+            let disk = disk.clone();
+            thread::spawn(move || disk.write(base + i * 512, &[i as u8 + 51; 512]).unwrap())
+        }).collect::<Vec<_>>();
+        for worker in workers { worker.join().unwrap(); }
+        *disk.shared.modify_publish_barrier.lock().unwrap() = None;
+        assert_eq!(disk.shared.write_revision_retries.load(Ordering::Relaxed), 1,
+            "the second writer must rebuild the shared page against the first writer's bytes");
+        disk.flush().unwrap();
+        drop(disk);
+        let disk = Volume::open(temp.path().join("test.odv4"), None).unwrap();
+        let mut actual = [0; PAGE];
+        disk.read(base, &mut actual).unwrap();
+        assert_eq!(&actual[..512], &[51; 512]);
+        assert_eq!(&actual[512..1024], &[52; 512]);
+        assert_eq!(&actual[1024..], &[0x23; PAGE - 1024]);
+    }
+
+    #[test]
+    fn committed_cow_reuses_authenticated_old_paths_during_reference_retirement() {
+        fn warm_paths(store: &mut Store, spec: &tree::Spec, reference: MetaRef, offsets: &mut Vec<u64>) {
+            if reference.empty() { return; }
+            offsets.push(reference.offset);
+            if let tree::Node::Branch { children, .. } = tree::visit_node(store, spec, reference).unwrap() {
+                for (_, child) in children { warm_paths(store, spec, child, offsets); }
+            }
+        }
+        let (temp, disk) = volume();
+        disk.stop_background_commit_for_test();
+        let base = 16 * 1024 * 1024;
+        disk.write(base, &vec![0x31; 1024 * 1024]).unwrap();
+        disk.flush().unwrap();
+        let mut offsets = Vec::new();
+        {
+            let mut store = disk.shared.store.lock().unwrap();
+            let root = store.root.index;
+            warm_paths(&mut store, &PAGES, root, &mut offsets);
+            let root = store.root.dirty;
+            warm_paths(&mut store, &DIRTY, root, &mut offsets);
+        }
+        let replacement = vec![0x74; 1024 * 1024];
+        disk.write(base, &replacement).unwrap();
+        disk.shared.device.events.lock().unwrap().clear();
+        disk.flush().unwrap();
+        let reread_pages = disk.shared.device.events.lock().unwrap().iter()
+            .filter(|(write, _, _)| !write)
+            .map(|(_, at, length)| offsets.iter().filter(|offset| **offset >= *at && **offset < at + *length as u64).count())
+            .sum::<usize>();
+        assert_eq!(reread_pages, 0, "COW retirement reread old paths already held in the authenticated cache");
+        drop(disk);
+        let disk = Volume::open(temp.path().join("test.odv4"), None).unwrap();
+        let mut actual = vec![0; replacement.len()];
+        disk.read(base, &mut actual).unwrap();
+        assert_eq!(actual, replacement);
+    }
+
 }

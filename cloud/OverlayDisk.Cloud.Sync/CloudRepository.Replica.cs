@@ -43,6 +43,7 @@ public sealed partial class CloudRepository
             }
         }
         catch (CloudObjectNotFoundException) { return null; }
+        catch (CloudProviderException error) when (error.Code is "Baidu:-9" or "Baidu:31066") { return null; }
         if (newest is not { } selected) return null;
         if (conflict) throw new IOException("云端存在冲突写入版本，已停止自动选择。");
         if (known is not null && CommitPath(root, known) == selected.Info.Path) return (known, selected.Info.Path);

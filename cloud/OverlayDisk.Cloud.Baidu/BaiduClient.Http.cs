@@ -221,7 +221,7 @@ public sealed partial class BaiduClient : ICloudObjectStore, ICloudBatchDeleteSt
     }
 
     private async Task<JsonDocument> JsonAsync(HttpMethod method, Uri uri, Func<HttpContent?>? body,
-        string operation, CancellationToken cancellationToken, bool requireErrno = true, bool native = false, bool retry = true)
+        string operation, CancellationToken cancellationToken, bool requireErrno = true, bool native = false, bool retry = true, string? missingDirectory = null)
     {
         try
         {
@@ -262,6 +262,15 @@ public sealed partial class BaiduClient : ICloudObjectStore, ICloudBatchDeleteSt
             try { EnsureSuccess(document.RootElement, requireErrno); return document; }
             catch { document.Dispose(); throw; }
             }, cancellationToken, retry ? options.MaximumAttempts : 1).ConfigureAwait(false);
+        }
+        catch (CloudProviderException error) when (missingDirectory is not null && error.Code is "Baidu:-9" or "Baidu:31066")
+        {
+            // A missing listing is a normal discovery result, not an API failure.
+            // If it contradicts a cached positive, an external deletion made all
+            // descendant receipts unsafe; retire that cache before mkdir can reuse it.
+            if (metadataCache is { } cache && (await cache.LookupAsync(missingDirectory, cancellationToken).ConfigureAwait(false)).Item is not null)
+                await cache.InvalidateAsync(cancellationToken).ConfigureAwait(false);
+            throw new CloudObjectNotFoundException(missingDirectory);
         }
         catch (CloudProviderException error)
         {
